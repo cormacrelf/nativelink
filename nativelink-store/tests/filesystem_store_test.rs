@@ -2140,3 +2140,153 @@ async fn concurrent_upload_burst_round_trip_test() -> Result<(), Error> {
     }
     Ok(())
 }
+
+// Regression test for https://github.com/TraceMachina/nativelink/issues/2242.
+//
+// `emplace_file()` runs the temp→content rename on a detached background task
+// so a dropped client future cannot orphan the entry (#495), but the update
+// entry points must still await that task before reporting success. If they
+// return early, a client that uploads a blob and immediately downloads it can
+// observe a missing or incomplete file because the blob has not yet been
+// renamed into the content path.
+//
+// The race is made deterministic rather than probabilistic: the injected
+// rename_fn sleeps before renaming and bumps a counter after, so an update
+// that returns success without having awaited the rename always observes a
+// zero counter and a missing content file — it cannot pass by lucky timing.
+#[nativelink_test]
+async fn update_waits_for_rename_before_returning_success() -> Result<(), Error> {
+    static RENAMES_COMPLETED: AtomicU32 = AtomicU32::new(0);
+    fn slow_rename(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::rename(from, to)?;
+        RENAMES_COMPLETED.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    // Immediately after an update reports success, the blob must be both on
+    // disk at its content path and downloadable through the store — the
+    // upload-then-immediate-download flow from the issue report.
+    async fn check_immediately_available(
+        store: &Arc<FilesystemStore>,
+        content_path: &str,
+        digest: DigestInfo,
+        expected: &[u8],
+        renames_expected: u32,
+        entry_point: &str,
+    ) -> Result<(), Error> {
+        assert_eq!(
+            RENAMES_COMPLETED.load(Ordering::Acquire),
+            renames_expected,
+            "{entry_point} returned success before the temp→content rename completed"
+        );
+        let content_file = OsString::from(format!("{content_path}/{DIGEST_FOLDER}/{digest}"));
+        assert_eq!(
+            read_file_contents(&content_file).await?,
+            expected,
+            "blob not fully on disk at its content path immediately after {entry_point} returned"
+        );
+        let downloaded = store
+            .get_part_unchunked(digest, 0, None)
+            .await
+            .err_tip(|| format!("blob not downloadable immediately after {entry_point}"))?;
+        assert_eq!(
+            downloaded, expected,
+            "blob incomplete when downloaded immediately after {entry_point} returned"
+        );
+        Ok(())
+    }
+
+    const HASH3: &str = "0123456789abcdef000000000000000000030000000000000123456789abcdef";
+
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+    let store = Arc::new(
+        FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+            &FilesystemSpec {
+                content_path: content_path.clone(),
+                temp_path: temp_path.clone(),
+                ..Default::default()
+            },
+            slow_rename,
+        )
+        .await?,
+    );
+
+    // The one-shot path (the exact flow in the issue report).
+    let digest1 = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    store.update_oneshot(digest1, VALUE1.into()).await?;
+    check_immediately_available(
+        &store,
+        &content_path,
+        digest1,
+        VALUE1.as_bytes(),
+        1,
+        "update_oneshot",
+    )
+    .await?;
+
+    // The streaming path funnels through the same emplace_file().
+    let digest2 = DigestInfo::try_new(HASH2, VALUE2.len())?;
+    let (mut writer, reader) = make_buf_channel_pair();
+    let store_ref = &store;
+    let content_path_ref = content_path.as_str();
+    let update_fut = async move {
+        store_ref
+            .update(
+                digest2,
+                reader,
+                UploadSizeInfo::ExactSize(VALUE2.len() as u64),
+            )
+            .await?;
+        check_immediately_available(
+            store_ref,
+            content_path_ref,
+            digest2,
+            VALUE2.as_bytes(),
+            2,
+            "update",
+        )
+        .await
+    };
+    let writer_fut = async move {
+        writer.send(VALUE2.into()).await?;
+        writer.send_eof()?;
+        Ok::<_, Error>(())
+    };
+    let (update_result, writer_result) =
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            tokio::join!(update_fut, writer_fut)
+        })
+        .await
+        .map_err(|err| Error::from_std_err(Code::Internal, &err).append("Deadlock detected"))?;
+    update_result.merge(writer_result)?;
+
+    // The whole-file path also funnels through emplace_file().
+    let digest3 = DigestInfo::try_new(HASH3, VALUE1.len())?;
+    let file_path = OsString::from(format!("{temp_path}/2242_whole_file"));
+    {
+        let mut file = fs::create_file(&file_path).await?;
+        file.write_all(VALUE1.as_bytes()).await?;
+        file.as_ref().sync_all().await?;
+        file.rewind().await?;
+        store
+            .update_with_whole_file(
+                digest3,
+                file_path,
+                file,
+                UploadSizeInfo::ExactSize(VALUE1.len() as u64),
+            )
+            .await?;
+    }
+    check_immediately_available(
+        &store,
+        &content_path,
+        digest3,
+        VALUE1.as_bytes(),
+        3,
+        "update_with_whole_file",
+    )
+    .await?;
+    Ok(())
+}
