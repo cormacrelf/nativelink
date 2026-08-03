@@ -14,6 +14,7 @@
 
 use core::time::Duration;
 
+use bytes::Bytes;
 use mock_instant::thread_local::MockClock;
 use nativelink_config::stores::{
     EvictionPolicy, ExistenceCacheSpec, MemorySpec, NoopSpec, StoreSpec,
@@ -22,12 +23,14 @@ use nativelink_error::{Error, ResultExt};
 use nativelink_macro::nativelink_test;
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::memory_store::MemoryStore;
+use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::instant_wrapper::MockInstantWrapped;
-use nativelink_util::store_trait::{Store, StoreLike};
+use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
 use pretty_assertions::assert_eq;
 
 const VALID_HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
+const VALID_HASH2: &str = "abcdef0123456789000000000000000000010000000000009876543210fedcba";
 
 #[nativelink_test]
 async fn simple_exist_cache_test() -> Result<(), Error> {
@@ -194,5 +197,64 @@ async fn copes_with_dropped_items() -> Result<(), Error> {
         "Failed item: {unwrapped_store:#?}"
     );
 
+    Ok(())
+}
+
+// The concurrent variant of `copes_with_dropped_items`.
+//
+#[nativelink_test]
+async fn copes_with_dropped_items_during_concurrent_update() -> Result<(), Error> {
+    // Any ExactSize write >= max_bytes is drained and skipped by MemoryStore,
+    // which fires the remove callbacks for its own key.
+    const MAX_BYTES: usize = 100;
+    const OVERSIZED: u64 = 200;
+
+    let spec = ExistenceCacheSpec {
+        backend: StoreSpec::Noop(NoopSpec::default()), // Note: Not used.
+        eviction_policy: Option::default(),
+    };
+    let inner_store = Store::new(MemoryStore::new(&MemorySpec {
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: MAX_BYTES,
+            ..Default::default()
+        }),
+    }));
+    let store = Store::new(ExistenceCacheStore::new(&spec, inner_store.clone()));
+
+    let digest_a = DigestInfo::try_new(VALID_HASH1, OVERSIZED)?;
+    let digest_b = DigestInfo::try_new(VALID_HASH2, 3)?;
+
+    let (mut tx_a, rx_a) = make_buf_channel_pair();
+    let store_a = store.clone();
+    let update_a = tokio::spawn(async move {
+        store_a
+            .update(digest_a, rx_a, UploadSizeInfo::ExactSize(OVERSIZED))
+            .await
+    });
+
+    // The buf channel buffers 2 messages, so the later sends only resolve once
+    // the reader has consumed data — proving A is past the point where it
+    // claims `pause_remove_callbacks` and is inside the inner store's drain.
+    for _ in 0..4 {
+        tx_a.send(Bytes::from(vec![0u8; 50])).await?;
+    }
+
+    // Update B starts and finishes while A is still in flight.
+    store.update_oneshot(digest_b, "123".into()).await?;
+
+    tx_a.send_eof()?;
+    // A reports success to the client (the drained oversized write).
+    update_a.await.expect("update task panicked")?;
+
+    assert_eq!(
+        inner_store.has(digest_a).await?,
+        None,
+        "inner store never stored the oversized blob"
+    );
+    assert_eq!(
+        store.has(digest_a).await?,
+        None,
+        "existence cache must not claim a blob the inner store dropped"
+    );
     Ok(())
 }
