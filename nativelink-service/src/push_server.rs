@@ -37,6 +37,9 @@ use tracing::{Instrument, Level, error_span, info, instrument};
 pub struct PushStoreInfo {
     /// The Action Cache store the metadata is written to.
     store: Store,
+    /// The CAS the pushed content lives in, used to build the `Tree` of a
+    /// directory. `PushDirectory` is unavailable without it.
+    cas_store: Option<Store>,
     read_only: bool,
 }
 
@@ -55,10 +58,20 @@ impl PushServer {
             let store = store_manager.get_store(&config.push_store).ok_or_else(|| {
                 make_input_err!("'push_store': '{}' does not exist", config.push_store)
             })?;
+            let cas_store = config
+                .cas_store
+                .as_ref()
+                .map(|name| {
+                    store_manager
+                        .get_store(name)
+                        .ok_or_else(|| make_input_err!("'cas_store': '{name}' does not exist"))
+                })
+                .transpose()?;
             stores.insert(
                 config.instance_name.clone(),
                 PushStoreInfo {
                     store,
+                    cas_store,
                     read_only: config.read_only,
                 },
             );
@@ -125,6 +138,68 @@ impl PushServer {
 
         Ok(Response::new(PushBlobResponse {}))
     }
+
+    async fn inner_push_directory(
+        &self,
+        request: PushDirectoryRequest,
+    ) -> Result<Response<PushDirectoryResponse>, Error> {
+        let instance_name = &request.instance_name;
+        let store_info = self
+            .stores
+            .get(instance_name)
+            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?;
+
+        if store_info.read_only {
+            return Err(make_err!(
+                Code::PermissionDenied,
+                "The store '{instance_name}' is read only on this endpoint",
+            ));
+        }
+
+        let cas_store = store_info.cas_store.as_ref().ok_or_else(|| {
+            make_err!(
+                Code::FailedPrecondition,
+                "PushDirectory needs 'cas_store' configured for '{instance_name}'",
+            )
+        })?;
+
+        let root_directory_digest = request.root_directory_digest.ok_or_else(|| {
+            Error::new(
+                Code::InvalidArgument,
+                "Missing root directory digest in push".to_owned(),
+            )
+        })?;
+        if request.uris.is_empty() {
+            return Err(Error::new(
+                Code::InvalidArgument,
+                "No uris in push request".to_owned(),
+            ));
+        }
+        // `references_blobs` and `references_directories` are only hints, and
+        // like `push_blob` we do not act on them.
+        let stored_at = now_timestamp();
+        for uri in request.uris {
+            let entry = RemoteAssetEntry {
+                query: RemoteAssetQuery::new(
+                    AssetKind::Directory,
+                    uri.clone(),
+                    request.qualifiers.clone(),
+                ),
+                digest: root_directory_digest.clone(),
+                expire_at: request.expire_at,
+                stored_at: Some(stored_at),
+                digest_function: request.digest_function,
+                tree_digest: None,
+            };
+            // Fails if any `Directory` of the tree is missing from the CAS.
+            write_remote_asset_entry(&store_info.store, Some(cas_store), &entry)
+                .await
+                .err_tip(|| "Failed to update in push server")?;
+            info!(uri = %redact_uri(&uri), "Pushed directory asset metadata");
+        }
+
+        Ok(Response::new(PushDirectoryResponse {}))
+    }
 }
 
 #[tonic::async_trait]
@@ -163,12 +238,28 @@ impl Push for PushServer {
         err(level = Level::WARN),
         ret(level = Level::INFO),
         skip_all,
-        fields(request = ?_grpc_request.get_ref())
+        fields(
+            // Qualifier values and URI credentials must never be logged.
+            request.instance_name = ?grpc_request.get_ref().instance_name,
+            request.uris = ?redacted_uris(&grpc_request.get_ref().uris),
+            request.qualifiers = ?qualifier_names(&grpc_request.get_ref().qualifiers),
+            request.digest_function = ?grpc_request.get_ref().digest_function,
+        )
     )]
     async fn push_directory(
         &self,
-        _grpc_request: Request<PushDirectoryRequest>,
+        grpc_request: Request<PushDirectoryRequest>,
     ) -> Result<Response<PushDirectoryResponse>, Status> {
-        Err(Status::unimplemented("PushDirectory not implemented"))
+        let request = grpc_request.into_inner();
+        let digest_function = request.digest_function;
+        self.inner_push_directory(request)
+            .instrument(error_span!("push_push_directory"))
+            .with_context(
+                make_ctx_for_hash_func(digest_function)
+                    .err_tip(|| "In PushServer::push_directory")?,
+            )
+            .await
+            .err_tip(|| "Failed on push_directory() command")
+            .map_err(Into::into)
     }
 }

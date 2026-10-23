@@ -345,6 +345,15 @@ pub struct PushConfig {
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub push_store: StoreRefName,
 
+    /// The CAS store the pushed content lives in. Required for
+    /// `PushDirectory` (which is rejected without it) and unused by
+    /// `PushBlob`: it is read to build the `Tree` stored with the metadata (the
+    /// push is rejected if any `Directory` of the tree is missing from it), and
+    /// the `Tree` is uploaded to it.
+    /// Default: {`PushDirectory` is not available}
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub cas_store: Option<StoreRefName>,
+
     /// Whether the Action Cache store may be written to, this if set to false
     /// it is only possible to read from the Action Cache.
     #[serde(default)]

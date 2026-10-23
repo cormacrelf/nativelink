@@ -168,6 +168,7 @@
         push: [
           {
             push_store: "ASSET_METADATA_STORE",
+            cas_store: "WORKER_FAST_SLOW_STORE",
           },
         ],
         capabilities: [

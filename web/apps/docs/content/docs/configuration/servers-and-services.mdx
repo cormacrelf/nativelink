@@ -75,7 +75,7 @@ from the `stores` or `schedulers` array. This is where the wiring described in
 | `capabilities` | What this endpoint supports; required by Bazel | optionally a scheduler |
 | `execution` | REAPI `Execution`: accepts `Execute` calls | `cas_store` and `scheduler` |
 | `fetch` | Remote Asset protocol, fetch half | `fetch_store`, optionally a `fetcher` from the top-level `fetchers` list |
-| `push` | Remote Asset protocol, push half | `push_store` |
+| `push` | Remote Asset protocol, push half | `push_store`, optionally `cas_store` (needed for `PushDirectory`) |
 | `worker_api` | Where workers connect and are handed actions | `scheduler` |
 | `experimental_bep` | Build Event Protocol consumption | `store` |
 | `admin` | REST endpoint for administrative tasks | nothing (path defaults to `/admin`) |

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use nativelink_config::cas_server::PushConfig;
 use nativelink_config::serde_utils::{
     convert_boolean_with_shellexpand, convert_data_size_with_shellexpand,
     convert_duration_with_shellexpand, convert_numeric_with_shellexpand,
@@ -321,6 +322,19 @@ mod optional_values_tests {
             let deserialized: OptionalStringEntity = serde_json5::from_str(input).unwrap();
             assert_eq!(deserialized.value, expected);
         }
+    }
+
+    #[test]
+    fn test_push_config_without_cas_store() {
+        // The shape of a `push` config before `cas_store` existed.
+        let config: PushConfig = serde_json5::from_str(r#"{ push_store: "AC_STORE" }"#).unwrap();
+        assert_eq!(config.push_store, "AC_STORE");
+        assert_eq!(config.cas_store, None);
+        assert!(!config.read_only);
+
+        let config: PushConfig =
+            serde_json5::from_str(r#"{ push_store: "AC_STORE", cas_store: "CAS_STORE" }"#).unwrap();
+        assert_eq!(config.cas_store.as_deref(), Some("CAS_STORE"));
     }
 
     #[test]
