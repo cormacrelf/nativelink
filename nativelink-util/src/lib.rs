@@ -33,6 +33,7 @@ pub mod origin_event;
 pub mod origin_event_publisher;
 pub mod platform_properties;
 pub mod proto_stream_utils;
+pub mod redact;
 pub mod resource_info;
 pub mod retry;
 pub mod shutdown_guard;
