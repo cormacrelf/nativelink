@@ -1,0 +1,103 @@
+// A fetch-only NativeLink: it serves the Remote Asset API `Fetch` service and
+// nothing else, keeping no state of its own. Fetched content is uploaded to a
+// central cluster's CAS and the URI -> digest metadata is written to its Action
+// Cache, both over gRPC, so every build sees the same fetched assets whichever
+// tier node fetched them. Run this close to the origin servers (or somewhere
+// with the network access the central cluster lacks) and point clients'
+// `--remote_downloader` at it.
+//
+// The metadata is stored as ordinary Action Cache entries, which is what lets
+// it go to any Action Cache, including a remote one.
+{
+  stores: [
+    {
+      // The central cluster's CAS. Downloaded content is uploaded here.
+      name: "CENTRAL_CAS_STORE",
+      grpc: {
+        instance_name: "main",
+        endpoints: [
+          {
+            address: "grpc://${CENTRAL_ENDPOINT:-127.0.0.1}:50051",
+          },
+        ],
+        store_type: "cas",
+      },
+    },
+    {
+      // The central cluster's Action Cache, wrapped so that an entry whose
+      // content has left the central CAS reads as a miss and the asset is
+      // fetched again, rather than a dangling digest being served. Reads and
+      // writes of the metadata both go through this store.
+      name: "CENTRAL_ASSET_METADATA_STORE",
+      completeness_checking: {
+        backend: {
+          grpc: {
+            instance_name: "main",
+            endpoints: [
+              {
+                address: "grpc://${CENTRAL_ENDPOINT:-127.0.0.1}:50051",
+              },
+            ],
+            store_type: "ac",
+          },
+        },
+        cas_store: {
+          ref_store: {
+            name: "CENTRAL_CAS_STORE",
+          },
+        },
+      },
+    },
+  ],
+
+  // The chain is `FETCH_CACHE` -> `FETCH_URL`. A fetcher can only name
+  // fetchers listed before it.
+  fetchers: [
+    {
+      // Leaf: downloads content over HTTP(S) and uploads it to the central CAS.
+      name: "FETCH_URL",
+      url: {
+        cas_store: "CENTRAL_CAS_STORE",
+
+        // Downloads are buffered here before being uploaded.
+        temp_path: "/tmp/nativelink/fetch-tier/tmp_path-fetch",
+
+        // Reject any single download larger than 256 GiB.
+        max_size_bytes: 274877906944,
+      },
+    },
+    {
+      // Runs fetches in the background, joining concurrent identical ones and
+      // keeping a fetch running past the client's RPC deadline so a retry can
+      // reuse it, and writes the fetched asset's URI+qualifiers -> digest
+      // metadata to the central Action Cache, so future Fetch calls (on any
+      // tier node) hit.
+      name: "FETCH_CACHE",
+      cache: {
+        fetcher: "FETCH_URL",
+        fetch_store: "CENTRAL_ASSET_METADATA_STORE",
+        cas_store: "CENTRAL_CAS_STORE",
+        max_concurrent_fetches: 8,
+      },
+    },
+  ],
+  servers: [
+    {
+      listener: {
+        http: {
+          socket_address: "0.0.0.0:50052",
+        },
+      },
+      services: {
+        fetch: [
+          {
+            instance_name: "main",
+            fetch_store: "CENTRAL_ASSET_METADATA_STORE",
+            fetcher: "FETCH_CACHE",
+          },
+        ],
+        health: {},
+      },
+    },
+  ],
+}

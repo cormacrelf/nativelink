@@ -92,6 +92,60 @@
         },
       },
     },
+    {
+      // Remote Asset metadata (fetched URI + qualifiers -> CAS digest), stored
+      // as ordinary Action Cache entries and used by the `fetch` service. It
+      // shares AC_MAIN_STORE: the keys are digests of a synthetic Action whose
+      // command is distinctive, so they cannot collide with real actions. The
+      // `completeness_checking` wrapper makes an entry read as a miss once any
+      // of its content has left the CAS, so the asset is fetched again rather
+      // than a dangling digest being served.
+      name: "FETCH_METADATA_STORE",
+      completeness_checking: {
+        backend: {
+          ref_store: {
+            name: "AC_MAIN_STORE",
+          },
+        },
+        cas_store: {
+          ref_store: {
+            name: "CAS_MAIN_STORE",
+          },
+        },
+      },
+    },
+  ],
+
+  // Fetchers compose as a chain referenced by name: `FETCH_CACHE` ->
+  // `FETCH_URL`. A fetcher can only name fetchers listed before it.
+  fetchers: [
+    {
+      // Leaf: downloads content over HTTP(S) and stores it in the CAS.
+      name: "FETCH_URL",
+      url: {
+        cas_store: "CAS_MAIN_STORE",
+
+        // Should be on the same volume as the CAS content_path so the fetched
+        // temp file can be moved into the store without a copy.
+        temp_path: "/tmp/nativelink/data/tmp_path-fetch",
+
+        // Reject any single download larger than 256 GiB.
+        max_size_bytes: 274877906944,
+      },
+    },
+    {
+      // Runs fetches in the background, joining concurrent identical ones and
+      // keeping a fetch running past the client's RPC deadline so a retry can
+      // reuse it, and writes the fetched asset's URI+qualifiers -> digest
+      // metadata so future Fetch calls hit.
+      name: "FETCH_CACHE",
+      cache: {
+        fetcher: "FETCH_URL",
+        fetch_store: "FETCH_METADATA_STORE",
+        cas_store: "CAS_MAIN_STORE",
+        max_concurrent_fetches: 8,
+      },
+    },
   ],
   schedulers: [
     {
@@ -159,6 +213,17 @@
             main: "CAS_MAIN_STORE",
           },
         },
+
+        // Remote Asset API fetch service. `fetch_store` is read to serve
+        // previously fetched/pushed assets; `fetcher` is the chain used to
+        // actively download on a miss (omit `fetcher` for lookup-only).
+        fetch: [
+          {
+            instance_name: "main",
+            fetch_store: "FETCH_METADATA_STORE",
+            fetcher: "FETCH_CACHE",
+          },
+        ],
       },
     },
     {

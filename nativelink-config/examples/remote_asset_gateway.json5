@@ -1,0 +1,263 @@
+// A Remote Asset gateway for a build cluster whose workers have no network
+// access. Builds download their dependencies through `Fetch` here instead
+// (Bazel: `--remote_downloader=grpc://<this host>:50051`), and the content
+// lands in the CAS the workers already read from.
+//
+// Where a download goes depends on its host:
+//
+//   * the company's artifact repository, on a private subnet, is fetched
+//     directly, and may serve unpinned (snapshot) artifacts;
+//   * a short list of well-known public origins is fetched directly, but only
+//     when the request pins the content with a checksum;
+//   * everything else goes out through the corporate egress proxy, also only
+//     when pinned, so that the proxy's logging and policy apply to it.
+//
+// Any `Fetch` caller can choose the URL, and can read back what was fetched,
+// so each `url` fetcher is limited to the addresses it needs. Only the
+// internal one may reach a private range, and only the artifact repository's
+// subnet; the route sends it nothing else. See "`Fetch` callers get the CAS
+// host's network" in the security-hardening docs.
+//
+// `PushBlob` records a URI -> digest mapping that every later `Fetch`
+// trusts, so it is served on its own listener, for CI.
+{
+  stores: [
+    {
+      name: "CAS_MAIN_STORE",
+      verify: {
+        backend: {
+          filesystem: {
+            content_path: "/var/lib/nativelink/content_path-cas",
+            temp_path: "/var/lib/nativelink/tmp_path-cas",
+            eviction_policy: {
+              // 500 GB.
+              max_bytes: 500000000000,
+            },
+          },
+        },
+        verify_size: true,
+        verify_hash: true,
+      },
+    },
+    {
+      name: "AC_MAIN_STORE",
+      filesystem: {
+        content_path: "/var/lib/nativelink/content_path-ac",
+        temp_path: "/var/lib/nativelink/tmp_path-ac",
+        eviction_policy: {
+          // 5 GB.
+          max_bytes: 5000000000,
+        },
+      },
+    },
+    {
+      // Remote Asset metadata (URI + qualifiers -> digest), stored as Action
+      // Cache entries alongside the build's own. An entry whose content has
+      // left the CAS reads as a miss, so the asset is fetched again instead of
+      // a dangling digest being served.
+      name: "ASSET_METADATA_STORE",
+      completeness_checking: {
+        backend: {
+          ref_store: {
+            name: "AC_MAIN_STORE",
+          },
+        },
+        cas_store: {
+          ref_store: {
+            name: "CAS_MAIN_STORE",
+          },
+        },
+      },
+    },
+  ],
+
+  // The chain, outermost first:
+  //
+  //   FETCH  (cache: joins fetches, keeps going after the client leaves,
+  //           records what was fetched)
+  //   -> FETCH_ROUTED  (route: picks a url fetcher by host)
+  //   -> ARTIFACTORY | PUBLIC_DIRECT | PUBLIC_VIA_PROXY  (url)
+  //
+  // A fetcher can only name fetchers listed before it.
+  fetchers: [
+    {
+      // The internal artifact repository. It is the one fetcher allowed to
+      // reach a private address, and only its subnet; the route below sends
+      // it only the repository's own host. Unpinned requests are allowed, for
+      // snapshot artifacts, and `http_header:Authorization` qualifiers from
+      // the client are forwarded to it.
+      name: "ARTIFACTORY",
+      url: {
+        cas_store: "CAS_MAIN_STORE",
+        // Same volume as the CAS content_path, so downloads are moved into
+        // the store rather than copied.
+        temp_path: "/var/lib/nativelink/tmp_path-fetch",
+        allowed_ip_ranges: [
+          "10.20.30.0/24",
+        ],
+        max_fetch_duration_s: 600,
+      },
+    },
+    {
+      // Well-known public origins, fetched directly. Only pinned requests: a
+      // caller can then only fetch content it already knows the hash of.
+      name: "PUBLIC_DIRECT",
+      url: {
+        cas_store: "CAS_MAIN_STORE",
+        temp_path: "/var/lib/nativelink/tmp_path-fetch",
+        require_checksum: true,
+
+        // 20 GiB per download; toolchains are big, but not that big.
+        max_size_bytes: 21474836480,
+        max_fetch_duration_s: 1800,
+      },
+    },
+    {
+      // Every other public origin, through the corporate egress proxy, which
+      // logs and filters it. NativeLink does not resolve these hosts itself,
+      // so the proxy's own rules are what keep them off internal addresses.
+      // The proxy URL carries credentials, so it comes from a mounted secret.
+      name: "PUBLIC_VIA_PROXY",
+      url: {
+        cas_store: "CAS_MAIN_STORE",
+        temp_path: "/var/lib/nativelink/tmp_path-fetch",
+        require_checksum: true,
+        http_proxy_secret_file: "${EGRESS_PROXY_URL_FILE:-/run/secrets/egress-proxy-url}",
+        max_size_bytes: 21474836480,
+        max_fetch_duration_s: 1800,
+      },
+    },
+    {
+      // Picks the url fetcher by host, first match wins. A request listing
+      // mirrors on different routes tries each route's mirrors in turn.
+      // Leaving out `otherwise` would refuse every host not listed here.
+      name: "FETCH_ROUTED",
+      route: {
+        routes: [
+          {
+            hosts: [
+              "artifactory.corp.example",
+            ],
+            fetcher: "ARTIFACTORY",
+          },
+          {
+            hosts: [
+              // Source archives and release assets, which redirect to
+              // objects.githubusercontent.com.
+              "github.com",
+              "*.github.com",
+              "*.githubusercontent.com",
+
+              // Bazel's own mirrors and the Bazel Central Registry.
+              "mirror.bazel.build",
+              "bcr.bazel.build",
+
+              // Language package registries rules_rust, rules_python and
+              // rules_js fetch from.
+              "static.crates.io",
+              "files.pythonhosted.org",
+              "registry.npmjs.org",
+            ],
+            fetcher: "PUBLIC_DIRECT",
+          },
+        ],
+        otherwise: "PUBLIC_VIA_PROXY",
+      },
+    },
+    {
+      // Joins concurrent pinned fetches of the same URI (a cold build asks
+      // for the same toolchain from every action at once) and keeps a fetch
+      // running after its client gives up, so the retry finds it done.
+      //
+      // Records what a pinned fetch fetched, so the next Fetch for it is
+      // answered from the CAS; those entries never expire. Unpinned fetches
+      // (the snapshots above) are not recorded and download every time.
+      name: "FETCH",
+      cache: {
+        fetcher: "FETCH_ROUTED",
+        fetch_store: "ASSET_METADATA_STORE",
+        cas_store: "CAS_MAIN_STORE",
+        max_concurrent_fetches: 32,
+
+        // Bazel's default --remote_timeout is 60s; give slow origins at least
+        // that, and no request more than half an hour.
+        min_timeout_s: 60,
+        max_timeout_s: 1800,
+      },
+    },
+  ],
+  servers: [
+    {
+      // Builds and workers.
+      listener: {
+        http: {
+          socket_address: "0.0.0.0:50051",
+        },
+      },
+      services: {
+        cas: [
+          {
+            instance_name: "main",
+            cas_store: "CAS_MAIN_STORE",
+          },
+        ],
+        ac: [
+          {
+            instance_name: "main",
+            ac_store: "AC_MAIN_STORE",
+          },
+        ],
+        capabilities: [
+          {
+            instance_name: "main",
+          },
+        ],
+        bytestream: [
+          {
+            instance_name: "main",
+            cas_store: "CAS_MAIN_STORE",
+          },
+        ],
+        fetch: [
+          {
+            instance_name: "main",
+            fetch_store: "ASSET_METADATA_STORE",
+            fetcher: "FETCH",
+          },
+        ],
+        health: {},
+      },
+    },
+    {
+      // CI only. A push is trusted as is: whatever digest it records for a
+      // URI is what later Fetch calls get, without a download. Keep this
+      // listener off the network builds and developers use.
+      listener: {
+        http: {
+          socket_address: "0.0.0.0:50052",
+        },
+      },
+      services: {
+        push: [
+          {
+            instance_name: "main",
+            push_store: "ASSET_METADATA_STORE",
+            cas_store: "CAS_MAIN_STORE",
+          },
+        ],
+        cas: [
+          {
+            instance_name: "main",
+            cas_store: "CAS_MAIN_STORE",
+          },
+        ],
+        bytestream: [
+          {
+            instance_name: "main",
+            cas_store: "CAS_MAIN_STORE",
+          },
+        ],
+      },
+    },
+  ],
+}

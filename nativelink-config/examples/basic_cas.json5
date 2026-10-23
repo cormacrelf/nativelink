@@ -12,6 +12,28 @@
       },
     },
     {
+      // Remote Asset metadata (fetched URI + qualifiers -> CAS digest), stored
+      // as ordinary Action Cache entries and used by the `fetch` service. It
+      // shares AC_MAIN_STORE: the keys are digests of a synthetic Action whose
+      // command is distinctive, so they cannot collide with real actions. The
+      // `completeness_checking` wrapper makes an entry read as a miss once any
+      // of its content has left the CAS, so the asset is fetched again rather
+      // than a dangling digest being served.
+      name: "FETCH_METADATA_STORE",
+      completeness_checking: {
+        backend: {
+          ref_store: {
+            name: "AC_MAIN_STORE",
+          },
+        },
+        cas_store: {
+          ref_store: {
+            name: "WORKER_FAST_SLOW_STORE",
+          },
+        },
+      },
+    },
+    {
       name: "WORKER_FAST_SLOW_STORE",
       fast_slow: {
         // "fast" must be a "filesystem" store because the worker uses it to make
@@ -62,6 +84,39 @@
           ISA: "exact",
           InputRootAbsolutePath: "ignore", // used by chromium builds, but we can drop it
         },
+      },
+    },
+  ],
+
+  // Fetchers compose as a chain referenced by name: `FETCH_CACHE` ->
+  // `FETCH_URL`. A fetcher can only name fetchers listed before it.
+  fetchers: [
+    {
+      // Leaf: downloads content over HTTP(S) and stores it in the CAS.
+      name: "FETCH_URL",
+      url: {
+        cas_store: "WORKER_FAST_SLOW_STORE",
+
+        // Should be on the same volume as the CAS store's content_path so the
+        // fetched temp file can be moved into the store without a copy.
+        temp_path: "/tmp/nativelink/data-worker-test/tmp_path-fetch",
+
+        // Reject any single download larger than 256 GiB.
+        max_size_bytes: 274877906944,
+      },
+    },
+    {
+      // Runs fetches in the background, joining concurrent identical ones and
+      // keeping a fetch running past the client's RPC deadline so a retry can
+      // reuse it, and writes the fetched asset's URI+qualifiers -> digest
+      // metadata so future Fetch calls hit. Its fetch_store should match the
+      // `fetch` service's fetch_store below.
+      name: "FETCH_CACHE",
+      cache: {
+        fetcher: "FETCH_URL",
+        fetch_store: "FETCH_METADATA_STORE",
+        cas_store: "WORKER_FAST_SLOW_STORE",
+        max_concurrent_fetches: 8,
       },
     },
   ],
@@ -193,6 +248,22 @@
           {
             instance_name: "main",
             cas_store: "WORKER_FAST_SLOW_STORE",
+          },
+        ],
+
+        // Remote Asset API fetch service. `fetch_store` is read to serve
+        // previously fetched/pushed assets; `fetcher` is the chain used to
+        // actively download on a miss. Omit `fetcher` for metadata-lookup-only.
+        fetch: [
+          {
+            instance_name: "",
+            fetch_store: "FETCH_METADATA_STORE",
+            fetcher: "FETCH_CACHE",
+          },
+          {
+            instance_name: "main",
+            fetch_store: "FETCH_METADATA_STORE",
+            fetcher: "FETCH_CACHE",
           },
         ],
       },

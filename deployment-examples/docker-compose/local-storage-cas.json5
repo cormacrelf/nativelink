@@ -90,8 +90,6 @@
             "": "CAS_MAIN_STORE",
           },
         },
-        fetch: {},
-        push: {},
       },
     },
     {

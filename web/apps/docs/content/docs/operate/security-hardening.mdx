@@ -359,6 +359,173 @@ Containerising the worker helps only as far as your container runtime is a
 boundary. The shipped Compose executor runs `privileged: true` precisely so
 `unshare` works, which removes most of what the container was giving you.
 
+## `Fetch` callers get the CAS host's network [#fetch-callers-get-the-cas-hosts-network]
+
+Keeping workers off the network is a main reason to run the Remote Asset
+`Fetch` service at all: a build downloads its dependencies through the server
+instead of from the worker. That moves the network access to the host running
+`Fetch`, usually the CAS host, and hands it to every caller. A caller names any
+URL, a `url` fetcher downloads it into the CAS, and the caller reads it back.
+That host often holds the cloud credentials the stores use, which its metadata
+service hands out to anything that can reach it.
+
+### What the `url` fetcher refuses by default [#what-the-url-fetcher-refuses-by-default]
+
+A `url` fetcher connects only to public addresses unless you say otherwise.
+Public hosts need no configuration. It refuses:
+
+- loopback, private networks (`10.0.0.0/8`, `172.16.0.0/12`,
+  `192.168.0.0/16`, `fc00::/7`) and link-local addresses (`169.254.0.0/16`,
+  where the cloud metadata services answer, and `fe80::/10`);
+- shared address space, `100.64.0.0/10`, where Alibaba Cloud's metadata
+  service and Tailscale nodes live;
+- multicast, reserved and documentation ranges;
+- IPv6 addresses that embed a refused IPv4 address: `::ffff:127.0.0.1`, NAT64
+  (`64:ff9b::a9fe:a9fe` is `169.254.169.254`) and 6to4.
+
+The check runs on the addresses a host name resolves to, at the moment of
+connecting. So a host name that resolves to a refused address is refused
+whether it was in the request or came from a redirect, and changing a DNS
+answer between a check and the connection does not help. URLs with an IP
+address as their host are checked on the request and on every redirect. A
+refused URI fails with `PERMISSION_DENIED`, the next mirror is tried, and if
+every URI fails that way, so does the request.
+
+To let the fetcher reach an internal host, list its range in
+`allowed_ip_ranges`. Keep the range as narrow as the host: allowing
+`169.254.0.0/16` opens the metadata service again.
+
+```json5
+fetchers: [
+  {
+    name: "FETCH_URL",
+    url: {
+      cas_store: "CAS_MAIN_STORE",
+      // The internal artifact mirror. Nothing else private is reachable.
+      allowed_ip_ranges: ["10.20.30.0/24"],
+    },
+  },
+],
+```
+
+<SourceLink file="nativelink-config/src/fetchers.rs" symbol="UrlFetcherSpec::allowed_ip_ranges" />
+
+### Header qualifiers defeat header-based metadata checks [#header-qualifiers-defeat-header-based-metadata-checks]
+
+The GCP metadata server answers only requests carrying
+`Metadata-Flavor: Google`, and Azure's only those carrying `Metadata: true`.
+Those headers stop a naive SSRF, but not this one: a caller sets any request
+header with an `http_header:*` qualifier, and the fetcher sends it. On those
+clouds the address check is what keeps the metadata service out of reach. AWS
+IMDSv2 needs a `PUT` first, which a fetch never sends; IMDSv1 needs nothing.
+
+### Through a proxy, the proxy decides [#through-a-proxy-the-proxy-decides]
+
+With `http_proxy` set, the proxy resolves and connects to each origin, so
+NativeLink never sees the address. The fetcher still checks URLs that name an
+IP address, and checks hosts in `no_proxy` as usual, but a host name sent
+through the proxy is the proxy's to police. Give the proxy its own outbound
+rules. The proxy itself is always reachable, whatever its address.
+
+### Limiting the hosts as well as the addresses [#limiting-the-hosts-as-well-as-the-addresses]
+
+Some hosts on public addresses trust the cluster rather than the caller: an
+artifact repository that allowlists the cluster's outbound NAT address, or a
+bucket that accepts requests arriving through the VPC's endpoint. Usually that
+is the point, since builds are meant to get those artifacts. But it means
+anything reachable from the cluster by name is reachable by every `Fetch`
+caller, and the address check cannot tell those hosts apart from the rest.
+
+A `route` fetcher picks a fetcher by host. Without `otherwise` it refuses every
+other URI, which makes it an allowlist. It also lets an internal mirror have
+its own `url` fetcher with `allowed_ip_ranges`, so that permission does not
+extend to every request:
+
+```json5
+fetchers: [
+  { name: "PUBLIC", url: { cas_store: "CAS_MAIN_STORE" } },
+  {
+    name: "INTERNAL",
+    url: { cas_store: "CAS_MAIN_STORE", allowed_ip_ranges: ["10.20.30.0/24"] },
+  },
+  {
+    name: "ROUTED",
+    route: {
+      routes: [
+        { hosts: ["artifacts.corp.example"], fetcher: "INTERNAL" },
+        { hosts: ["github.com", "*.githubusercontent.com"], fetcher: "PUBLIC" },
+      ],
+      // No `otherwise`: any other host is refused.
+    },
+  },
+],
+```
+
+Routing matches the host the URL names, before any redirect, so a route to
+`github.com` also allows whatever `github.com` redirects to. Redirect targets
+still go through the `url` fetcher's address check. Assets that were pushed, or
+fetched earlier, are served whatever their host: routing decides only what is
+downloaded.
+
+<SourceLink file="nativelink-config/src/fetchers.rs" symbol="RouteSpec" />
+
+### Narrowing a route to ports, schemes and paths [#narrowing-a-route-to-ports-schemes-and-paths]
+
+A route takes only the scheme's default port, 443 or 80, unless it lists
+`ports`. So a route to an internal mirror does not also reach the database or
+admin console on the same host. A route can also require `https` with
+`schemes`, and take only some paths with `path_prefixes`:
+
+```json5
+routes: [
+  {
+    hosts: ["artifacts.corp.example"],
+    ports: [8443],
+    schemes: ["https"],
+    fetcher: "INTERNAL",
+  },
+  {
+    hosts: ["github.com"],
+    path_prefixes: ["/bazelbuild", "/my-org"],
+    fetcher: "PUBLIC",
+  },
+  { hosts: ["*.githubusercontent.com"], fetcher: "PUBLIC" },
+],
+```
+
+A path prefix matches whole segments and is case-sensitive: `/bazelbuild`
+takes `/bazelbuild/rules_go/...` but not `/bazelbuild-evil/...` or
+`/BazelBuild/...`. Dot segments are resolved before matching, as the `url`
+fetcher sends the URL, and a path that a server could still resolve outside the
+prefix matches no route: one with an encoded `/` or `\` (`..%2F`), a `..;`
+segment, or a double-encoded `%`. Spelling a path differently can only make it
+miss a route, so a route should send URIs to the fetcher that may do more, and
+`otherwise` to the one that may do less.
+
+A path prefix limits which URLs are requested, not who wrote what they serve.
+A redirect from inside the prefix is followed wherever it leads, within the
+`url` fetcher's address check. And on a forge, a path can serve other people's
+content: GitHub serves archives of pull requests and of commits pushed to any
+fork under the parent repository's path. Add `require_checksum` where the
+content must be trusted, not only its origin.
+
+Routes are tried in order, and the first that matches wins, so put a narrower
+route ahead of a broader one to the same host.
+
+<SourceLink file="nativelink-config/src/fetchers.rs" symbol="FetchRouteSpec" />
+
+### Requiring a checksum limits what can be read [#requiring-a-checksum-limits-what-can-be-read]
+
+With `require_checksum: true` on the `url` fetcher, a fetch must name the hash
+of the content it wants, and content that does not match never reaches the
+CAS. A caller can then only fetch what it already knows the hash of, so nothing
+secret can be read out. Two things remain: the side effects of the `GET`
+itself, and an oracle, since a connection failure and a checksum mismatch come
+back with different codes. The cost is that Bazel repository rules without
+`sha256` or `integrity` stop working against this server.
+
+<SourceLink file="nativelink-config/src/fetchers.rs" symbol="UrlFetcherSpec::require_checksum" />
+
 ## What to do, in order [#what-to-do-in-order]
 
 | Step | Why |
@@ -370,6 +537,8 @@ boundary. The shipped Compose executor runs `privileged: true` precisely so
 | Remove ambient credentials from worker hosts | An action can read them |
 | Put no secrets in `environment_variables` on the worker entrypoint | Every action sees them |
 | Decide you can rebuild a worker host at any time | Assume one will need it |
+| Keep `allowed_ip_ranges` to the internal hosts `Fetch` must reach | Whoever can call `Fetch` gets the network access you allow |
+| Put a `route` fetcher in the chain if `Fetch` should reach only known hosts | The address check cannot tell which public hosts trust your cluster |
 
 <VerifyBlock>
 
@@ -401,6 +570,8 @@ boundary. The shipped Compose executor runs `privileged: true` precisely so
 | A certificate rotated on disk but the process serves the old one | Expansion and file reads happen at parse time | Restart the process |
 | An action reached an internal service it should not have | No network namespace | Segment the worker network; this is not fixable in configuration |
 | Actions fail with permission errors after adding `NoNewPrivileges` | It blocks the `unshare` the worker performs | See [bare metal](/operate/deploy-bare-metal), which omits it deliberately |
+| `Fetch` of an internal mirror fails with `PERMISSION_DENIED` naming the host | The `url` fetcher refuses non-public addresses by default | Add the mirror's range to `allowed_ip_ranges`, ideally on a fetcher only a `route` for that host uses |
+| `Fetch` fails with `PERMISSION_DENIED` saying no route matches | A `route` fetcher without `otherwise` refuses unlisted hosts | Add the host to a route, or add `otherwise` |
 | The health probe works from the internet | `health` shares a listener with something public | Give it a dedicated listener |
 | Something else is broken and it is not on this list | Not everything is a security problem | [Troubleshooting](/operate/troubleshooting) indexes the rest |
 
