@@ -34,6 +34,23 @@
         },
       },
     },
+    {
+      // Remote Asset metadata, stored as Action Cache entries in AC_MAIN_STORE
+      // and read as a miss once their content has left the CAS.
+      name: "ASSET_METADATA_STORE",
+      completeness_checking: {
+        backend: {
+          ref_store: {
+            name: "AC_MAIN_STORE",
+          },
+        },
+        cas_store: {
+          ref_store: {
+            name: "WORKER_FAST_SLOW_STORE",
+          },
+        },
+      },
+    },
   ],
   schedulers: [
     {
@@ -145,12 +162,12 @@
         ],
         fetch: [
           {
-            fetch_store: "WORKER_FAST_SLOW_STORE",
+            fetch_store: "ASSET_METADATA_STORE",
           },
         ],
         push: [
           {
-            push_store: "WORKER_FAST_SLOW_STORE",
+            push_store: "ASSET_METADATA_STORE",
           },
         ],
         capabilities: [

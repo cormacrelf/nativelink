@@ -14,9 +14,14 @@
 
 use core::convert::Into;
 use std::collections::HashMap;
+use std::time::Instant;
 
 use nativelink_config::cas_server::{FetchConfig, WithInstanceName};
 use nativelink_error::{Error, ResultExt, make_err, make_input_err};
+use nativelink_fetch::remote_asset_proto::{
+    AssetKind, RemoteAssetEntry, RemoteAssetQuery, now_timestamp, qualifier_names,
+    read_remote_asset_entry, redacted_uris, timestamp_is_before,
+};
 use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::{
     Fetch, FetchServer as Server,
 };
@@ -25,18 +30,77 @@ use nativelink_proto::build::bazel::remote::asset::v1::{
 };
 use nativelink_proto::google::rpc::Status as GoogleStatus;
 use nativelink_store::store_manager::StoreManager;
-use nativelink_util::digest_hasher::{default_digest_hasher_func, make_ctx_for_hash_func};
-use nativelink_util::store_trait::{Store, StoreLike};
+use nativelink_util::digest_hasher::make_ctx_for_hash_func;
+use nativelink_util::redact::redact_uri;
+use nativelink_util::store_trait::Store;
 use opentelemetry::context::FutureExt;
-use prost::Message;
+use prost_types::Timestamp;
 use tonic::{Code, Request, Response, Status};
-use tracing::{Instrument, Level, error_span, info, instrument};
+use tracing::{Instrument, Level, debug, error_span, info, instrument, warn};
 
-use crate::remote_asset_proto::{RemoteAssetArtifact, RemoteAssetQuery};
-
-#[derive(Debug, Clone)]
+/// Per-instance state: the Action Cache store holding the Remote Asset metadata
+/// (mapping URI+qualifiers -> digest) the server reads. Whether a hit's content
+/// is still in the CAS is the store's business: wrap it in a
+/// `completeness_checking` store to have such entries read as misses.
+#[derive(Clone, Debug)]
 pub struct FetchStoreInfo {
     store: Store,
+}
+
+/// Whether a cached entry may be served at `now`. An entry past its
+/// `expire_at` is stale. When the request sets `oldest_content_accepted`, an
+/// entry stored before it, or with no `stored_at` to compare, is too old.
+fn is_current(
+    expire_at: Option<&Timestamp>,
+    stored_at: Option<&Timestamp>,
+    oldest_content_accepted: Option<&Timestamp>,
+    now: &Timestamp,
+) -> bool {
+    if expire_at.is_some_and(|expire_at| !timestamp_is_before(now, expire_at)) {
+        return false;
+    }
+    match (oldest_content_accepted, stored_at) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(oldest), Some(stored_at)) => !timestamp_is_before(stored_at, oldest),
+    }
+}
+
+/// Looks up the cached entry for `query` in `store`, returning it only if it
+/// may be served at `now`. Anything else (no entry, an unreadable store, an
+/// expired or too old entry) is a miss, not a reason to fail the request.
+async fn lookup_entry(
+    store: &Store,
+    query: &RemoteAssetQuery,
+    digest_function: i32,
+    oldest_content_accepted: Option<&Timestamp>,
+    now: &Timestamp,
+) -> Option<RemoteAssetEntry> {
+    let entry = match read_remote_asset_entry(store, query, digest_function).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return None,
+        Err(err) => {
+            warn!(
+                uri = %redact_uri(&query.uri),
+                ?err,
+                "Failed to read fetch asset metadata"
+            );
+            return None;
+        }
+    };
+    if !is_current(
+        entry.expire_at.as_ref(),
+        entry.stored_at.as_ref(),
+        oldest_content_accepted,
+        now,
+    ) {
+        debug!(
+            uri = %redact_uri(&query.uri),
+            "Cached fetch asset is expired or too old"
+        );
+        return None;
+    }
+    Some(entry)
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +140,7 @@ impl FetchServer {
             .stores
             .get(instance_name)
             .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?;
+        let start = Instant::now();
 
         if request.uris.is_empty() {
             return Err(Error::new(
@@ -83,44 +148,54 @@ impl FetchServer {
                 "No uris in fetch request".to_owned(),
             ));
         }
+        let now = now_timestamp();
         for uri in &request.uris {
-            let asset_request = RemoteAssetQuery::new(uri.clone(), request.qualifiers.clone());
-            let asset_digest = asset_request.digest();
-            let asset_response_possible = store_info
-                .store
-                .get_part_unchunked(asset_digest, 0, None)
-                .await;
-
-            info!(
-                uri = uri,
-                digest = format!("{}", asset_digest),
+            let query =
+                RemoteAssetQuery::new(AssetKind::Blob, uri.clone(), request.qualifiers.clone());
+            let entry = lookup_entry(
+                &store_info.store,
+                &query,
+                request.digest_function,
+                request.oldest_content_accepted.as_ref(),
+                &now,
+            )
+            .await;
+            debug!(
+                uri = %redact_uri(uri),
+                hit = entry.is_some(),
                 "Looked up fetch asset"
             );
-
-            if let Ok(asset_response_raw) = asset_response_possible {
-                let asset_response = RemoteAssetArtifact::decode(asset_response_raw)
-                    .err_tip(|| "Failed to decode stored RemoteAssetArtifact")?;
+            if let Some(entry) = entry {
+                info!(
+                    uri = %redact_uri(uri),
+                    digest = %entry.digest.hash,
+                    size_bytes = entry.digest.size_bytes,
+                    source = "cache",
+                    duration = ?start.elapsed(),
+                    "Fetched asset"
+                );
                 return Ok(Response::new(FetchBlobResponse {
                     status: Some(GoogleStatus {
                         code: Code::Ok.into(),
                         message: "Fetch object found".to_owned(),
                         details: vec![],
                     }),
-                    uri: asset_response.uri,
-                    qualifiers: asset_response.qualifiers,
-                    expires_at: asset_response.expire_at,
-                    blob_digest: asset_response.blob_digest,
-                    digest_function: asset_response.digest_function,
+                    uri: entry.query.uri,
+                    qualifiers: entry.query.qualifiers,
+                    expires_at: entry.expire_at,
+                    blob_digest: Some(entry.digest),
+                    digest_function: entry.digest_function,
                 }));
             }
         }
+
         Ok(Response::new(FetchBlobResponse {
             status: Some(make_err!(Code::NotFound, "No item found").into()),
-            uri: request.uris.first().cloned().unwrap_or(String::new()),
-            qualifiers: vec![],
+            uri: request.uris.first().cloned().unwrap_or_default(),
+            qualifiers: request.qualifiers,
             expires_at: None,
             blob_digest: None,
-            digest_function: default_digest_hasher_func().proto_digest_func().into(),
+            digest_function: request.digest_function,
         }))
     }
 }
@@ -128,11 +203,19 @@ impl FetchServer {
 #[tonic::async_trait]
 impl Fetch for FetchServer {
     #[allow(clippy::blocks_in_conditions)]
+    // The response echoes the request's qualifiers, header values included, so
+    // it is not logged either.
     #[instrument(
         err(level = Level::WARN),
-        ret(level = Level::INFO),
         skip_all,
-        fields(request = ?grpc_request.get_ref())
+        fields(
+            // Qualifier values and URI credentials must never be logged.
+            request.instance_name = ?grpc_request.get_ref().instance_name,
+            request.uris = ?redacted_uris(&grpc_request.get_ref().uris),
+            request.qualifiers = ?qualifier_names(&grpc_request.get_ref().qualifiers),
+            request.digest_function = ?grpc_request.get_ref().digest_function,
+            request.has_timeout = grpc_request.get_ref().timeout.is_some(),
+        )
     )]
     async fn fetch_blob(
         &self,

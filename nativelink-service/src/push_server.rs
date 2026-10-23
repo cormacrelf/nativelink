@@ -17,21 +17,25 @@ use std::collections::HashMap;
 
 use nativelink_config::cas_server::{PushConfig, WithInstanceName};
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
+use nativelink_fetch::remote_asset_proto::{
+    AssetKind, RemoteAssetEntry, RemoteAssetQuery, now_timestamp, qualifier_names, redacted_uris,
+    write_remote_asset_entry,
+};
 use nativelink_proto::build::bazel::remote::asset::v1::push_server::{Push, PushServer as Server};
 use nativelink_proto::build::bazel::remote::asset::v1::{
     PushBlobRequest, PushBlobResponse, PushDirectoryRequest, PushDirectoryResponse,
 };
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::digest_hasher::make_ctx_for_hash_func;
-use nativelink_util::store_trait::{Store, StoreLike};
+use nativelink_util::redact::redact_uri;
+use nativelink_util::store_trait::Store;
 use opentelemetry::context::FutureExt;
 use tonic::{Request, Response, Status};
 use tracing::{Instrument, Level, error_span, info, instrument};
 
-use crate::remote_asset_proto::RemoteAssetArtifact;
-
 #[derive(Debug, Clone)]
 pub struct PushStoreInfo {
+    /// The Action Cache store the metadata is written to.
     store: Store,
     read_only: bool,
 }
@@ -97,25 +101,25 @@ impl PushServer {
                 "No uris in push request".to_owned(),
             ));
         }
+        let stored_at = now_timestamp();
         for uri in request.uris {
-            let asset = RemoteAssetArtifact::new(
-                uri.clone(),
-                request.qualifiers.clone(),
-                blob_digest.clone(),
-                request.expire_at,
-                request.digest_function,
-            );
-            let asset_digest = asset.digest();
-            store_info
-                .store
-                .update_oneshot(asset_digest, asset.as_bytes())
+            // Header qualifiers are dropped here: they are often credentials
+            // and are not part of an asset's identity.
+            let entry = RemoteAssetEntry {
+                query: RemoteAssetQuery::new(
+                    AssetKind::Blob,
+                    uri.clone(),
+                    request.qualifiers.clone(),
+                ),
+                digest: blob_digest.clone(),
+                expire_at: request.expire_at,
+                stored_at: Some(stored_at),
+                digest_function: request.digest_function,
+            };
+            write_remote_asset_entry(&store_info.store, &entry)
                 .await
                 .err_tip(|| "Failed to update in push server")?;
-            info!(
-                uri = uri,
-                digest = format!("{}", asset_digest),
-                "Pushed asset metadata with hash"
-            );
+            info!(uri = %redact_uri(&uri), "Pushed asset metadata");
         }
 
         Ok(Response::new(PushBlobResponse {}))
@@ -129,7 +133,13 @@ impl Push for PushServer {
         err(level = Level::WARN),
         ret(level = Level::INFO),
         skip_all,
-        fields(request = ?grpc_request.get_ref())
+        fields(
+            // Qualifier values and URI credentials must never be logged.
+            request.instance_name = ?grpc_request.get_ref().instance_name,
+            request.uris = ?redacted_uris(&grpc_request.get_ref().uris),
+            request.qualifiers = ?qualifier_names(&grpc_request.get_ref().qualifiers),
+            request.digest_function = ?grpc_request.get_ref().digest_function,
+        )
     )]
     async fn push_blob(
         &self,

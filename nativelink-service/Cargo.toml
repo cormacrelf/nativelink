@@ -9,6 +9,7 @@ version = "1.8.3"
 [dependencies]
 nativelink-config = { path = "../nativelink-config" }
 nativelink-error = { path = "../nativelink-error" }
+nativelink-fetch = { path = "../nativelink-fetch" }
 nativelink-metric = { path = "../nativelink-metric" }
 nativelink-proto = { path = "../nativelink-proto" }
 nativelink-scheduler = { path = "../nativelink-scheduler" }

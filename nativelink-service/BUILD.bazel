@@ -20,7 +20,6 @@ rust_library(
         "src/health_server.rs",
         "src/lib.rs",
         "src/push_server.rs",
-        "src/remote_asset_proto.rs",
         "src/wire_compression.rs",
         "src/worker_api_server.rs",
     ],
@@ -28,6 +27,7 @@ rust_library(
     deps = [
         "//nativelink-config",
         "//nativelink-error",
+        "//nativelink-fetch",
         "//nativelink-metric",
         "//nativelink-proto",
         "//nativelink-scheduler",
@@ -86,6 +86,7 @@ rust_test_suite(
     deps = [
         "//nativelink-config",
         "//nativelink-error",
+        "//nativelink-fetch",
         "//nativelink-metric",
         "//nativelink-proto",
         "//nativelink-scheduler",

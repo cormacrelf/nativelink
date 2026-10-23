@@ -1,0 +1,43 @@
+load(
+    "@rules_rust//rust:defs.bzl",
+    "rust_doc",
+    "rust_doc_test",
+    "rust_library",
+    "rust_test",
+)
+
+rust_library(
+    name = "nativelink-fetch",
+    srcs = [
+        "src/lib.rs",
+        "src/remote_asset_proto.rs",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//nativelink-error",
+        "//nativelink-proto",
+        "//nativelink-store",
+        "//nativelink-util",
+        "@crates//:bytes",
+        "@crates//:prost",
+        "@crates//:prost-types",
+    ],
+)
+
+rust_test(
+    name = "unit_test",
+    timeout = "short",
+    crate = ":nativelink-fetch",
+)
+
+rust_doc(
+    name = "docs",
+    crate = ":nativelink-fetch",
+    visibility = ["//visibility:public"],
+)
+
+rust_doc_test(
+    name = "doc_test",
+    timeout = "short",
+    crate = ":nativelink-fetch",
+)

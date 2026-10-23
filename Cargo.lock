@@ -3067,6 +3067,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nativelink-fetch"
+version = "1.8.0"
+dependencies = [
+ "bytes",
+ "nativelink-error",
+ "nativelink-proto",
+ "nativelink-store",
+ "nativelink-util",
+ "prost",
+ "prost-types",
+]
+
+[[package]]
 name = "nativelink-macro"
 version = "1.8.3"
 dependencies = [
@@ -3173,6 +3186,7 @@ dependencies = [
  "hyper-util",
  "nativelink-config",
  "nativelink-error",
+ "nativelink-fetch",
  "nativelink-macro",
  "nativelink-metric",
  "nativelink-proto",

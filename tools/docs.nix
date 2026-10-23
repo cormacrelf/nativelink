@@ -9,6 +9,7 @@ writeShellScriptBin "docs" ''
   ${rust}/bin/cargo doc --no-deps \
       -p nativelink-config \
       -p nativelink-error \
+      -p nativelink-fetch \
       -p nativelink-macro \
       -p nativelink-proto \
       -p nativelink-scheduler \

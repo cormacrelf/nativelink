@@ -1,0 +1,19 @@
+#:schema ../tools/cargo-with-detailed-deps.json
+lints.workspace = true
+
+[package]
+edition = "2024"
+name = "nativelink-fetch"
+version = "1.8.0"
+
+[dependencies]
+nativelink-error = { path = "../nativelink-error" }
+nativelink-proto = { path = "../nativelink-proto" }
+nativelink-store = { path = "../nativelink-store" }
+nativelink-util = { path = "../nativelink-util" }
+
+bytes = { version = "1.10.1", default-features = false }
+prost = { version = "0.14.4", default-features = false }
+prost-types = { version = "0.14.4", default-features = false, features = [
+  "std",
+] }

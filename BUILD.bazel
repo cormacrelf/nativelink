@@ -84,6 +84,7 @@ filegroup(
     srcs = [
         "//nativelink-config:docs",
         "//nativelink-error:docs",
+        "//nativelink-fetch:docs",
         "//nativelink-macro:docs",
         "//nativelink-proto:docs",
         "//nativelink-scheduler:docs",
@@ -99,6 +100,7 @@ test_suite(
     tests = [
         "//nativelink-config:unit_test",
         "//nativelink-error:unit_test",
+        "//nativelink-fetch:unit_test",
         "//nativelink-macro:unit_test",
         "//nativelink-metric:unit_test",
         "//nativelink-scheduler:unit_test",
@@ -114,6 +116,7 @@ test_suite(
     tests = [
         "//nativelink-config:doc_test",
         "//nativelink-error:doc_test",
+        "//nativelink-fetch:doc_test",
         "//nativelink-macro:doc_test",
         "//nativelink-scheduler:doc_test",
         "//nativelink-service:doc_test",
