@@ -37,6 +37,7 @@ pub mod redact;
 pub mod resource_info;
 pub mod retry;
 pub mod shutdown_guard;
+pub mod sri;
 pub mod store_trait;
 pub mod task;
 pub mod telemetry;
