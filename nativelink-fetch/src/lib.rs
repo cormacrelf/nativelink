@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod background_fetcher;
 pub mod fetcher;
 pub mod metadata_cache;
 pub mod remote_asset_proto;

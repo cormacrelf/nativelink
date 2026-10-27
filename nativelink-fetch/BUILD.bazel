@@ -10,6 +10,7 @@ load(
 rust_library(
     name = "nativelink-fetch",
     srcs = [
+        "src/background_fetcher.rs",
         "src/fetcher.rs",
         "src/lib.rs",
         "src/metadata_cache.rs",
@@ -22,9 +23,11 @@ rust_library(
         "//nativelink-store",
         "//nativelink-util",
         "@crates//:bytes",
+        "@crates//:parking_lot",
         "@crates//:prost",
         "@crates//:prost-types",
         "@crates//:reqwest",
+        "@crates//:tokio",
         "@crates//:tonic",
         "@crates//:tracing",
     ],
@@ -34,6 +37,7 @@ rust_test_suite(
     name = "integration",
     timeout = "short",
     srcs = [
+        "tests/background_fetcher_test.rs",
         "tests/metadata_cache_test.rs",
     ],
     proc_macro_deps = [
@@ -46,6 +50,7 @@ rust_test_suite(
         "//nativelink-proto",
         "//nativelink-store",
         "//nativelink-util",
+        "@crates//:parking_lot",
         "@crates//:prost",
         "@crates//:tokio",
         "@crates//:tonic",

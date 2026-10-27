@@ -3077,6 +3077,7 @@ dependencies = [
  "nativelink-proto",
  "nativelink-store",
  "nativelink-util",
+ "parking_lot",
  "prost",
  "prost-types",
  "reqwest",
