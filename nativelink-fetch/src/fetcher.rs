@@ -147,9 +147,10 @@ pub struct FetchBlobTask {
     /// and, because differing qualifiers map to distinct metadata entries,
     /// included in the deduplication identity (order-insensitively).
     pub qualifiers: Vec<(String, String)>,
-    /// Checksums of the downloaded bytes (`checksum.sri`) that must all
-    /// match. When empty, the content is downloaded unverified and stored
-    /// under its computed CAS digest.
+    /// Checksums of the downloaded bytes (`checksum.sri` and the hex
+    /// `checksum.sha*` qualifiers) that must all match. When empty, the
+    /// content is downloaded unverified and stored under its computed CAS
+    /// digest.
     pub checksums: Vec<ByteChecksum>,
     /// Hash function used to compute the CAS digest.
     pub hasher_func: DigestHasherFunc,

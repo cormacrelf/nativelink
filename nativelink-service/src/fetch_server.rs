@@ -40,7 +40,9 @@ use nativelink_proto::google::rpc::{BadRequest, ErrorInfo, Status as GoogleStatu
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::digest_hasher::{DigestHasherFunc, make_ctx_for_hash_func};
 use nativelink_util::redact::{redact_uri, redact_uris_in_text};
-use nativelink_util::sri::{ByteChecksum, QUALIFIER_CHECKSUM_SRI};
+use nativelink_util::sri::{
+    BYTE_CHECKSUM_QUALIFIERS, ByteChecksum, HEX_CHECKSUM_QUALIFIERS, QUALIFIER_CHECKSUM_SRI,
+};
 use nativelink_util::store_trait::Store;
 use opentelemetry::context::FutureExt;
 use prost::Message;
@@ -50,10 +52,33 @@ use tonic::metadata::MetadataMap;
 use tonic::{Code, Request, Response, Status};
 use tracing::{Instrument, Level, debug, error_span, info, instrument, warn};
 
-/// Qualifiers `FetchBlob` honours, besides HTTP header qualifiers. Others, such
-/// as `resource_type` and `vcs.*`, would change what must be fetched and we only
-/// download plain HTTP(S) content, so they are rejected rather than ignored.
-const BLOB_QUALIFIERS: &[&str] = &[QUALIFIER_CHECKSUM_SRI, QUALIFIER_BAZEL_CANONICAL_ID];
+/// Qualifiers `FetchBlob` honours, besides HTTP header qualifiers and the
+/// byte checksums of [`BYTE_CHECKSUM_QUALIFIERS`] (see [`blob_qualifiers`]).
+/// Others, such as `resource_type` and `vcs.*`, would change what must be
+/// fetched and we only download plain HTTP(S) content, so they are rejected
+/// rather than ignored.
+const BLOB_QUALIFIERS: &[&str] = &[QUALIFIER_BAZEL_CANONICAL_ID];
+
+/// Every qualifier `FetchBlob` honours, besides HTTP header qualifiers.
+fn blob_qualifiers() -> Vec<&'static str> {
+    BLOB_QUALIFIERS
+        .iter()
+        .chain(BYTE_CHECKSUM_QUALIFIERS)
+        .copied()
+        .collect()
+}
+
+/// The hex checksums (`checksum.sha1`, ...) a request asks for, over the
+/// downloaded bytes. A malformed value is an `InvalidArgument` error.
+fn hex_checksums(qualifiers: &[Qualifier]) -> Result<Vec<ByteChecksum>, Error> {
+    let mut checksums = Vec::new();
+    for &name in HEX_CHECKSUM_QUALIFIERS {
+        if let Some(value) = find_qualifier(qualifiers, name) {
+            checksums.push(ByteChecksum::from_qualifier(name, value)?);
+        }
+    }
+    Ok(checksums)
+}
 
 /// The `checksum.sri` a request asks for, if any. It is parsed only once a
 /// fetch is needed, so that an asset pushed under a qualifier set with an
@@ -61,7 +86,7 @@ const BLOB_QUALIFIERS: &[&str] = &[QUALIFIER_CHECKSUM_SRI, QUALIFIER_BAZEL_CANON
 /// `InvalidArgument` error.
 fn sri_checksum(qualifiers: &[Qualifier]) -> Result<Option<ByteChecksum>, Error> {
     find_qualifier(qualifiers, QUALIFIER_CHECKSUM_SRI)
-        .map(ByteChecksum::from_sri)
+        .map(|value| ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SRI, value))
         .transpose()
 }
 
@@ -458,7 +483,7 @@ impl FetchServer {
 
         // No previously pushed asset matched. If a fetcher is configured (i.e.
         // a CAS store exists), actively download the content, verify it against
-        // the `checksum.sri` qualifier when present, cache it, and return its
+        // the checksum qualifiers when present, cache it, and return its
         // digest. A checksum is optional: when absent the content is still
         // downloaded and stored under its computed CAS digest, just unverified.
         if let Some(fetcher) = &store_info.fetcher {
@@ -466,14 +491,15 @@ impl FetchServer {
             // match all of them, so reject any we cannot honour, and malformed
             // ones, before sending anything to the origin.
             if let Some(status) =
-                unsupported_qualifiers_status(&request.qualifiers, BLOB_QUALIFIERS)
+                unsupported_qualifiers_status(&request.qualifiers, &blob_qualifiers())
             {
                 return Err(status);
             }
             let headers = FetchHeaders::from_qualifiers(&request.qualifiers, request.uris.len())?;
+            let mut checksums = hex_checksums(&request.qualifiers)?;
             let hasher_func = DigestHasherFunc::try_from(request.digest_function)
                 .err_tip(|| "In FetchServer::inner_fetch_blob")?;
-            let checksums = sri_checksum(&request.qualifiers)?.into_iter().collect();
+            checksums.extend(sri_checksum(&request.qualifiers)?);
             let job = FetchBlobTask {
                 uris: request.uris.clone(),
                 qualifiers: qualifier_pairs(&request.qualifiers),

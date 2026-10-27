@@ -14,39 +14,83 @@
 
 //! Checksums over the raw bytes of a downloaded file.
 //!
-//! The Remote Asset API's `checksum.sri` qualifier carries a Subresource
-//! Integrity value, `{algorithm}-{base64}`, for example
-//! `sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=`, or several such
-//! expressions separated by whitespace. It parses into a [`ByteChecksum`],
-//! which a [`ChecksumVerifier`] checks incrementally as the bytes arrive.
+//! The Remote Asset API qualifiers handled here come in two spellings of the
+//! same idea:
+//!
+//! - `checksum.sri`: a Subresource Integrity value, `{algorithm}-{base64}`,
+//!   for example `sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=`, or
+//!   several such expressions separated by whitespace.
+//! - `checksum.sha1`, `checksum.sha256`, `checksum.sha384` and
+//!   `checksum.sha512`: the digest as hex, as lockfiles and registries record
+//!   it (Cargo, pip, Maven, Composer, ...), optionally prefixed with the
+//!   algorithm (`sha256:...`).
+//!
+//! Both parse into a [`ByteChecksum`], which a [`ChecksumVerifier`] checks
+//! incrementally as the bytes arrive.
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use nativelink_error::{Code, Error, make_err, make_input_err};
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 /// The Remote Asset API qualifier name carrying an SRI checksum.
 pub const QUALIFIER_CHECKSUM_SRI: &str = "checksum.sri";
 
+/// The qualifier names carrying a hex digest, one per algorithm.
+pub const QUALIFIER_CHECKSUM_SHA1: &str = "checksum.sha1";
+pub const QUALIFIER_CHECKSUM_SHA256: &str = "checksum.sha256";
+pub const QUALIFIER_CHECKSUM_SHA384: &str = "checksum.sha384";
+pub const QUALIFIER_CHECKSUM_SHA512: &str = "checksum.sha512";
+
+/// The qualifiers that carry a hex digest.
+pub const HEX_CHECKSUM_QUALIFIERS: &[&str] = &[
+    QUALIFIER_CHECKSUM_SHA1,
+    QUALIFIER_CHECKSUM_SHA256,
+    QUALIFIER_CHECKSUM_SHA384,
+    QUALIFIER_CHECKSUM_SHA512,
+];
+
+/// Every qualifier that carries a [`ByteChecksum`].
+pub const BYTE_CHECKSUM_QUALIFIERS: &[&str] = &[
+    QUALIFIER_CHECKSUM_SRI,
+    QUALIFIER_CHECKSUM_SHA1,
+    QUALIFIER_CHECKSUM_SHA256,
+    QUALIFIER_CHECKSUM_SHA384,
+    QUALIFIER_CHECKSUM_SHA512,
+];
+
 /// A hash algorithm a byte checksum can use, weakest first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum HashAlgorithm {
+    Sha1,
     Sha256,
     Sha384,
     Sha512,
 }
 
 impl HashAlgorithm {
-    /// The algorithm's lowercase name, as used in SRI values.
+    /// The algorithm's lowercase name, as used in SRI values and hex prefixes.
     const fn name(self) -> &'static str {
         match self {
+            Self::Sha1 => "sha1",
             Self::Sha256 => "sha256",
             Self::Sha384 => "sha384",
             Self::Sha512 => "sha512",
         }
     }
 
-    /// The algorithm named by an SRI value.
+    /// The length of a digest in bytes.
+    const fn digest_len(self) -> usize {
+        match self {
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+            Self::Sha512 => 64,
+        }
+    }
+
+    /// The algorithm named by an SRI value (SHA-1 is not valid SRI).
     fn from_sri_name(name: &str) -> Option<Self> {
         match name {
             "sha256" => Some(Self::Sha256),
@@ -56,8 +100,20 @@ impl HashAlgorithm {
         }
     }
 
+    /// The algorithm whose hex digest the qualifier `name` carries.
+    fn from_hex_qualifier(name: &str) -> Option<Self> {
+        match name {
+            QUALIFIER_CHECKSUM_SHA1 => Some(Self::Sha1),
+            QUALIFIER_CHECKSUM_SHA256 => Some(Self::Sha256),
+            QUALIFIER_CHECKSUM_SHA384 => Some(Self::Sha384),
+            QUALIFIER_CHECKSUM_SHA512 => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+
     fn hasher(self) -> ByteHasher {
         match self {
+            Self::Sha1 => ByteHasher::Sha1(Sha1::new()),
             Self::Sha256 => ByteHasher::Sha256(Sha256::new()),
             Self::Sha384 => ByteHasher::Sha384(Sha384::new()),
             Self::Sha512 => ByteHasher::Sha512(Sha512::new()),
@@ -76,6 +132,18 @@ pub struct ByteChecksum {
 }
 
 impl ByteChecksum {
+    /// Parses the value of any qualifier in [`BYTE_CHECKSUM_QUALIFIERS`].
+    /// Returns `InvalidArgument` if the value is malformed or `qualifier` is
+    /// not one of them.
+    pub fn from_qualifier(qualifier: &str, value: &str) -> Result<Self, Error> {
+        if qualifier == QUALIFIER_CHECKSUM_SRI {
+            return Self::from_sri(value);
+        }
+        let algorithm = HashAlgorithm::from_hex_qualifier(qualifier)
+            .ok_or_else(|| make_input_err!("'{qualifier}' is not a checksum qualifier"))?;
+        Self::from_hex(algorithm, value).map_err(|e| e.append(format!("In '{qualifier}'")))
+    }
+
     /// Parses an SRI value: whitespace-separated hash expressions
     /// `{algorithm}-{base64-digest}`, each optionally followed by `?options`.
     /// As the SRI spec has it, options are ignored, as are expressions whose
@@ -119,12 +187,43 @@ impl ByteChecksum {
             )
         })
     }
+
+    /// Parses a hex digest of `algorithm`: exactly the digest's length in
+    /// hex characters, in either case, optionally preceded by `{algorithm}:`
+    /// (as in pip's `sha256:...`). Returns `InvalidArgument` otherwise,
+    /// including when the prefix names a different algorithm.
+    fn from_hex(algorithm: HashAlgorithm, value: &str) -> Result<Self, Error> {
+        let name = algorithm.name();
+        let digits = match value.split_once(':') {
+            Some((prefix, digits)) if prefix.eq_ignore_ascii_case(name) => digits,
+            Some((prefix, _)) => {
+                return Err(make_input_err!(
+                    "Expected a {name} digest but the value has prefix '{prefix}:'"
+                ));
+            }
+            None => value,
+        };
+        let expected_chars = algorithm.digest_len() * 2;
+        if digits.len() != expected_chars {
+            return Err(make_input_err!(
+                "A {name} digest is {expected_chars} hex characters, got {}",
+                digits.len()
+            ));
+        }
+        let expected = hex::decode(digits)
+            .map_err(|e| make_input_err!("Invalid hex in {name} checksum '{value}': {e}"))?;
+        Ok(Self {
+            algorithm,
+            expected: vec![expected],
+        })
+    }
 }
 
 /// The running hash state for a [`ChecksumVerifier`], one variant per
 /// supported algorithm.
 #[derive(Debug)]
 enum ByteHasher {
+    Sha1(Sha1),
     Sha256(Sha256),
     Sha384(Sha384),
     Sha512(Sha512),
@@ -156,6 +255,7 @@ impl ChecksumVerifier {
     /// Feeds an additional chunk of data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
         match &mut self.hasher {
+            ByteHasher::Sha1(h) => Digest::update(h, data),
             ByteHasher::Sha256(h) => Digest::update(h, data),
             ByteHasher::Sha384(h) => Digest::update(h, data),
             ByteHasher::Sha512(h) => Digest::update(h, data),
@@ -166,6 +266,7 @@ impl ChecksumVerifier {
     /// Useful for reusing one verifier across multiple download attempts.
     pub fn reset(&mut self) {
         match &mut self.hasher {
+            ByteHasher::Sha1(h) => Digest::reset(h),
             ByteHasher::Sha256(h) => Digest::reset(h),
             ByteHasher::Sha384(h) => Digest::reset(h),
             ByteHasher::Sha512(h) => Digest::reset(h),
@@ -177,6 +278,7 @@ impl ChecksumVerifier {
     /// `Aborted` if the computed hash does not match.
     pub fn finalize_and_verify(&mut self) -> Result<(), Error> {
         let actual = match &mut self.hasher {
+            ByteHasher::Sha1(h) => h.finalize_reset().to_vec(),
             ByteHasher::Sha256(h) => h.finalize_reset().to_vec(),
             ByteHasher::Sha384(h) => h.finalize_reset().to_vec(),
             ByteHasher::Sha512(h) => h.finalize_reset().to_vec(),
