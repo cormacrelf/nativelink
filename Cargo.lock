@@ -3071,12 +3071,19 @@ name = "nativelink-fetch"
 version = "1.8.0"
 dependencies = [
  "bytes",
+ "nativelink-config",
  "nativelink-error",
+ "nativelink-macro",
  "nativelink-proto",
  "nativelink-store",
  "nativelink-util",
  "prost",
  "prost-types",
+ "reqwest",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-test",
 ]
 
 [[package]]

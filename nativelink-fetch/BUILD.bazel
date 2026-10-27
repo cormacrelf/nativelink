@@ -4,12 +4,15 @@ load(
     "rust_doc_test",
     "rust_library",
     "rust_test",
+    "rust_test_suite",
 )
 
 rust_library(
     name = "nativelink-fetch",
     srcs = [
+        "src/fetcher.rs",
         "src/lib.rs",
+        "src/metadata_cache.rs",
         "src/remote_asset_proto.rs",
     ],
     visibility = ["//visibility:public"],
@@ -21,6 +24,33 @@ rust_library(
         "@crates//:bytes",
         "@crates//:prost",
         "@crates//:prost-types",
+        "@crates//:reqwest",
+        "@crates//:tonic",
+        "@crates//:tracing",
+    ],
+)
+
+rust_test_suite(
+    name = "integration",
+    timeout = "short",
+    srcs = [
+        "tests/metadata_cache_test.rs",
+    ],
+    proc_macro_deps = [
+        "//nativelink-macro",
+    ],
+    deps = [
+        "//nativelink-config",
+        "//nativelink-error",
+        "//nativelink-fetch",
+        "//nativelink-proto",
+        "//nativelink-store",
+        "//nativelink-util",
+        "@crates//:prost",
+        "@crates//:tokio",
+        "@crates//:tonic",
+        "@crates//:tracing",
+        "@crates//:tracing-test",
     ],
 )
 
