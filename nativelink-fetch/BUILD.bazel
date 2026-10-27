@@ -20,6 +20,7 @@ rust_library(
         "src/spill.rs",
         "src/tree_hash/h1.rs",
         "src/tree_hash/mod.rs",
+        "src/tree_hash/nar.rs",
         "src/url_fetcher.rs",
     ],
     visibility = ["//visibility:public"],
@@ -58,6 +59,7 @@ rust_test_suite(
         "tests/background_fetcher_test.rs",
         "tests/h1_test.rs",
         "tests/metadata_cache_test.rs",
+        "tests/nar_test.rs",
         "tests/url_fetcher_test.rs",
     ],
     proc_macro_deps = [

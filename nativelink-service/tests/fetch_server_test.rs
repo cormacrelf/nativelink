@@ -1517,6 +1517,193 @@ async fn test_fetch_directory_every_checksum_must_match() -> Result<(), Status> 
     Ok(())
 }
 
+/// One entry of [`build_tar_gz_tree`].
+enum TarEntry {
+    File(&'static str, &'static [u8], u32),
+    Dir(&'static str),
+    Link(&'static str, &'static str),
+}
+
+/// Builds a tar.gz with every path under `prefix`, directories, modes and
+/// symlinks included.
+fn build_tar_gz_tree(prefix: &str, entries: &[TarEntry]) -> Vec<u8> {
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    let mut builder = tar::Builder::new(Vec::new());
+    for entry in entries {
+        let mut header = tar::Header::new_gnu();
+        match entry {
+            TarEntry::File(name, content, mode) => {
+                header.set_mode(*mode);
+                header.set_size(u64::try_from(content.len()).unwrap());
+                header.set_entry_type(tar::EntryType::Regular);
+                builder
+                    .append_data(&mut header, format!("{prefix}{name}"), *content)
+                    .unwrap();
+            }
+            TarEntry::Dir(name) => {
+                header.set_mode(0o755);
+                header.set_size(0);
+                header.set_entry_type(tar::EntryType::Directory);
+                builder
+                    .append_data(&mut header, format!("{prefix}{name}"), std::io::empty())
+                    .unwrap();
+            }
+            TarEntry::Link(name, target) => {
+                header.set_mode(0o777);
+                header.set_size(0);
+                header.set_entry_type(tar::EntryType::Symlink);
+                builder
+                    .append_link(&mut header, format!("{prefix}{name}"), target)
+                    .unwrap();
+            }
+        }
+    }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&builder.into_inner().unwrap()).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A tree with a regular file, an executable, a symlink, nested and empty
+/// directories, a non-ASCII name and names whose bytewise order matters.
+const NAR_TREE: &[TarEntry] = &[
+    TarEntry::Dir("bin/"),
+    TarEntry::File("bin/run.sh", b"#!/bin/sh\necho hi\n", 0o755),
+    TarEntry::Dir("empty/"),
+    TarEntry::Link("link", "bin/run.sh"),
+    TarEntry::File("nested/deeper/f", b"deep", 0o644),
+    TarEntry::File("café.txt", b"unicode", 0o644),
+    TarEntry::File("B", b"upper", 0o644),
+    TarEntry::File("a/x", b"in a", 0o644),
+    TarEntry::File("a-b", b"dash", 0o644),
+    TarEntry::File("a.b", b"dot", 0o644),
+    TarEntry::File("zero", b"", 0o644),
+    TarEntry::File("pad7", b"1234567", 0o644),
+    TarEntry::File("pad8", b"12345678", 0o644),
+];
+
+/// `nix hash path --type sha256` (Nix 2.35.3) of [`NAR_TREE`] built on disk
+/// with `printf`, `mkdir`, `ln -s` and `chmod`, and the same hash in Nix
+/// base-32 (`nix hash convert --to nix32`).
+const NAR_TREE_HASH: &str = "sha256-CD7RjZWP2Wwdf1cvg37MXDGv/B/+cZ8c3FZ2dlJs3xk=";
+const NAR_TREE_HASH_NIX32: &str = "sha256:06fzdi97cxjnvhf9ywgy3zyaycawriz86bspgwfnrncgjn6x2gh8";
+
+#[nativelink_test]
+async fn test_fetch_directory_with_nar_hash() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let archive = build_tar_gz_tree("", NAR_TREE);
+
+    let mut roots = Vec::new();
+    for value in [NAR_TREE_HASH, NAR_TREE_HASH_NIX32] {
+        let uri = serve_once(archive.clone()).await;
+        let response = fs
+            .fetch_directory(directory_request_with(
+                vec![uri],
+                vec![header_qualifier("checksum.nar", value)],
+            ))
+            .await?
+            .into_inner();
+        let root = read_root(&store_manager, &response).await;
+        assert_eq!(root.files.len(), 7, "{value}");
+        assert_eq!(root.directories.len(), 4, "{value}");
+        assert_eq!(root.symlinks.len(), 1, "{value}");
+        roots.push(response.root_directory_digest);
+    }
+    assert_eq!(roots[0], roots[1]);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_nar_mismatch_falls_through_to_next_uri() -> Result<(), Status> {
+    directory_checksum_mismatch_falls_through(|_archive| {
+        // `nix hash path` of {a.txt: "alpha", dir/b.txt: "beta"}.
+        header_qualifier(
+            "checksum.nar",
+            "sha256-CsoZjhXuorHhbAO4sSoI+rDGBTK8qjwbH58H0hD8vNo=",
+        )
+    })
+    .await
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_nar_hash_of_the_single_top_level_directory() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    // As GitHub serves a tarball: everything under one `<repo>-<rev>/`.
+    let uri = serve_once(build_tar_gz_tree("repo-1.0/", NAR_TREE)).await;
+
+    // Nix hashes the tree without the top-level directory, as fetchzip and
+    // fetchFromGitHub do.
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec![uri],
+            vec![header_qualifier("checksum.nar", NAR_TREE_HASH)],
+        ))
+        .await?
+        .into_inner();
+    // The returned root is still the archive's root.
+    let root = read_root(&store_manager, &response).await;
+    assert!(root.files.is_empty());
+    assert!(root.symlinks.is_empty());
+    assert_eq!(root.directories.len(), 1);
+    assert_eq!(root.directories[0].name, "repo-1.0");
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_nar_hash_of_a_git_ordered_tarball() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    // `git archive` puts `foo-x` and `foo.rs` before `foo/`; a NAR does not.
+    let uri = serve_once(build_tar_gz_tree(
+        "repo-abc/",
+        &[
+            TarEntry::File("foo-x", b"x\n", 0o644),
+            TarEntry::File("foo.rs", b"rs\n", 0o644),
+            TarEntry::Dir("foo/"),
+            TarEntry::File("foo/bar.rs", b"bar\n", 0o644),
+            TarEntry::File("foo/sub/z", b"z\n", 0o644),
+            TarEntry::File("zzz", b"end\n", 0o644),
+        ],
+    ))
+    .await;
+    // `nix hash path` of the tree without `repo-abc/`.
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec![uri],
+            vec![header_qualifier(
+                "checksum.nar",
+                "sha256-yZWOCm1M493qYScZuhHicLRdChJQZdDW2Nz8Zcm5nD4=",
+            )],
+        ))
+        .await?
+        .into_inner();
+    read_root(&store_manager, &response).await;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_malformed_nar_hash_is_invalid_argument() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    for value in ["sha256-abc", "sha256:0000", "md5-AAAA", "not a hash"] {
+        let err = fs
+            .fetch_directory(directory_request_with(
+                vec!["http://example.invalid/dir".to_owned()],
+                vec![header_qualifier("checksum.nar", value)],
+            ))
+            .await
+            .expect_err(value);
+        assert_eq!(err.code(), Code::InvalidArgument, "{value}");
+        assert!(err.message().contains("checksum.nar"), "{}", err.message());
+    }
+    Ok(())
+}
+
 #[nativelink_test]
 async fn test_fetch_directory_all_uris_mismatching_reports_the_last_error() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
@@ -2714,11 +2901,12 @@ async fn test_fetch_directory_qualifiers() -> Result<(), Status> {
         "no download should be attempted"
     );
 
-    // Both checksum flavours, the canonical id and headers are supported, so
+    // Every checksum flavour, the canonical id and headers are supported, so
     // the fetch goes ahead.
     fs.fetch_directory(request(vec![
         header_qualifier("checksum.sri", &sri_of(&zip_data)),
         header_qualifier("checksum.h1", &h1_of(entries)),
+        header_qualifier("checksum.nar", NAR_TREE_HASH),
         header_qualifier("bazel.canonical_id", "id"),
         header_qualifier("http_header:Authorization", "Bearer t"),
     ]))

@@ -56,9 +56,10 @@ use tonic::async_trait;
 use crate::archive_expander::{ExpandHook, FileMeta, Held, Listing};
 
 pub mod h1;
+pub mod nar;
 
 /// Every supported tree-hash format.
-pub static TREE_HASH_FORMATS: &[&dyn TreeHashFormat] = &[&h1::H1];
+pub static TREE_HASH_FORMATS: &[&dyn TreeHashFormat] = &[&h1::H1, &nar::Nar];
 
 /// Describes one tree-hash format. See the [module docs](self).
 pub trait TreeHashFormat: Sync {
@@ -423,6 +424,19 @@ impl ExpandHook for TreeHashSet {
     fn needs_held(&self) -> bool {
         self.needs_held
     }
+}
+
+/// Decodes hex digits in either case.
+pub(crate) fn hex_decode(digits: &str) -> Option<Vec<u8>> {
+    let digits = digits.as_bytes();
+    if !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    let nibble = |c: u8| char::from(c).to_digit(16);
+    digits
+        .chunks_exact(2)
+        .map(|pair| u8::try_from((nibble(pair[0])? << 4) | nibble(pair[1])?).ok())
+        .collect()
 }
 
 /// Lower-case hex, as most formats print their values.
