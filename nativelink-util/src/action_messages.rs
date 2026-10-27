@@ -600,6 +600,7 @@ impl From<DirectoryInfo> for OutputDirectory {
             path: val.path,
             tree_digest: Some(val.tree_digest.into()),
             is_topologically_sorted: false,
+            root_directory_digest: None,
         }
     }
 }

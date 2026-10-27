@@ -255,6 +255,16 @@ pub struct Command {
     /// `INVALID_ARGUMENT`.
     #[prost(string, repeated, tag = "8")]
     pub output_node_properties: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The format that the worker should use to store the contents of
+    /// output directories.
+    ///
+    /// In case this field is set to a value that is not supported by the
+    /// worker, the worker SHOULD interpret this field as TREE_ONLY. The
+    /// worker MAY store output directories in formats that are a superset
+    /// of what was requested (e.g., interpreting DIRECTORY_ONLY as
+    /// TREE_AND_DIRECTORY).
+    #[prost(enumeration = "command::OutputDirectoryFormat", tag = "9")]
+    pub output_directory_format: i32,
 }
 /// Nested message and enum types in `Command`.
 pub mod command {
@@ -268,6 +278,44 @@ pub mod command {
         /// The variable value.
         #[prost(string, tag = "2")]
         pub value: ::prost::alloc::string::String,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum OutputDirectoryFormat {
+        /// The client is only interested in receiving output directories in
+        /// the form of a single Tree object, using the `tree_digest` field.
+        TreeOnly = 0,
+        /// The client is only interested in receiving output directories in
+        /// the form of a hierarchy of separately stored Directory objects,
+        /// using the `root_directory_digest` field.
+        DirectoryOnly = 1,
+        /// The client is interested in receiving output directories both in
+        /// the form of a single Tree object and a hierarchy of separately
+        /// stored Directory objects, using both the `tree_digest` and
+        /// `root_directory_digest` fields.
+        TreeAndDirectory = 2,
+    }
+    impl OutputDirectoryFormat {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::TreeOnly => "TREE_ONLY",
+                Self::DirectoryOnly => "DIRECTORY_ONLY",
+                Self::TreeAndDirectory => "TREE_AND_DIRECTORY",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "TREE_ONLY" => Some(Self::TreeOnly),
+                "DIRECTORY_ONLY" => Some(Self::DirectoryOnly),
+                "TREE_AND_DIRECTORY" => Some(Self::TreeAndDirectory),
+                _ => None,
+            }
+        }
     }
 }
 /// A `Platform` is a set of requirements, such as hardware, operating system, or
@@ -551,9 +599,7 @@ pub struct ExecutedActionMetadata {
     pub input_fetch_start_timestamp: ::core::option::Option<::prost_types::Timestamp>,
     /// When the worker finished fetching action inputs.
     #[prost(message, optional, tag = "6")]
-    pub input_fetch_completed_timestamp: ::core::option::Option<
-        ::prost_types::Timestamp,
-    >,
+    pub input_fetch_completed_timestamp: ::core::option::Option<::prost_types::Timestamp>,
     /// When the worker started executing the action command.
     #[prost(message, optional, tag = "7")]
     pub execution_start_timestamp: ::core::option::Option<::prost_types::Timestamp>,
@@ -584,9 +630,7 @@ pub struct ExecutedActionMetadata {
     pub output_upload_start_timestamp: ::core::option::Option<::prost_types::Timestamp>,
     /// When the worker finished uploading action outputs.
     #[prost(message, optional, tag = "10")]
-    pub output_upload_completed_timestamp: ::core::option::Option<
-        ::prost_types::Timestamp,
-    >,
+    pub output_upload_completed_timestamp: ::core::option::Option<::prost_types::Timestamp>,
     /// Details that are specific to the kind of worker used. For example,
     /// on POSIX-like systems this could contain a message with
     /// getrusage(2) statistics.
@@ -600,8 +644,7 @@ pub struct ExecutedActionMetadata {
 /// `ActionResult.execution_metadata.Worker`) have a non-default value, to
 /// ensure that the serialized value is non-empty, which can then be used
 /// as a basic data sanity check.
-#[derive(::derive_more::Debug)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(::derive_more::Debug, Clone, PartialEq, ::prost::Message)]
 #[prost(skip_debug)]
 pub struct ActionResult {
     /// The output files of the action. For each output file requested in the
@@ -873,6 +916,15 @@ pub struct OutputDirectory {
     /// redundant marshaling.
     #[prost(bool, tag = "4")]
     pub is_topologically_sorted: bool,
+    /// The digest of the encoded
+    /// [Directory][build.bazel.remote.execution.v2.Directory] proto
+    /// containing the contents the directory's root.
+    ///
+    /// If both `tree_digest` and `root_directory_digest` are set, this
+    /// field MUST match the digest of the root directory contained in the
+    /// Tree message.
+    #[prost(message, optional, tag = "5")]
+    pub root_directory_digest: ::core::option::Option<Digest>,
 }
 /// An `OutputSymlink` is similar to a
 /// [Symlink][build.bazel.remote.execution.v2.SymlinkNode], but it is used as an
@@ -1013,9 +1065,7 @@ pub struct ExecuteResponse {
     /// populate the output-, stdout-, and stderr-related fields if it has any
     /// information available, such as the stdout and stderr of a timed-out action.
     #[prost(message, optional, tag = "3")]
-    pub status: ::core::option::Option<
-        super::super::super::super::super::google::rpc::Status,
-    >,
+    pub status: ::core::option::Option<super::super::super::super::super::google::rpc::Status>,
     /// An optional list of additional log outputs the server wishes to provide. A
     /// server can use this to return execution-specific logs however it wishes.
     /// This is intended primarily to make it easier for users to debug issues that
@@ -1024,10 +1074,7 @@ pub struct ExecuteResponse {
     /// phase. The keys SHOULD be human readable so that a client can display them
     /// to a user.
     #[prost(map = "string, message", tag = "4")]
-    pub server_logs: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        LogFile,
-    >,
+    pub server_logs: ::std::collections::HashMap<::prost::alloc::string::String, LogFile>,
     /// Freeform informational message with details on the execution of the action
     /// that may be displayed to the user upon failure or when requested explicitly.
     #[prost(string, tag = "5")]
@@ -1049,17 +1096,7 @@ pub struct ExecuteResponse {
 pub struct ExecutionStage {}
 /// Nested message and enum types in `ExecutionStage`.
 pub mod execution_stage {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Value {
         /// Invalid value.
@@ -1246,8 +1283,7 @@ pub struct FindMissingBlobsResponse {
 }
 /// A request message for
 /// [ContentAddressableStorage.BatchUpdateBlobs][build.bazel.remote.execution.v2.ContentAddressableStorage.BatchUpdateBlobs].
-#[derive(::derive_more::Debug)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(::derive_more::Debug, Clone, PartialEq, ::prost::Message)]
 #[prost(skip_debug)]
 pub struct BatchUpdateBlobsRequest {
     /// The instance of the execution system to operate against. A server may
@@ -1294,8 +1330,7 @@ pub mod batch_update_blobs_request {
 }
 /// A response message for
 /// [ContentAddressableStorage.BatchUpdateBlobs][build.bazel.remote.execution.v2.ContentAddressableStorage.BatchUpdateBlobs].
-#[derive(::derive_more::Debug)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(::derive_more::Debug, Clone, PartialEq, ::prost::Message)]
 #[prost(skip_debug)]
 pub struct BatchUpdateBlobsResponse {
     /// The responses to the requests.
@@ -1313,15 +1348,13 @@ pub mod batch_update_blobs_response {
         pub digest: ::core::option::Option<super::Digest>,
         /// The result of attempting to upload that blob.
         #[prost(message, optional, tag = "2")]
-        pub status: ::core::option::Option<
-            super::super::super::super::super::super::google::rpc::Status,
-        >,
+        pub status:
+            ::core::option::Option<super::super::super::super::super::super::google::rpc::Status>,
     }
 }
 /// A request message for
 /// [ContentAddressableStorage.BatchReadBlobs][build.bazel.remote.execution.v2.ContentAddressableStorage.BatchReadBlobs].
-#[derive(::derive_more::Debug)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(::derive_more::Debug, Clone, PartialEq, ::prost::Message)]
 #[prost(skip_debug)]
 pub struct BatchReadBlobsRequest {
     /// The instance of the execution system to operate against. A server may
@@ -1352,8 +1385,7 @@ pub struct BatchReadBlobsRequest {
 }
 /// A response message for
 /// [ContentAddressableStorage.BatchReadBlobs][build.bazel.remote.execution.v2.ContentAddressableStorage.BatchReadBlobs].
-#[derive(::derive_more::Debug)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(::derive_more::Debug, Clone, PartialEq, ::prost::Message)]
 #[prost(skip_debug)]
 pub struct BatchReadBlobsResponse {
     /// The responses to the requests.
@@ -1378,9 +1410,8 @@ pub mod batch_read_blobs_response {
         pub compressor: i32,
         /// The result of attempting to download that blob.
         #[prost(message, optional, tag = "3")]
-        pub status: ::core::option::Option<
-            super::super::super::super::super::super::google::rpc::Status,
-        >,
+        pub status:
+            ::core::option::Option<super::super::super::super::super::super::google::rpc::Status>,
     }
 }
 /// A request message for
@@ -1559,9 +1590,7 @@ pub struct ServerCapabilities {
     pub execution_capabilities: ::core::option::Option<ExecutionCapabilities>,
     /// Earliest RE API version supported, including deprecated versions.
     #[prost(message, optional, tag = "3")]
-    pub deprecated_api_version: ::core::option::Option<
-        super::super::super::semver::SemVer,
-    >,
+    pub deprecated_api_version: ::core::option::Option<super::super::super::semver::SemVer>,
     /// Earliest non-deprecated RE API version supported.
     #[prost(message, optional, tag = "4")]
     pub low_api_version: ::core::option::Option<super::super::super::semver::SemVer>,
@@ -1575,17 +1604,7 @@ pub struct ServerCapabilities {
 pub struct DigestFunction {}
 /// Nested message and enum types in `DigestFunction`.
 pub mod digest_function {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Value {
         /// It is an error for the server to return this value.
@@ -1742,17 +1761,7 @@ pub mod priority_capabilities {
 pub struct SymlinkAbsolutePathStrategy {}
 /// Nested message and enum types in `SymlinkAbsolutePathStrategy`.
 pub mod symlink_absolute_path_strategy {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Value {
         /// Invalid value.
@@ -1794,17 +1803,7 @@ pub mod symlink_absolute_path_strategy {
 pub struct Compressor {}
 /// Nested message and enum types in `Compressor`.
 pub mod compressor {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Value {
         /// No compression. Servers and clients MUST always support this, and do
@@ -1861,17 +1860,7 @@ pub mod compressor {
 pub struct ChunkingFunction {}
 /// Nested message and enum types in `ChunkingFunction`.
 pub mod chunking_function {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Value {
         /// No specific algorithm. Servers MUST always accept this value.
@@ -1918,9 +1907,7 @@ pub struct CacheCapabilities {
     pub digest_functions: ::prost::alloc::vec::Vec<i32>,
     /// Capabilities for updating the action cache.
     #[prost(message, optional, tag = "2")]
-    pub action_cache_update_capabilities: ::core::option::Option<
-        ActionCacheUpdateCapabilities,
-    >,
+    pub action_cache_update_capabilities: ::core::option::Option<ActionCacheUpdateCapabilities>,
     /// Supported cache priority range for both CAS and ActionCache.
     #[prost(message, optional, tag = "3")]
     pub cache_priority_capabilities: ::core::option::Option<PriorityCapabilities>,
@@ -2081,9 +2068,7 @@ pub struct ExecutionCapabilities {
     pub execution_priority_capabilities: ::core::option::Option<PriorityCapabilities>,
     /// Supported node properties.
     #[prost(string, repeated, tag = "4")]
-    pub supported_node_properties: ::prost::alloc::vec::Vec<
-        ::prost::alloc::string::String,
-    >,
+    pub supported_node_properties: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// All the digest functions supported by the remote execution system.
     /// If this field is set, it MUST also contain digest_function.
     ///
@@ -2162,10 +2147,10 @@ pub mod execution_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// The Remote Execution API is used to execute an
     /// [Action][build.bazel.remote.execution.v2.Action] on the remote
     /// workers.
@@ -2201,14 +2186,13 @@ pub mod execution_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    http::Request<tonic::body::Body>,
+                    Response = http::Response<
+                        <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    >,
                 >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             ExecutionClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -2327,26 +2311,18 @@ pub mod execution_client {
             >,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/build.bazel.remote.execution.v2.Execution/Execute",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "build.bazel.remote.execution.v2.Execution",
-                        "Execute",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "build.bazel.remote.execution.v2.Execution",
+                "Execute",
+            ));
             self.inner.server_streaming(req, path, codec).await
         }
         /// Wait for an execution operation to complete. When the client initially
@@ -2374,26 +2350,18 @@ pub mod execution_client {
             >,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/build.bazel.remote.execution.v2.Execution/WaitExecution",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "build.bazel.remote.execution.v2.Execution",
-                        "WaitExecution",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "build.bazel.remote.execution.v2.Execution",
+                "WaitExecution",
+            ));
             self.inner.server_streaming(req, path, codec).await
         }
     }
@@ -2405,7 +2373,7 @@ pub mod execution_server {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
     use tonic::codegen::*;
     /// Generated trait containing gRPC methods that should be implemented for use with ExecutionServer.
@@ -2417,8 +2385,7 @@ pub mod execution_server {
                     super::super::super::super::super::super::google::longrunning::Operation,
                     tonic::Status,
                 >,
-            >
-            + std::marker::Send
+            > + std::marker::Send
             + 'static;
         /// Execute an action remotely.
         ///
@@ -2503,8 +2470,7 @@ pub mod execution_server {
                     super::super::super::super::super::super::google::longrunning::Operation,
                     tonic::Status,
                 >,
-            >
-            + std::marker::Send
+            > + std::marker::Send
             + 'static;
         /// Wait for an execution operation to complete. When the client initially
         /// makes the request, the server immediately responds with the current status
@@ -2523,10 +2489,7 @@ pub mod execution_server {
         async fn wait_execution(
             &self,
             request: tonic::Request<super::WaitExecutionRequest>,
-        ) -> std::result::Result<
-            tonic::Response<Self::WaitExecutionStream>,
-            tonic::Status,
-        >;
+        ) -> std::result::Result<tonic::Response<Self::WaitExecutionStream>, tonic::Status>;
     }
     /// The Remote Execution API is used to execute an
     /// [Action][build.bazel.remote.execution.v2.Action] on the remote
@@ -2557,10 +2520,7 @@ pub mod execution_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -2615,24 +2575,18 @@ pub mod execution_server {
                 "/build.bazel.remote.execution.v2.Execution/Execute" => {
                     #[allow(non_camel_case_types)]
                     struct ExecuteSvc<T: Execution>(pub Arc<T>);
-                    impl<
-                        T: Execution,
-                    > tonic::server::ServerStreamingService<super::ExecuteRequest>
-                    for ExecuteSvc<T> {
+                    impl<T: Execution> tonic::server::ServerStreamingService<super::ExecuteRequest> for ExecuteSvc<T> {
                         type Response = super::super::super::super::super::super::google::longrunning::Operation;
                         type ResponseStream = T::ExecuteStream;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::ResponseStream>,
-                            tonic::Status,
-                        >;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::ExecuteRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Execution>::execute(&inner, request).await
-                            };
+                            let fut =
+                                async move { <T as Execution>::execute(&inner, request).await };
                             Box::pin(fut)
                         }
                     }
@@ -2661,16 +2615,14 @@ pub mod execution_server {
                 "/build.bazel.remote.execution.v2.Execution/WaitExecution" => {
                     #[allow(non_camel_case_types)]
                     struct WaitExecutionSvc<T: Execution>(pub Arc<T>);
-                    impl<
-                        T: Execution,
-                    > tonic::server::ServerStreamingService<super::WaitExecutionRequest>
-                    for WaitExecutionSvc<T> {
+                    impl<T: Execution>
+                        tonic::server::ServerStreamingService<super::WaitExecutionRequest>
+                        for WaitExecutionSvc<T>
+                    {
                         type Response = super::super::super::super::super::super::google::longrunning::Operation;
                         type ResponseStream = T::WaitExecutionStream;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::ResponseStream>,
-                            tonic::Status,
-                        >;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::WaitExecutionRequest>,
@@ -2704,25 +2656,19 @@ pub mod execution_server {
                     };
                     Box::pin(fut)
                 }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
+                _ => Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        tonic::Status::GRPC_STATUS,
+                        (tonic::Code::Unimplemented as i32).into(),
+                    );
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        tonic::metadata::GRPC_CONTENT_TYPE,
+                    );
+                    Ok(response)
+                }),
             }
         }
     }
@@ -2751,10 +2697,10 @@ pub mod action_cache_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// The action cache API is used to query whether a given action has already been
     /// performed and, if so, retrieve its result. Unlike the
     /// [ContentAddressableStorage][build.bazel.remote.execution.v2.ContentAddressableStorage],
@@ -2798,14 +2744,13 @@ pub mod action_cache_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    http::Request<tonic::body::Body>,
+                    Response = http::Response<
+                        <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    >,
                 >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             ActionCacheClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -2856,26 +2801,18 @@ pub mod action_cache_client {
             &mut self,
             request: impl tonic::IntoRequest<super::GetActionResultRequest>,
         ) -> std::result::Result<tonic::Response<super::ActionResult>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/build.bazel.remote.execution.v2.ActionCache/GetActionResult",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "build.bazel.remote.execution.v2.ActionCache",
-                        "GetActionResult",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "build.bazel.remote.execution.v2.ActionCache",
+                "GetActionResult",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Upload a new execution result.
@@ -2901,26 +2838,18 @@ pub mod action_cache_client {
             &mut self,
             request: impl tonic::IntoRequest<super::UpdateActionResultRequest>,
         ) -> std::result::Result<tonic::Response<super::ActionResult>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/build.bazel.remote.execution.v2.ActionCache/UpdateActionResult",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "build.bazel.remote.execution.v2.ActionCache",
-                        "UpdateActionResult",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "build.bazel.remote.execution.v2.ActionCache",
+                "UpdateActionResult",
+            ));
             self.inner.unary(req, path, codec).await
         }
     }
@@ -2932,7 +2861,7 @@ pub mod action_cache_server {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
     use tonic::codegen::*;
     /// Generated trait containing gRPC methods that should be implemented for use with ActionCacheServer.
@@ -3015,10 +2944,7 @@ pub mod action_cache_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -3073,15 +2999,11 @@ pub mod action_cache_server {
                 "/build.bazel.remote.execution.v2.ActionCache/GetActionResult" => {
                     #[allow(non_camel_case_types)]
                     struct GetActionResultSvc<T: ActionCache>(pub Arc<T>);
-                    impl<
-                        T: ActionCache,
-                    > tonic::server::UnaryService<super::GetActionResultRequest>
-                    for GetActionResultSvc<T> {
+                    impl<T: ActionCache> tonic::server::UnaryService<super::GetActionResultRequest>
+                        for GetActionResultSvc<T>
+                    {
                         type Response = super::ActionResult;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::GetActionResultRequest>,
@@ -3118,23 +3040,19 @@ pub mod action_cache_server {
                 "/build.bazel.remote.execution.v2.ActionCache/UpdateActionResult" => {
                     #[allow(non_camel_case_types)]
                     struct UpdateActionResultSvc<T: ActionCache>(pub Arc<T>);
-                    impl<
-                        T: ActionCache,
-                    > tonic::server::UnaryService<super::UpdateActionResultRequest>
-                    for UpdateActionResultSvc<T> {
+                    impl<T: ActionCache>
+                        tonic::server::UnaryService<super::UpdateActionResultRequest>
+                        for UpdateActionResultSvc<T>
+                    {
                         type Response = super::ActionResult;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::UpdateActionResultRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ActionCache>::update_action_result(&inner, request)
-                                    .await
+                                <T as ActionCache>::update_action_result(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -3161,25 +3079,19 @@ pub mod action_cache_server {
                     };
                     Box::pin(fut)
                 }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
+                _ => Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        tonic::Status::GRPC_STATUS,
+                        (tonic::Code::Unimplemented as i32).into(),
+                    );
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        tonic::metadata::GRPC_CONTENT_TYPE,
+                    );
+                    Ok(response)
+                }),
             }
         }
     }
@@ -3208,10 +3120,10 @@ pub mod content_addressable_storage_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// The CAS (content-addressable storage) is used to store the inputs to and
     /// outputs from the execution service. Each piece of content is addressed by the
     /// digest of its binary data.
@@ -3382,18 +3294,15 @@ pub mod content_addressable_storage_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    http::Request<tonic::body::Body>,
+                    Response = http::Response<
+                        <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    >,
                 >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
-            ContentAddressableStorageClient::new(
-                InterceptedService::new(inner, interceptor),
-            )
+            ContentAddressableStorageClient::new(InterceptedService::new(inner, interceptor))
         }
         /// Compress requests with the given encoding.
         ///
@@ -3438,30 +3347,20 @@ pub mod content_addressable_storage_client {
         pub async fn find_missing_blobs(
             &mut self,
             request: impl tonic::IntoRequest<super::FindMissingBlobsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::FindMissingBlobsResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::FindMissingBlobsResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "build.bazel.remote.execution.v2.ContentAddressableStorage",
-                        "FindMissingBlobs",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "build.bazel.remote.execution.v2.ContentAddressableStorage",
+                "FindMissingBlobs",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Upload many blobs at once.
@@ -3490,30 +3389,20 @@ pub mod content_addressable_storage_client {
         pub async fn batch_update_blobs(
             &mut self,
             request: impl tonic::IntoRequest<super::BatchUpdateBlobsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::BatchUpdateBlobsResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::BatchUpdateBlobsResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchUpdateBlobs",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "build.bazel.remote.execution.v2.ContentAddressableStorage",
-                        "BatchUpdateBlobs",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "build.bazel.remote.execution.v2.ContentAddressableStorage",
+                "BatchUpdateBlobs",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Download many blobs at once.
@@ -3539,30 +3428,20 @@ pub mod content_addressable_storage_client {
         pub async fn batch_read_blobs(
             &mut self,
             request: impl tonic::IntoRequest<super::BatchReadBlobsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::BatchReadBlobsResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::BatchReadBlobsResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "build.bazel.remote.execution.v2.ContentAddressableStorage",
-                        "BatchReadBlobs",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "build.bazel.remote.execution.v2.ContentAddressableStorage",
+                "BatchReadBlobs",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Fetch the entire directory tree rooted at a node.
@@ -3595,26 +3474,18 @@ pub mod content_addressable_storage_client {
             tonic::Response<tonic::codec::Streaming<super::GetTreeResponse>>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/GetTree",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "build.bazel.remote.execution.v2.ContentAddressableStorage",
-                        "GetTree",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "build.bazel.remote.execution.v2.ContentAddressableStorage",
+                "GetTree",
+            ));
             self.inner.server_streaming(req, path, codec).await
         }
         /// SplitBlob retrieves information about how a blob is split into chunks.
@@ -3676,30 +3547,19 @@ pub mod content_addressable_storage_client {
         pub async fn split_blob(
             &mut self,
             request: impl tonic::IntoRequest<super::SplitBlobRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::SplitBlobResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::SplitBlobResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/SplitBlob",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "build.bazel.remote.execution.v2.ContentAddressableStorage",
-                        "SplitBlob",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "build.bazel.remote.execution.v2.ContentAddressableStorage",
+                "SplitBlob",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// SpliceBlob tells the CAS how chunks can compose a blob.
@@ -3760,30 +3620,20 @@ pub mod content_addressable_storage_client {
         pub async fn splice_blob(
             &mut self,
             request: impl tonic::IntoRequest<super::SpliceBlobRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::SpliceBlobResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::SpliceBlobResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/SpliceBlob",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "build.bazel.remote.execution.v2.ContentAddressableStorage",
-                        "SpliceBlob",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "build.bazel.remote.execution.v2.ContentAddressableStorage",
+                "SpliceBlob",
+            ));
             self.inner.unary(req, path, codec).await
         }
     }
@@ -3795,7 +3645,7 @@ pub mod content_addressable_storage_server {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
     use tonic::codegen::*;
     /// Generated trait containing gRPC methods that should be implemented for use with ContentAddressableStorageServer.
@@ -3813,10 +3663,7 @@ pub mod content_addressable_storage_server {
         async fn find_missing_blobs(
             &self,
             request: tonic::Request<super::FindMissingBlobsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::FindMissingBlobsResponse>,
-            tonic::Status,
-        >;
+        ) -> std::result::Result<tonic::Response<super::FindMissingBlobsResponse>, tonic::Status>;
         /// Upload many blobs at once.
         ///
         /// The server may enforce a limit of the combined total size of blobs
@@ -3843,10 +3690,7 @@ pub mod content_addressable_storage_server {
         async fn batch_update_blobs(
             &self,
             request: tonic::Request<super::BatchUpdateBlobsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::BatchUpdateBlobsResponse>,
-            tonic::Status,
-        >;
+        ) -> std::result::Result<tonic::Response<super::BatchUpdateBlobsResponse>, tonic::Status>;
         /// Download many blobs at once.
         ///
         /// The server may enforce a limit of the combined total size of blobs
@@ -3870,15 +3714,11 @@ pub mod content_addressable_storage_server {
         async fn batch_read_blobs(
             &self,
             request: tonic::Request<super::BatchReadBlobsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::BatchReadBlobsResponse>,
-            tonic::Status,
-        >;
+        ) -> std::result::Result<tonic::Response<super::BatchReadBlobsResponse>, tonic::Status>;
         /// Server streaming response type for the GetTree method.
         type GetTreeStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::GetTreeResponse, tonic::Status>,
-            >
-            + std::marker::Send
+            > + std::marker::Send
             + 'static;
         /// Fetch the entire directory tree rooted at a node.
         ///
@@ -3966,10 +3806,7 @@ pub mod content_addressable_storage_server {
         async fn split_blob(
             &self,
             request: tonic::Request<super::SplitBlobRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::SplitBlobResponse>,
-            tonic::Status,
-        >;
+        ) -> std::result::Result<tonic::Response<super::SplitBlobResponse>, tonic::Status>;
         /// SpliceBlob tells the CAS how chunks can compose a blob.
         ///
         /// This is the complementary operation to the
@@ -4028,10 +3865,7 @@ pub mod content_addressable_storage_server {
         async fn splice_blob(
             &self,
             request: tonic::Request<super::SpliceBlobRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::SpliceBlobResponse>,
-            tonic::Status,
-        >;
+        ) -> std::result::Result<tonic::Response<super::SpliceBlobResponse>, tonic::Status>;
     }
     /// The CAS (content-addressable storage) is used to store the inputs to and
     /// outputs from the execution service. Each piece of content is addressed by the
@@ -4197,10 +4031,7 @@ pub mod content_addressable_storage_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -4235,8 +4066,7 @@ pub mod content_addressable_storage_server {
             self
         }
     }
-    impl<T, B> tonic::codegen::Service<http::Request<B>>
-    for ContentAddressableStorageServer<T>
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for ContentAddressableStorageServer<T>
     where
         T: ContentAddressableStorage,
         B: Body + std::marker::Send + 'static,
@@ -4256,15 +4086,12 @@ pub mod content_addressable_storage_server {
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs" => {
                     #[allow(non_camel_case_types)]
                     struct FindMissingBlobsSvc<T: ContentAddressableStorage>(pub Arc<T>);
-                    impl<
-                        T: ContentAddressableStorage,
-                    > tonic::server::UnaryService<super::FindMissingBlobsRequest>
-                    for FindMissingBlobsSvc<T> {
+                    impl<T: ContentAddressableStorage>
+                        tonic::server::UnaryService<super::FindMissingBlobsRequest>
+                        for FindMissingBlobsSvc<T>
+                    {
                         type Response = super::FindMissingBlobsResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::FindMissingBlobsRequest>,
@@ -4272,10 +4099,9 @@ pub mod content_addressable_storage_server {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
                                 <T as ContentAddressableStorage>::find_missing_blobs(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
+                                    &inner, request,
+                                )
+                                .await
                             };
                             Box::pin(fut)
                         }
@@ -4305,15 +4131,12 @@ pub mod content_addressable_storage_server {
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchUpdateBlobs" => {
                     #[allow(non_camel_case_types)]
                     struct BatchUpdateBlobsSvc<T: ContentAddressableStorage>(pub Arc<T>);
-                    impl<
-                        T: ContentAddressableStorage,
-                    > tonic::server::UnaryService<super::BatchUpdateBlobsRequest>
-                    for BatchUpdateBlobsSvc<T> {
+                    impl<T: ContentAddressableStorage>
+                        tonic::server::UnaryService<super::BatchUpdateBlobsRequest>
+                        for BatchUpdateBlobsSvc<T>
+                    {
                         type Response = super::BatchUpdateBlobsResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::BatchUpdateBlobsRequest>,
@@ -4321,10 +4144,9 @@ pub mod content_addressable_storage_server {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
                                 <T as ContentAddressableStorage>::batch_update_blobs(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
+                                    &inner, request,
+                                )
+                                .await
                             };
                             Box::pin(fut)
                         }
@@ -4354,25 +4176,19 @@ pub mod content_addressable_storage_server {
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs" => {
                     #[allow(non_camel_case_types)]
                     struct BatchReadBlobsSvc<T: ContentAddressableStorage>(pub Arc<T>);
-                    impl<
-                        T: ContentAddressableStorage,
-                    > tonic::server::UnaryService<super::BatchReadBlobsRequest>
-                    for BatchReadBlobsSvc<T> {
+                    impl<T: ContentAddressableStorage>
+                        tonic::server::UnaryService<super::BatchReadBlobsRequest>
+                        for BatchReadBlobsSvc<T>
+                    {
                         type Response = super::BatchReadBlobsResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::BatchReadBlobsRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ContentAddressableStorage>::batch_read_blobs(
-                                        &inner,
-                                        request,
-                                    )
+                                <T as ContentAddressableStorage>::batch_read_blobs(&inner, request)
                                     .await
                             };
                             Box::pin(fut)
@@ -4403,24 +4219,21 @@ pub mod content_addressable_storage_server {
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/GetTree" => {
                     #[allow(non_camel_case_types)]
                     struct GetTreeSvc<T: ContentAddressableStorage>(pub Arc<T>);
-                    impl<
-                        T: ContentAddressableStorage,
-                    > tonic::server::ServerStreamingService<super::GetTreeRequest>
-                    for GetTreeSvc<T> {
+                    impl<T: ContentAddressableStorage>
+                        tonic::server::ServerStreamingService<super::GetTreeRequest>
+                        for GetTreeSvc<T>
+                    {
                         type Response = super::GetTreeResponse;
                         type ResponseStream = T::GetTreeStream;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::ResponseStream>,
-                            tonic::Status,
-                        >;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::GetTreeRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ContentAddressableStorage>::get_tree(&inner, request)
-                                    .await
+                                <T as ContentAddressableStorage>::get_tree(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -4450,26 +4263,18 @@ pub mod content_addressable_storage_server {
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/SplitBlob" => {
                     #[allow(non_camel_case_types)]
                     struct SplitBlobSvc<T: ContentAddressableStorage>(pub Arc<T>);
-                    impl<
-                        T: ContentAddressableStorage,
-                    > tonic::server::UnaryService<super::SplitBlobRequest>
-                    for SplitBlobSvc<T> {
+                    impl<T: ContentAddressableStorage>
+                        tonic::server::UnaryService<super::SplitBlobRequest> for SplitBlobSvc<T>
+                    {
                         type Response = super::SplitBlobResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::SplitBlobRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ContentAddressableStorage>::split_blob(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
+                                <T as ContentAddressableStorage>::split_blob(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -4499,26 +4304,18 @@ pub mod content_addressable_storage_server {
                 "/build.bazel.remote.execution.v2.ContentAddressableStorage/SpliceBlob" => {
                     #[allow(non_camel_case_types)]
                     struct SpliceBlobSvc<T: ContentAddressableStorage>(pub Arc<T>);
-                    impl<
-                        T: ContentAddressableStorage,
-                    > tonic::server::UnaryService<super::SpliceBlobRequest>
-                    for SpliceBlobSvc<T> {
+                    impl<T: ContentAddressableStorage>
+                        tonic::server::UnaryService<super::SpliceBlobRequest> for SpliceBlobSvc<T>
+                    {
                         type Response = super::SpliceBlobResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::SpliceBlobRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ContentAddressableStorage>::splice_blob(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
+                                <T as ContentAddressableStorage>::splice_blob(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -4545,25 +4342,19 @@ pub mod content_addressable_storage_server {
                     };
                     Box::pin(fut)
                 }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
+                _ => Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        tonic::Status::GRPC_STATUS,
+                        (tonic::Code::Unimplemented as i32).into(),
+                    );
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        tonic::metadata::GRPC_CONTENT_TYPE,
+                    );
+                    Ok(response)
+                }),
             }
         }
     }
@@ -4592,10 +4383,10 @@ pub mod capabilities_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// The Capabilities service may be used by remote execution clients to query
     /// various server properties, in order to self-configure or return meaningful
     /// error messages.
@@ -4629,14 +4420,13 @@ pub mod capabilities_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    http::Request<tonic::body::Body>,
+                    Response = http::Response<
+                        <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    >,
                 >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             CapabilitiesClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -4684,30 +4474,20 @@ pub mod capabilities_client {
         pub async fn get_capabilities(
             &mut self,
             request: impl tonic::IntoRequest<super::GetCapabilitiesRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ServerCapabilities>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::ServerCapabilities>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "build.bazel.remote.execution.v2.Capabilities",
-                        "GetCapabilities",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "build.bazel.remote.execution.v2.Capabilities",
+                "GetCapabilities",
+            ));
             self.inner.unary(req, path, codec).await
         }
     }
@@ -4719,7 +4499,7 @@ pub mod capabilities_server {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
     use tonic::codegen::*;
     /// Generated trait containing gRPC methods that should be implemented for use with CapabilitiesServer.
@@ -4738,10 +4518,7 @@ pub mod capabilities_server {
         async fn get_capabilities(
             &self,
             request: tonic::Request<super::GetCapabilitiesRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ServerCapabilities>,
-            tonic::Status,
-        >;
+        ) -> std::result::Result<tonic::Response<super::ServerCapabilities>, tonic::Status>;
     }
     /// The Capabilities service may be used by remote execution clients to query
     /// various server properties, in order to self-configure or return meaningful
@@ -4770,10 +4547,7 @@ pub mod capabilities_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -4828,15 +4602,11 @@ pub mod capabilities_server {
                 "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities" => {
                     #[allow(non_camel_case_types)]
                     struct GetCapabilitiesSvc<T: Capabilities>(pub Arc<T>);
-                    impl<
-                        T: Capabilities,
-                    > tonic::server::UnaryService<super::GetCapabilitiesRequest>
-                    for GetCapabilitiesSvc<T> {
+                    impl<T: Capabilities> tonic::server::UnaryService<super::GetCapabilitiesRequest>
+                        for GetCapabilitiesSvc<T>
+                    {
                         type Response = super::ServerCapabilities;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::GetCapabilitiesRequest>,
@@ -4870,25 +4640,19 @@ pub mod capabilities_server {
                     };
                     Box::pin(fut)
                 }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
+                _ => Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        tonic::Status::GRPC_STATUS,
+                        (tonic::Code::Unimplemented as i32).into(),
+                    );
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        tonic::metadata::GRPC_CONTENT_TYPE,
+                    );
+                    Ok(response)
+                }),
             }
         }
     }
