@@ -557,11 +557,11 @@ impl UrlFetcher {
     /// Fails a directory job that has no checksum of any kind when
     /// `require_checksum` is set. See [`Self::check_blob_checksum`].
     fn check_directory_checksum(&self, job: &FetchDirectoryJob) -> Result<(), Error> {
-        if self.require_checksum && job.checksums.is_empty() {
+        if self.require_checksum && job.checksums.is_empty() && !job.verified_by_action {
             return Err(make_input_err!(
                 "This server only fetches content the request gives a checksum for, and the \
                  request has none: set the checksum.sri qualifier, a hex checksum.sha* \
-                 qualifier or a tree hash such as checksum.h1"
+                 qualifier, a tree hash such as checksum.h1, or checksum.action_digest"
             ));
         }
         Ok(())
@@ -638,7 +638,7 @@ impl UrlFetcher {
         }));
         let tree_checksums = checksums.iter().filter_map(|checksum| match checksum {
             DirectoryChecksum::Tree(checksum) => Some(checksum),
-            DirectoryChecksum::Bytes(_) => None,
+            DirectoryChecksum::Bytes(_) | DirectoryChecksum::Action(_) => None,
         });
         let context = TreeHashContext {
             hasher_func: options.hasher_func,
@@ -818,7 +818,7 @@ impl UrlFetcher {
             .iter()
             .filter_map(|checksum| match checksum {
                 DirectoryChecksum::Bytes(checksum) => Some(checksum.clone()),
-                DirectoryChecksum::Tree(_) => None,
+                DirectoryChecksum::Tree(_) | DirectoryChecksum::Action(_) => None,
             })
             .collect();
         let mut verifiers = make_verifiers(&byte_checksums);
@@ -900,6 +900,19 @@ impl Fetcher for UrlFetcher {
     }
 
     async fn fetch_directory(&self, job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+        // An action checksum is checked by an `ActionVerifier` around this
+        // fetcher, which takes it off the job. One that is still here would
+        // go unchecked.
+        if job
+            .checksums
+            .iter()
+            .any(|checksum| matches!(checksum, DirectoryChecksum::Action(_)))
+        {
+            return Err(make_err!(
+                Code::FailedPrecondition,
+                "checksum.action_digest needs an action_verify fetcher, and none is configured"
+            ));
+        }
         self.check_directory_checksum(job)?;
         within_budget(
             self.budget(job.timeout),

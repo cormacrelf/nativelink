@@ -22,6 +22,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use nativelink_config::cas_server::{FetchConfig, WithInstanceName};
 use nativelink_error::{Error, ResultExt, make_input_err};
+use nativelink_fetch::action_verifier::{QUALIFIER_CHECKSUM_ACTION_DIGEST, parse_action_digest};
 use nativelink_fetch::fetcher::{
     DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchHeaders, Fetcher,
 };
@@ -65,7 +66,10 @@ const BLOB_QUALIFIERS: &[&str] = &[QUALIFIER_BAZEL_CANONICAL_ID];
 /// Qualifiers `FetchDirectory` honours, besides HTTP header qualifiers, the
 /// byte checksums of [`BYTE_CHECKSUM_QUALIFIERS`] and those of the
 /// [`TREE_HASH_FORMATS`] (see [`directory_qualifiers`]).
-const DIRECTORY_QUALIFIERS: &[&str] = &[QUALIFIER_BAZEL_CANONICAL_ID];
+const DIRECTORY_QUALIFIERS: &[&str] = &[
+    QUALIFIER_BAZEL_CANONICAL_ID,
+    QUALIFIER_CHECKSUM_ACTION_DIGEST,
+];
 
 /// Every qualifier `FetchBlob` honours, besides HTTP header qualifiers.
 fn blob_qualifiers() -> Vec<&'static str> {
@@ -108,8 +112,8 @@ fn sri_checksum(qualifiers: &[Qualifier]) -> Result<Option<ByteChecksum>, Error>
         .transpose()
 }
 
-/// The hex and tree-hash checksums a `FetchDirectory` request asks for, all of
-/// which the fetched directory must match. A malformed value is an
+/// The hex, tree-hash and action checksums a `FetchDirectory` request asks
+/// for, all of which the fetched directory must match. A malformed value is an
 /// `InvalidArgument` error.
 fn directory_checksums(qualifiers: &[Qualifier]) -> Result<Vec<DirectoryChecksum>, Error> {
     let mut checksums: Vec<_> = hex_checksums(qualifiers)?
@@ -120,6 +124,9 @@ fn directory_checksums(qualifiers: &[Qualifier]) -> Result<Vec<DirectoryChecksum
         if let Some(value) = find_qualifier(qualifiers, format.qualifier()) {
             checksums.push(DirectoryChecksum::Tree(TreeChecksum::parse(format, value)?));
         }
+    }
+    if let Some(value) = find_qualifier(qualifiers, QUALIFIER_CHECKSUM_ACTION_DIGEST) {
+        checksums.push(DirectoryChecksum::Action(parse_action_digest(value)?));
     }
     Ok(checksums)
 }
@@ -696,6 +703,7 @@ impl FetchServer {
             .err_tip(|| "In FetchServer::inner_fetch_directory")?;
         checksums.extend(sri_checksum(&request.qualifiers)?.map(DirectoryChecksum::Bytes));
         let job = FetchDirectoryJob {
+            verified_by_action: false,
             uris: request.uris.clone(),
             qualifiers: qualifier_pairs(&request.qualifiers),
             checksums,

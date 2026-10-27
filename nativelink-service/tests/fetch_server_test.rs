@@ -44,6 +44,7 @@ use nativelink_store::store_manager::StoreManager;
 use nativelink_util::background_spawn;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+use nativelink_util::operation_state_manager::ClientStateManager;
 use nativelink_util::store_trait::{Store, StoreLike};
 use parking_lot::Mutex;
 use prost::Message;
@@ -397,9 +398,15 @@ fn make_fetch_server_with_clamps(
     min_timeout_s: Option<u64>,
     max_timeout_s: Option<u64>,
 ) -> FetchServer {
+    let schedulers: HashMap<String, Arc<dyn ClientStateManager>> = HashMap::new();
     let mut fetchers: HashMap<String, Arc<dyn Fetcher>> = HashMap::new();
-    let url = fetcher_factory(&FetcherSpec::Url(url_spec), store_manager, &fetchers)
-        .expect("failed to build url fetcher");
+    let url = fetcher_factory(
+        &FetcherSpec::Url(url_spec),
+        store_manager,
+        &schedulers,
+        &fetchers,
+    )
+    .expect("failed to build url fetcher");
     fetchers.insert("URL".to_string(), url);
 
     let cached = fetcher_factory(
@@ -409,6 +416,7 @@ fn make_fetch_server_with_clamps(
             fetcher: String::from("URL"),
         }),
         store_manager,
+        &schedulers,
         &fetchers,
     )
     .expect("failed to build metadata cache fetcher");
@@ -422,6 +430,7 @@ fn make_fetch_server_with_clamps(
             max_timeout_s,
         }),
         store_manager,
+        &schedulers,
         &fetchers,
     )
     .expect("failed to build background fetcher");
@@ -3374,6 +3383,67 @@ async fn test_fetch_directory_malformed_hex_checksum_is_invalid_argument() -> Re
     Ok(())
 }
 
+#[nativelink_test]
+async fn test_fetch_directory_malformed_action_digest_is_invalid_argument() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let hash = "0".repeat(64);
+    for value in [
+        String::new(),
+        "abc/12".to_owned(),
+        hash.clone(),
+        format!("{hash}/"),
+        format!("{hash}/-1"),
+        format!("{hash}/x"),
+    ] {
+        let err = fs
+            .fetch_directory(directory_request_with(
+                vec!["http://example.invalid/dir".to_owned()],
+                vec![header_qualifier("checksum.action_digest", &value)],
+            ))
+            .await
+            .expect_err(&value);
+        assert_eq!(err.code(), Code::InvalidArgument, "{value}");
+        assert!(
+            err.message().contains("checksum.action_digest"),
+            "{}",
+            err.message()
+        );
+    }
+    Ok(())
+}
+
+/// Without an `action_verify` fetcher nothing would run the action, so the
+/// fetch fails rather than returning an unverified directory.
+#[nativelink_test]
+async fn test_fetch_directory_action_digest_needs_an_action_verify_fetcher() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec!["http://example.invalid/dir".to_owned()],
+            vec![header_qualifier(
+                "checksum.action_digest",
+                &format!("{}/10", "0".repeat(64)),
+            )],
+        ))
+        .await?
+        .into_inner();
+    assert_error_info(
+        response.status.as_ref(),
+        Code::FailedPrecondition,
+        "FETCH_FAILED",
+    );
+    assert!(
+        response
+            .status
+            .as_ref()
+            .is_some_and(|status| status.message.contains("action_verify")),
+        "{response:?}"
+    );
+    Ok(())
+}
+
 /// The status code a response carries.
 fn status_code_of(status: Option<&GoogleStatus>) -> Option<i32> {
     Some(status?.code)
@@ -3661,7 +3731,13 @@ async fn serve_proxy(body: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
 /// Builds the URL fetcher `spec` describes, the way the server does.
 async fn build_url_fetcher(spec: UrlFetcherSpec) -> Result<Arc<dyn Fetcher>, Error> {
     let store_manager = make_store_manager().await?;
-    fetcher_factory(&FetcherSpec::Url(spec), &store_manager, &HashMap::new())
+    let schedulers: HashMap<String, Arc<dyn ClientStateManager>> = HashMap::new();
+    fetcher_factory(
+        &FetcherSpec::Url(spec),
+        &store_manager,
+        &schedulers,
+        &HashMap::new(),
+    )
 }
 
 #[nativelink_test]

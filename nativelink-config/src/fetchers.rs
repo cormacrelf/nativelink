@@ -30,10 +30,13 @@ pub type FetcherRefName = String;
 
 /// A composable fetcher. Fetchers form a chain via name references: a leaf
 /// [`FetcherSpec::Url`] does the real HTTP work, and decorators
-/// ([`FetcherSpec::MetadataCache`], [`FetcherSpec::Background`]) wrap an inner
-/// fetcher referenced by name. A production config typically composes
-/// `Background -> MetadataCache -> Url` so that the metadata write happens
-/// inside the background unit of work that joins identical fetches.
+/// ([`FetcherSpec::MetadataCache`], [`FetcherSpec::Background`],
+/// [`FetcherSpec::ActionVerify`]) wrap an inner fetcher referenced by name. A
+/// production config typically composes `Background -> MetadataCache -> Url`
+/// so that the metadata write happens inside the background unit of work that
+/// joins identical fetches. `ActionVerify`, when used, goes between
+/// `MetadataCache` and `Url`, so that a directory failing verification is
+/// never recorded.
 ///
 /// Referenced fetchers must be defined earlier in the `fetchers` list than the
 /// fetchers that reference them.
@@ -48,6 +51,9 @@ pub enum FetcherSpec {
     /// Joins identical in-flight fetches and keeps them running past a
     /// client's RPC deadline.
     Background(BackgroundSpec),
+    /// Verifies fetched directories by running the action a request names in
+    /// its `checksum.action_digest` qualifier.
+    ActionVerify(ActionVerifySpec),
 }
 
 /// The leaf fetcher: performs the HTTP or HTTPS download and CAS upload.
@@ -184,12 +190,13 @@ pub struct UrlFetcherSpec {
     #[serde(default, deserialize_with = "convert_vec_string_with_shellexpand")]
     pub no_proxy: Vec<String>,
 
-    /// Refuse to download content that the request gives no checksum for: a
-    /// blob request needs a `checksum.sri` or a hex `checksum.sha*` qualifier,
-    /// and a directory request one of those or a tree hash such as
-    /// `checksum.h1`. A request without one fails with `INVALID_ARGUMENT`
-    /// before any origin is contacted. Use it so that nothing unverified is
-    /// ever fetched into the CAS.
+    /// Refuse to download content that the request gives no checksum for. A
+    /// blob request needs a `checksum.sri` or a hex `checksum.sha*` qualifier. A
+    /// directory request needs a checksum of any kind: those, a tree hash such
+    /// as `checksum.h1`, or a `checksum.action_digest` verified by an
+    /// `action_verify` fetcher. A request without one fails with
+    /// `INVALID_ARGUMENT` before any origin is contacted. Use it so that nothing
+    /// unverified is ever fetched into the CAS.
     ///
     /// The check is part of fetching, so it applies only when content would be
     /// downloaded. A request that finds an asset already pushed with
@@ -264,4 +271,40 @@ pub struct BackgroundSpec {
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
     pub max_timeout_s: Option<u64>,
+}
+
+/// A decorator that verifies a fetched directory by running an action against
+/// it, for requests with a `checksum.action_digest` qualifier. The qualifier
+/// names an `Action` the client uploaded to the CAS, with its `Command` and
+/// input root. That action is run through `scheduler` with the fetched
+/// directory in its input root: at the relative path given by the command's
+/// `NATIVELINK_FETCHED_DIRECTORY` environment variable, or as the whole input
+/// root when the variable is not set, in which case the uploaded input root
+/// must be empty. Exit code 0 means the directory is verified; any other exit
+/// code is a checksum mismatch, and the next URI is tried.
+///
+/// Requests without the qualifier pass straight through. A request with it
+/// that reaches a `url` fetcher without passing an `action_verify` fails.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct ActionVerifySpec {
+    /// The inner fetcher (from the `fetchers` list) this decorates.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub fetcher: FetcherRefName,
+
+    /// The CAS store (from the `stores` map) the uploaded action is read from
+    /// and the action that is run is written to. It must hold the fetched
+    /// content, and the scheduler's workers must read from it.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub cas_store: StoreRefName,
+
+    /// The scheduler (from the `schedulers` list) that runs the action, in
+    /// this process.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub scheduler: String,
+
+    /// The instance name the action runs under. Default: "".
+    #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
+    pub instance_name: String,
 }

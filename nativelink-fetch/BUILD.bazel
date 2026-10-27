@@ -10,6 +10,7 @@ load(
 rust_library(
     name = "nativelink-fetch",
     srcs = [
+        "src/action_verifier.rs",
         "src/archive_expander.rs",
         "src/background_fetcher.rs",
         "src/fetcher.rs",
@@ -57,6 +58,7 @@ rust_test_suite(
     name = "integration",
     timeout = "short",
     srcs = [
+        "tests/action_verifier_test.rs",
         "tests/archive_expander_test.rs",
         "tests/background_fetcher_test.rs",
         "tests/git_tree_test.rs",
@@ -73,6 +75,7 @@ rust_test_suite(
         "//nativelink-config",
         "//nativelink-error",
         "//nativelink-fetch",
+        "//nativelink-metric",
         "//nativelink-proto",
         "//nativelink-store",
         "//nativelink-util",

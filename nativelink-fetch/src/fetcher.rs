@@ -39,8 +39,8 @@ use tonic::async_trait;
 use crate::remote_asset_proto::{QUALIFIER_HTTP_HEADER_PREFIX, QUALIFIER_HTTP_HEADER_URL_PREFIX};
 use crate::tree_hash::TreeChecksum;
 
-/// A checksum used to verify a downloaded directory archive: either of the
-/// raw archive bytes, or of the expanded files.
+/// A checksum used to verify a downloaded directory archive: of the raw
+/// archive bytes, of the expanded files, or by running an action on them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DirectoryChecksum {
     /// A hash of the raw archive bytes: the `checksum.sri` qualifier or one of
@@ -48,6 +48,10 @@ pub enum DirectoryChecksum {
     Bytes(ByteChecksum),
     /// A hash of the expanded tree in one of the [`crate::tree_hash`] formats.
     Tree(TreeChecksum),
+    /// The digest of an `Action` to run on the expanded tree; the
+    /// `checksum.action_digest` qualifier. Checked by
+    /// [`crate::action_verifier::ActionVerifier`].
+    Action(DigestInfo),
 }
 
 /// HTTP headers a request asks the fetcher to send to the origin, parsed from
@@ -139,6 +143,22 @@ impl FetchHeaders {
         }
         headers
     }
+
+    /// The headers for the URIs from `uris[first]` on, indexed from there:
+    /// what a job holding only `uris[first..]` must carry.
+    #[must_use]
+    pub fn from_uri(&self, first: usize) -> Self {
+        Self {
+            global: self.global.clone(),
+            per_uri: self
+                .per_uri
+                .iter()
+                .filter_map(|(&idx, headers)| {
+                    idx.checked_sub(first).map(|idx| (idx, headers.clone()))
+                })
+                .collect(),
+        }
+    }
 }
 
 /// A request to fetch a single blob from one of `uris`.
@@ -195,6 +215,12 @@ pub struct FetchDirectoryJob {
     pub checksums: Vec<DirectoryChecksum>,
     /// Hash function used to compute the CAS digests of the expanded tree.
     pub hasher_func: DigestHasherFunc,
+    /// Set by an [`crate::action_verifier::ActionVerifier`] on the job it passes
+    /// on, after taking the [`DirectoryChecksum::Action`] checksums off it: the
+    /// content will be verified by running those actions, which is a checksum as
+    /// far as a fetcher that requires one is concerned. Not part of the
+    /// deduplication identity.
+    pub verified_by_action: bool,
     /// The time budget for the whole job: every URI attempt, the download,
     /// archive expansion, verification and the CAS upload. Not part of the
     /// deduplication identity.

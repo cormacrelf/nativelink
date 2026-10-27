@@ -3126,6 +3126,7 @@ dependencies = [
  "nativelink-config",
  "nativelink-error",
  "nativelink-macro",
+ "nativelink-metric",
  "nativelink-proto",
  "nativelink-store",
  "nativelink-util",

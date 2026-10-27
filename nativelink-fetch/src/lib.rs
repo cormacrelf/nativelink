@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod action_verifier;
 pub mod archive_expander;
 pub mod background_fetcher;
 pub mod fetcher;

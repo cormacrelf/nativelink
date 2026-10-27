@@ -114,6 +114,7 @@ fn blob_job(uri: &str, qualifiers: Vec<(String, String)>) -> FetchBlobTask {
 
 fn directory_job(uri: &str) -> FetchDirectoryJob {
     FetchDirectoryJob {
+        verified_by_action: false,
         uris: vec![uri.to_string()],
         qualifiers: qualifiers(),
         checksums: vec![DirectoryChecksum::Tree(

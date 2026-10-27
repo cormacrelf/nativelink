@@ -57,6 +57,7 @@ zip = { version = "9.0.0", default-features = false, features = [
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
+nativelink-metric = { path = "../nativelink-metric" }
 
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 pretty_assertions = { version = "1.4.1", features = [

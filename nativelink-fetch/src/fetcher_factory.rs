@@ -22,20 +22,24 @@ use std::sync::Arc;
 use nativelink_config::fetchers::FetcherSpec;
 use nativelink_error::{Error, make_input_err};
 use nativelink_store::store_manager::StoreManager;
+use nativelink_util::operation_state_manager::ClientStateManager;
 
+use crate::action_verifier::ActionVerifier;
 use crate::background_fetcher::{BackgroundFetcher, BackgroundFetcherOpts};
 use crate::fetcher::Fetcher;
 use crate::metadata_cache::MetadataCache;
 use crate::url_fetcher::{ProxySettings, UrlFetcher, UrlFetcherOptions};
 
 /// Builds a single fetcher from `spec`, resolving store references against
-/// `store_manager` and inner-fetcher references against `built` (fetchers
-/// already constructed earlier in the `fetchers` list). Decorators reference
-/// their inner fetcher by name, so a referenced fetcher must appear before the
-/// fetcher that references it.
-pub fn fetcher_factory<S: BuildHasher>(
+/// `store_manager`, scheduler references against `schedulers`, and
+/// inner-fetcher references against `built` (fetchers already constructed
+/// earlier in the `fetchers` list). Decorators reference their inner fetcher by
+/// name, so a referenced fetcher must appear before the fetcher that
+/// references it.
+pub fn fetcher_factory<S: BuildHasher, T: BuildHasher>(
     spec: &FetcherSpec,
     store_manager: &StoreManager,
+    schedulers: &HashMap<String, Arc<dyn ClientStateManager>, T>,
     built: &HashMap<String, Arc<dyn Fetcher>, S>,
 ) -> Result<Arc<dyn Fetcher>, Error> {
     match spec {
@@ -84,6 +88,21 @@ pub fn fetcher_factory<S: BuildHasher>(
                 max_timeout: spec.max_timeout_s.map(Duration::from_secs),
             };
             Ok(BackgroundFetcher::new(inner, opts))
+        }
+        FetcherSpec::ActionVerify(spec) => {
+            let cas_store = store_manager.get_store(&spec.cas_store).ok_or_else(|| {
+                make_input_err!("'cas_store': '{}' does not exist", spec.cas_store)
+            })?;
+            let scheduler = schedulers.get(&spec.scheduler).cloned().ok_or_else(|| {
+                make_input_err!("'scheduler': '{}' does not exist", spec.scheduler)
+            })?;
+            let inner = resolve(&spec.fetcher, built)?;
+            Ok(ActionVerifier::new(
+                inner,
+                cas_store,
+                scheduler,
+                spec.instance_name.clone(),
+            ))
         }
     }
 }

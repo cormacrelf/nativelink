@@ -60,6 +60,7 @@ use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::fs::set_open_file_limit;
 use nativelink_util::digest_hasher::{DigestHasherFunc, set_default_digest_hasher_func};
 use nativelink_util::health_utils::HealthRegistryBuilder;
+use nativelink_util::operation_state_manager::ClientStateManager;
 use nativelink_util::origin_event_publisher::OriginEventPublisher;
 #[cfg(target_family = "unix")]
 use nativelink_util::shutdown_guard::Priority;
@@ -312,10 +313,20 @@ async fn inner_main(
     }
 
     // Fetchers are built in declaration order so a decorator can reference an
-    // inner fetcher defined earlier in the list.
+    // inner fetcher defined earlier in the list. One that runs actions does so
+    // through a scheduler of this process.
+    let fetch_schedulers: HashMap<String, Arc<dyn ClientStateManager>> = action_schedulers
+        .iter()
+        .map(|(name, scheduler)| {
+            (
+                name.clone(),
+                scheduler.clone() as Arc<dyn ClientStateManager>,
+            )
+        })
+        .collect();
     let mut fetchers: HashMap<String, Arc<dyn Fetcher>> = HashMap::new();
     for FetcherConfig { name, spec } in cfg.fetchers.iter().flatten() {
-        let fetcher = fetcher_factory(spec, &store_manager, &fetchers)
+        let fetcher = fetcher_factory(spec, &store_manager, &fetch_schedulers, &fetchers)
             .err_tip(|| format!("Failed to create fetcher '{name}'"))?;
         fetchers.insert(name.clone(), fetcher);
     }
