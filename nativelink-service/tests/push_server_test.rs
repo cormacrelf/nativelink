@@ -224,6 +224,7 @@ async fn test_push_blob() -> Result<(), Status> {
             qualifiers: test_qualifiers(),
             expire_at: None,
             digest_function: i32::from(digest_function::Value::Sha256),
+            root_directory_digest: None,
         }
     );
     Ok(())

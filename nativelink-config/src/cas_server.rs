@@ -315,9 +315,10 @@ pub struct FetchConfig {
     /// become discoverable here.
     ///
     /// Wrap it in a `completeness_checking` store whose `cas_store` is the one
-    /// the content lives in: an entry whose content has left the CAS is then
-    /// treated as a miss, and re-fetched if a fetcher is configured. Without
-    /// it, such entries are served as if the content were still there.
+    /// the content lives in: an entry whose content has left the CAS (for a
+    /// directory: any file or `Directory` in the tree) is then treated as a
+    /// miss, and re-fetched if a fetcher is configured. Without it, such
+    /// entries are served as if the content were still there.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub fetch_store: StoreRefName,
 

@@ -46,6 +46,9 @@ pub fn fetcher_factory<S: BuildHasher>(
             let options = UrlFetcherOptions {
                 temp_path: spec.temp_path.clone(),
                 max_size_bytes: spec.max_size_bytes,
+                archive_entry_inline_threshold_bytes: spec.archive_entry_inline_threshold_bytes,
+                max_archive_entries: spec.max_archive_entries,
+                max_archive_uncompressed_bytes: spec.max_archive_uncompressed_bytes,
                 require_checksum: spec.require_checksum,
                 proxy: ProxySettings::from_config(
                     spec.http_proxy.as_deref(),
@@ -67,8 +70,11 @@ pub fn fetcher_factory<S: BuildHasher>(
             let store = store_manager.get_store(&spec.fetch_store).ok_or_else(|| {
                 make_input_err!("'fetch_store': '{}' does not exist", spec.fetch_store)
             })?;
+            let cas_store = store_manager.get_store(&spec.cas_store).ok_or_else(|| {
+                make_input_err!("'cas_store': '{}' does not exist", spec.cas_store)
+            })?;
             let inner = resolve(&spec.fetcher, built)?;
-            Ok(MetadataCache::new(inner, store))
+            Ok(MetadataCache::new(inner, store, cas_store))
         }
         FetcherSpec::Background(spec) => {
             let inner = resolve(&spec.fetcher, built)?;

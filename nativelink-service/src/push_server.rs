@@ -115,8 +115,9 @@ impl PushServer {
                 expire_at: request.expire_at,
                 stored_at: Some(stored_at),
                 digest_function: request.digest_function,
+                tree_digest: None,
             };
-            write_remote_asset_entry(&store_info.store, &entry)
+            write_remote_asset_entry(&store_info.store, None, &entry)
                 .await
                 .err_tip(|| "Failed to update in push server")?;
             info!(uri = %redact_uri(&uri), "Pushed asset metadata");

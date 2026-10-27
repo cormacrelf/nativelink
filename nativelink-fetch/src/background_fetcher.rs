@@ -43,7 +43,7 @@ use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tonic::{Code, async_trait};
 
-use crate::fetcher::{FetchBlobTask, FetchOutcome, Fetcher};
+use crate::fetcher::{FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher};
 
 /// The shared, in-flight result of one fetch. `None` until the fetch completes;
 /// once set, every current and future subscriber observes the same
@@ -69,6 +69,7 @@ pub struct BackgroundFetcherOpts {
 pub struct BackgroundFetcher {
     inner: Arc<dyn Fetcher>,
     blob_in_flight: Arc<Mutex<HashMap<FetchBlobTask, SharedResult>>>,
+    dir_in_flight: Arc<Mutex<HashMap<FetchDirectoryJob, SharedResult>>>,
     permits: Option<Arc<Semaphore>>,
     min_timeout: Option<Duration>,
     max_timeout: Option<Duration>,
@@ -80,6 +81,7 @@ impl BackgroundFetcher {
         Arc::new(Self {
             inner,
             blob_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            dir_in_flight: Arc::new(Mutex::new(HashMap::new())),
             permits: opts
                 .max_concurrent_fetches
                 .map(|n| Arc::new(Semaphore::new(n))),
@@ -180,6 +182,20 @@ impl Fetcher for BackgroundFetcher {
             &self.permits,
             job,
             move || async move { inner.fetch_blob(&run_job).await },
+        );
+        await_shared(rx).await
+    }
+
+    async fn fetch_directory(&self, job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+        let mut job = job.clone();
+        job.timeout = self.clamp(job.timeout);
+        let inner = self.inner.clone();
+        let run_job = job.clone();
+        let rx = schedule_or_join(
+            &self.dir_in_flight,
+            &self.permits,
+            job,
+            move || async move { inner.fetch_directory(&run_job).await },
         );
         await_shared(rx).await
     }

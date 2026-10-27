@@ -40,7 +40,7 @@ use prost_types::Timestamp;
 use tonic::async_trait;
 use tracing::debug;
 
-use crate::fetcher::{FetchBlobTask, FetchOutcome, Fetcher};
+use crate::fetcher::{FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher};
 use crate::remote_asset_proto::{
     AssetKind, RemoteAssetEntry, RemoteAssetQuery, now_timestamp, write_remote_asset_entry,
 };
@@ -52,12 +52,19 @@ pub struct MetadataCache {
     /// The Action Cache store the metadata is written to, as an `ActionResult`
     /// (see [`crate::remote_asset_proto`]).
     ac_store: Store,
+    /// The CAS the fetched content lives in, used to build the `Tree` of a
+    /// directory.
+    cas_store: Store,
 }
 
 impl MetadataCache {
     /// Wraps `inner`, writing fetched-asset metadata into `ac_store`.
-    pub fn new(inner: Arc<dyn Fetcher>, ac_store: Store) -> Arc<Self> {
-        Arc::new(Self { inner, ac_store })
+    pub fn new(inner: Arc<dyn Fetcher>, ac_store: Store, cas_store: Store) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            ac_store,
+            cas_store,
+        })
     }
 
     /// Writes the metadata for a successful fetch. The hash-function context
@@ -87,8 +94,9 @@ impl MetadataCache {
             expire_at: None,
             stored_at: Some(stored_at),
             digest_function: hasher_func.proto_digest_func().into(),
+            tree_digest: None,
         };
-        write_remote_asset_entry(&self.ac_store, &entry)
+        write_remote_asset_entry(&self.ac_store, Some(&self.cas_store), &entry)
             .await
             .err_tip(|| "Caching fetched asset metadata")?;
         debug!(
@@ -108,6 +116,20 @@ impl Fetcher for MetadataCache {
         let outcome = self.inner.fetch_blob(job).await?;
         self.write(
             AssetKind::Blob,
+            &outcome,
+            &job.qualifiers,
+            job.hasher_func,
+            stored_at,
+        )
+        .await?;
+        Ok(outcome)
+    }
+
+    async fn fetch_directory(&self, job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+        let stored_at = now_timestamp();
+        let outcome = self.inner.fetch_directory(job).await?;
+        self.write(
+            AssetKind::Directory,
             &outcome,
             &job.qualifiers,
             job.hasher_func,

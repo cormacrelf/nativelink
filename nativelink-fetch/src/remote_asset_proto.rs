@@ -14,35 +14,41 @@
 
 //! How Remote Asset metadata is stored: as ordinary Action Cache entries.
 //!
-//! An asset (`uri` + qualifiers) maps to the digest of its content. That
-//! mapping is stored as an `ActionResult` under the digest of a synthetic
-//! `Action`, so any Action Cache store can hold it: a `grpc` store (e.g. a
-//! fetch tier writing to a central cluster), a `verify` store, and a
+//! An asset (`uri` + qualifiers, blob or directory) maps to the digest of its
+//! content. That mapping is stored as an `ActionResult` under the digest of a
+//! synthetic `Action`, so any Action Cache store can hold it: a `grpc` store
+//! (e.g. a fetch tier writing to a central cluster), a `verify` store, and a
 //! `completeness_checking` store that refuses entries whose content has left
 //! the CAS.
 //!
 //! * **Key**: the digest of `Action { command_digest: digest(Command) }`, hashed
 //!   with the request's digest function. The `Command` is
-//!   `["nativelink-remote-asset", "blob", "<uri>"]` with the qualifiers
-//!   (sorted, HTTP header qualifiers excluded) as environment variables.
-//!   Neither the `Action` nor the `Command` is uploaded to the CAS: an Action
-//!   Cache entry does not need them. A push made with one digest function is
-//!   not found by a fetch asking for another.
-//! * **Value**: an `ActionResult` with the content as the `OutputFile` `out`.
-//!   `execution_metadata` carries the times (`worker_start_timestamp` is when
-//!   the content was retrieved or pushed) and a [`RemoteAssetMetadata`] in
-//!   `auxiliary_metadata`.
+//!   `["nativelink-remote-asset", "<blob|directory>", "<uri>"]` with the
+//!   qualifiers (sorted, HTTP header qualifiers excluded) as environment
+//!   variables. Neither the `Action` nor the `Command` is uploaded to the CAS:
+//!   an Action Cache entry does not need them. A push made with one digest
+//!   function is not found by a fetch asking for another.
+//! * **Value**: an `ActionResult` with the content as output `out`: an
+//!   `OutputFile` for a blob, or an `OutputDirectory` whose `tree_digest` is a
+//!   `Tree` uploaded to the CAS for a directory. `execution_metadata` carries
+//!   the times (`worker_start_timestamp` is when the content was retrieved or
+//!   pushed) and a [`RemoteAssetMetadata`] in `auxiliary_metadata`.
 
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 use bytes::BytesMut;
-use nativelink_error::{Code, Error, ResultExt};
+use futures::future::try_join_all;
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
 use nativelink_proto::build::bazel::remote::execution::v2::command::EnvironmentVariable;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    Action, ActionResult, Command, Digest, ExecutedActionMetadata, OutputFile,
+    Action, ActionResult, Command, Digest, Directory, ExecutedActionMetadata, OutputDirectory,
+    OutputFile, Tree,
 };
-use nativelink_store::ac_utils::{get_and_decode_digest, message_to_digest};
+use nativelink_store::ac_utils::{
+    get_and_decode_digest, message_to_digest, serialize_and_upload_message,
+};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::redact::redact_uri;
@@ -103,17 +109,19 @@ pub fn timestamp_is_before(a: &Timestamp, b: &Timestamp) -> bool {
     (a.seconds, a.nanos) < (b.seconds, b.nanos)
 }
 
-/// What kind of asset an entry describes. It is part of the key, so entries of
-/// different kinds for the same URI are independent.
+/// What kind of asset an entry describes. Blob and directory entries for the
+/// same URI are independent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetKind {
     Blob,
+    Directory,
 }
 
 impl AssetKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Blob => "blob",
+            Self::Directory => "directory",
         }
     }
 }
@@ -136,6 +144,12 @@ pub struct RemoteAssetMetadata {
         tag = "4"
     )]
     pub digest_function: i32,
+
+    /// For a directory, the digest of the root `Directory` blob as it is in the
+    /// CAS, which may differ from that of re-encoding the `Tree`'s `root`. It is
+    /// kept here so that serving a hit needs no read of the `Tree` from the CAS.
+    #[prost(message, optional, tag = "5")]
+    pub root_directory_digest: Option<Digest>,
 }
 
 /// The identity of an asset: its kind, URI and qualifiers. HTTP header
@@ -201,8 +215,11 @@ impl RemoteAssetQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteAssetEntry {
     pub query: RemoteAssetQuery,
-    /// The blob's digest. It is stored and served as given, so it must be the
-    /// digest the content is in the CAS under.
+    /// The blob's digest, or the root `Directory`'s for a directory. It is
+    /// stored and served as given (a directory's root with its hex lowercased),
+    /// so it must be the digest the content is in the CAS under (which, for a
+    /// `Directory` a client uploaded, may not be that of its canonical
+    /// encoding).
     pub digest: Digest,
     pub expire_at: Option<Timestamp>,
     /// When the content was Push'd, or when the retrieval from origin that
@@ -210,36 +227,131 @@ pub struct RemoteAssetEntry {
     /// against. Stored as the `worker_start_timestamp`.
     pub stored_at: Option<Timestamp>,
     /// The digest function as the request gave it (zero when unset). It selects
-    /// how the key is hashed. What is stored, and read back here, is the
-    /// function it resolves to.
+    /// how the key and any `Tree` are hashed. What is stored, and read back
+    /// here, is the function it resolves to.
     pub digest_function: i32,
+    /// For a directory read back from the Action Cache, the digest of its
+    /// `Tree` in the CAS. Ignored on write, which builds and uploads the `Tree`
+    /// itself.
+    pub tree_digest: Option<Digest>,
+}
+
+/// The digests of the subdirectories of `directory` that are not in `seen`,
+/// which they are added to.
+fn new_subdirectories(
+    directory: &Directory,
+    seen: &mut HashSet<DigestInfo>,
+) -> Result<Vec<DigestInfo>, Error> {
+    let mut found = Vec::new();
+    for node in &directory.directories {
+        let digest = node
+            .digest
+            .as_ref()
+            .err_tip(|| "Directory node without a digest")?;
+        let digest = DigestInfo::try_from(digest).err_tip(|| "Invalid directory node digest")?;
+        if seen.insert(digest) {
+            found.push(digest);
+        }
+    }
+    Ok(found)
+}
+
+/// Builds the REAPI `Tree` rooted at the `Directory` `root` by walking it and
+/// its subdirectories in `cas_store`, a level at a time. Fails if any
+/// `Directory` proto is missing, so success also proves the tree's structure
+/// is complete (file contents are not checked).
+pub async fn build_tree(cas_store: &Store, root: DigestInfo) -> Result<Tree, Error> {
+    let root_directory = get_and_decode_digest::<Directory>(cas_store, root.into())
+        .await
+        .err_tip(|| format!("Root directory {root} is not in the CAS"))?;
+    let mut seen = HashSet::from([root]);
+    let mut level = new_subdirectories(&root_directory, &mut seen)?;
+    let mut children = Vec::new();
+    while !level.is_empty() {
+        let directories = try_join_all(level.iter().map(|digest| async move {
+            get_and_decode_digest::<Directory>(cas_store, (*digest).into())
+                .await
+                .err_tip(|| format!("Subdirectory {digest} is not in the CAS"))
+        }))
+        .await?;
+        level = Vec::new();
+        for directory in directories {
+            level.extend(new_subdirectories(&directory, &mut seen)?);
+            children.push(directory);
+        }
+    }
+    Ok(Tree {
+        root: Some(root_directory),
+        children,
+    })
 }
 
 /// Writes `entry` to the Action Cache `ac_store` as described in the module
-/// docs.
+/// docs. For a directory, `cas_store` is used to read the `Directory` protos
+/// and to upload the `Tree`; this fails if any `Directory` is missing, or with
+/// `FailedPrecondition` if there is no `cas_store`. A blob needs none.
 pub async fn write_remote_asset_entry(
     ac_store: &Store,
+    cas_store: Option<&Store>,
     entry: &RemoteAssetEntry,
 ) -> Result<(), Error> {
     let hasher_func = DigestHasherFunc::try_from(entry.digest_function)
         .err_tip(|| "Digest function of Remote Asset entry")?;
     let key = entry.query.key(hasher_func)?;
-    let output_files = match entry.query.kind {
-        AssetKind::Blob => vec![OutputFile {
-            path: OUTPUT_PATH.to_owned(),
-            digest: Some(entry.digest.clone()),
-            is_executable: false,
-            ..Default::default()
-        }],
+    let (output_files, output_directories, root_directory_digest) = match entry.query.kind {
+        AssetKind::Blob => (
+            vec![OutputFile {
+                path: OUTPUT_PATH.to_owned(),
+                digest: Some(entry.digest.clone()),
+                is_executable: false,
+                ..Default::default()
+            }],
+            vec![],
+            None,
+        ),
+        AssetKind::Directory => {
+            let cas_store = cas_store.ok_or_else(|| {
+                make_err!(
+                    Code::FailedPrecondition,
+                    "Writing a directory asset needs a CAS store"
+                )
+            })?;
+            let root =
+                DigestInfo::try_from(&entry.digest).err_tip(|| "Invalid root directory digest")?;
+            // The entry names both the `Tree` and the root `Directory`, so
+            // `completeness_checking` also checks the separately stored
+            // `Directory` blobs that clients walk from the root. The root
+            // digest stored is the one the client gave, which exists in the
+            // CAS by the `build_tree` read, whereas re-encoding the decoded
+            // root may give other bytes. It is stored in its parsed form so
+            // that the hex is lowercase whatever the client sent.
+            let tree = build_tree(cas_store, root).await?;
+            let tree_digest =
+                serialize_and_upload_message(&tree, cas_store.as_pin(), &mut hasher_func.hasher())
+                    .await
+                    .err_tip(|| "Uploading the Tree")?;
+            (
+                vec![],
+                vec![OutputDirectory {
+                    path: OUTPUT_PATH.to_owned(),
+                    tree_digest: Some(tree_digest.into()),
+                    is_topologically_sorted: false,
+                    root_directory_digest: Some(root.into()),
+                }],
+                Some(root.into()),
+            )
+        }
     };
     let metadata = RemoteAssetMetadata {
         uri: entry.query.uri.clone(),
         qualifiers: entry.query.qualifiers.clone(),
         expire_at: entry.expire_at,
         digest_function: hasher_func.proto_digest_func().into(),
+        root_directory_digest,
     };
     let action_result = ActionResult {
         output_files,
+        output_directories,
         execution_metadata: Some(ExecutedActionMetadata {
             worker: REMOTE_ASSET_WORKER.to_owned(),
             worker_start_timestamp: entry.stored_at.or_else(|| Some(now_timestamp())),
@@ -290,12 +402,21 @@ fn entry_from_action_result(
         .iter()
         .find(|any| any.type_url == REMOTE_ASSET_METADATA_TYPE_URL)?;
     let metadata = RemoteAssetMetadata::decode(any.value.as_slice()).ok()?;
-    let digest = match kind {
+    let (digest, tree_digest) = match kind {
         AssetKind::Blob => {
             let [file] = action_result.output_files.as_slice() else {
                 return None;
             };
-            file.digest.clone()?
+            (file.digest.clone()?, None)
+        }
+        AssetKind::Directory => {
+            let [directory] = action_result.output_directories.as_slice() else {
+                return None;
+            };
+            (
+                metadata.root_directory_digest.clone()?,
+                directory.tree_digest.clone(),
+            )
         }
     };
     Some(RemoteAssetEntry {
@@ -308,5 +429,6 @@ fn entry_from_action_result(
         expire_at: metadata.expire_at,
         stored_at: execution_metadata.worker_start_timestamp,
         digest_function: metadata.digest_function,
+        tree_digest,
     })
 }

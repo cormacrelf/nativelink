@@ -31,19 +31,20 @@ use nativelink_fetch::remote_asset_proto::{
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::Fetch;
 use nativelink_proto::build::bazel::remote::asset::v1::{
-    FetchBlobRequest, FetchBlobResponse, Qualifier,
+    FetchBlobRequest, FetchBlobResponse, FetchDirectoryRequest, FetchDirectoryResponse, Qualifier,
 };
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    ActionResult, Digest, digest_function,
+    ActionResult, Digest, Directory, DirectoryNode, FileNode, Tree, digest_function,
 };
 use nativelink_proto::google::rpc::{BadRequest, ErrorInfo, Status as GoogleStatus};
 use nativelink_service::fetch_server::{FetchServer, parse_grpc_timeout};
 use nativelink_store::default_store_factory::store_factory;
+use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::background_spawn;
 use nativelink_util::common::DigestInfo;
-use nativelink_util::digest_hasher::DigestHasherFunc;
-use nativelink_util::store_trait::StoreLike;
+use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+use nativelink_util::store_trait::{Store, StoreLike};
 use parking_lot::Mutex;
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -246,6 +247,27 @@ async fn serve_trickling(
     (format!("http://{addr}/blob"), requests)
 }
 
+/// Computes the `sha256-...` SRI checksum value for `data`.
+fn sri_of(data: &[u8]) -> String {
+    use base64::Engine;
+    use base64::prelude::BASE64_STANDARD;
+    use sha2::{Digest, Sha256};
+    format!("sha256-{}", BASE64_STANDARD.encode(Sha256::digest(data)))
+}
+
+/// Computes the Go `h1:` directory hash of `(name, content)` entries, as the
+/// server derives it from the files of an expanded archive.
+fn h1_of(entries: &[(&str, &[u8])]) -> String {
+    use nativelink_fetch::tree_hash::h1::h1_from_file_hashes;
+    use sha2::{Digest, Sha256};
+    h1_from_file_hashes(
+        entries
+            .iter()
+            .map(|(name, content)| ((*name).to_string(), Sha256::digest(content).into()))
+            .collect(),
+    )
+}
+
 #[nativelink_test]
 async fn test_fetch_blob() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
@@ -350,6 +372,9 @@ fn make_fetch_server_with_cas_and_limit(
             cas_store: String::from("test_cas_store"),
             temp_path: None,
             max_size_bytes,
+            archive_entry_inline_threshold_bytes: None,
+            max_archive_entries: None,
+            max_archive_uncompressed_bytes: None,
             ..Default::default()
         },
     )
@@ -380,6 +405,7 @@ fn make_fetch_server_with_clamps(
     let cached = fetcher_factory(
         &FetcherSpec::MetadataCache(MetadataCacheSpec {
             fetch_store: String::from("test_fetch_store"),
+            cas_store: String::from("test_cas_store"),
             fetcher: String::from("URL"),
         }),
         store_manager,
@@ -446,7 +472,11 @@ async fn test_fetch_blob_active_download_with_sri() -> Result<(), Status> {
 
     // The downloaded content should have been uploaded into the CAS store.
     let cas_store = store_manager.get_store("test_cas_store").unwrap();
-    let digest = DigestInfo::try_new(HELLO_WORLD_SHA256_HEX, HELLO_WORLD.len() as u64).unwrap();
+    let digest = DigestInfo::try_new(
+        HELLO_WORLD_SHA256_HEX,
+        u64::try_from(HELLO_WORLD.len()).unwrap(),
+    )
+    .unwrap();
     let stored = cas_store.get_part_unchunked(digest, 0, None).await.unwrap();
     assert_eq!(stored.as_ref(), HELLO_WORLD);
 
@@ -504,7 +534,11 @@ async fn test_fetch_blob_checksum_mismatch_falls_through_to_next_uri() -> Result
 
     // The good content should have ended up in the CAS, the corrupt one not.
     let cas_store = store_manager.get_store("test_cas_store").unwrap();
-    let digest = DigestInfo::try_new(HELLO_WORLD_SHA256_HEX, HELLO_WORLD.len() as u64).unwrap();
+    let digest = DigestInfo::try_new(
+        HELLO_WORLD_SHA256_HEX,
+        u64::try_from(HELLO_WORLD.len()).unwrap(),
+    )
+    .unwrap();
     let stored = cas_store.get_part_unchunked(digest, 0, None).await.unwrap();
     assert_eq!(stored.as_ref(), HELLO_WORLD);
 
@@ -540,7 +574,11 @@ async fn test_fetch_blob_active_download_without_checksum() -> Result<(), Status
     );
 
     let cas_store = store_manager.get_store("test_cas_store").unwrap();
-    let digest = DigestInfo::try_new(HELLO_WORLD_SHA256_HEX, HELLO_WORLD.len() as u64).unwrap();
+    let digest = DigestInfo::try_new(
+        HELLO_WORLD_SHA256_HEX,
+        u64::try_from(HELLO_WORLD.len()).unwrap(),
+    )
+    .unwrap();
     let stored = cas_store.get_part_unchunked(digest, 0, None).await.unwrap();
     assert_eq!(stored.as_ref(), HELLO_WORLD);
 
@@ -755,6 +793,42 @@ async fn test_fetch_blob_never_logs_header_values_or_uri_credentials() -> Result
 }
 
 #[nativelink_test]
+async fn test_fetch_directory_never_logs_header_values_or_uri_credentials() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (served_uri, _requests) = serve_recording(build_zip(&[("a.txt", b"alpha")])).await;
+    let qualifiers = vec![header_qualifier(
+        "http_header:Authorization",
+        SECRET_HEADER_VALUE,
+    )];
+
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec![
+                uri_with_secrets(&unreachable_uri().await),
+                uri_with_secrets(&served_uri),
+            ],
+            qualifiers.clone(),
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert!(logs_contain("Fetched directory"));
+    assert!(logs_contain("X-Amz-Signature=REDACTED"));
+
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec![uri_with_secrets(&unreachable_uri().await)],
+            qualifiers,
+        ))
+        .await?
+        .into_inner();
+    assert_error_info(response.status.as_ref(), Code::NotFound, "FETCH_FAILED");
+    assert_no_secrets_in_logs(logs_contain);
+    Ok(())
+}
+
+#[nativelink_test]
 async fn test_fetch_blob_url_specific_header_only_applies_to_that_uri() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
     let fs = make_fetch_server_with_cas(&store_manager);
@@ -892,7 +966,7 @@ async fn test_fetch_blob_streamed_body_over_limit_is_resource_exhausted() -> Res
 #[nativelink_test]
 async fn test_fetch_blob_over_limit_falls_through_to_next_uri() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
-    let limit = HELLO_WORLD.len() as u64;
+    let limit = u64::try_from(HELLO_WORLD.len()).unwrap();
     let fs = make_fetch_server_with_cas_and_limit(&store_manager, Some(limit));
     let too_big = serve_once(vec![b'x'; 100]).await;
     // Exactly at the limit is allowed.
@@ -908,6 +982,33 @@ async fn test_fetch_blob_over_limit_falls_through_to_next_uri() -> Result<(), St
         response.blob_digest.expect("digest").hash,
         HELLO_WORLD_SHA256_HEX
     );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_over_limit_is_resource_exhausted() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas_and_limit(&store_manager, Some(10));
+    let zip_data = build_zip(&[("a.txt", b"alpha")]);
+    let sri = sri_of(&zip_data);
+    let uri = serve_once(zip_data).await;
+
+    let response = fs
+        .fetch_directory(Request::new(FetchDirectoryRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec![uri],
+            qualifiers: vec![header_qualifier("checksum.sri", &sri)],
+            digest_function: 0,
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(
+        response.status.as_ref().map(|s| s.code),
+        Some(i32::from(Code::ResourceExhausted))
+    );
+    assert!(response.root_directory_digest.is_none());
     Ok(())
 }
 
@@ -1067,6 +1168,625 @@ async fn test_fetch_blob_corrupt_metadata_entry_is_a_miss() -> Result<(), Status
     Ok(())
 }
 
+/// Builds an in-memory zip archive from `(name, content)` entries.
+fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::{Cursor, Write};
+
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, content) in entries {
+        writer
+            .start_file(*name, SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(content).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_active_download_with_sri() -> Result<(), Status> {
+    use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::Fetch as _;
+    use prost::Message;
+
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+
+    let zip_data = build_zip(&[("a.txt", b"alpha"), ("dir/b.txt", b"beta")]);
+    let sri = sri_of(&zip_data);
+    let uri = serve_once(zip_data).await;
+
+    let response = fs
+        .fetch_directory(Request::new(FetchDirectoryRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec![uri.clone()],
+            qualifiers: vec![Qualifier {
+                name: "checksum.sri".to_owned(),
+                value: sri.clone(),
+            }],
+            digest_function: 0,
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    let root_digest = response
+        .root_directory_digest
+        .expect("expected a root directory digest");
+
+    // The root Directory proto should be retrievable from the CAS and describe
+    // the archive's top-level entries.
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    let root_info: DigestInfo = root_digest.try_into().unwrap();
+    let root_raw = cas_store
+        .get_part_unchunked(root_info, 0, None)
+        .await
+        .unwrap();
+    let root = Directory::decode(root_raw).unwrap();
+    assert_eq!(root.files.len(), 1);
+    assert_eq!(root.files[0].name, "a.txt");
+    assert_eq!(root.directories.len(), 1);
+    assert_eq!(root.directories[0].name, "dir");
+
+    // The metadata is an `ActionResult` whose output directory is a `Tree` of
+    // the whole archive, uploaded to the CAS.
+    let qualifiers = vec![header_qualifier("checksum.sri", &sri)];
+    let tree_digest =
+        stored_tree_digest(&store_manager, AssetKind::Directory, &uri, qualifiers).await;
+    let tree = Tree::decode(
+        cas_store
+            .get_part_unchunked(tree_digest, 0, None)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(tree.root, Some(root));
+    assert_eq!(tree.children.len(), 1);
+    assert_eq!(tree.children[0].files[0].name, "b.txt");
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_checksum_mismatch_is_aborted() -> Result<(), Status> {
+    use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::Fetch as _;
+
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+
+    let zip_data = build_zip(&[("a.txt", b"alpha")]);
+    let uri = serve_once(zip_data).await;
+
+    let response = fs
+        .fetch_directory(Request::new(FetchDirectoryRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec![uri],
+            qualifiers: vec![Qualifier {
+                name: "checksum.sri".to_owned(),
+                // Valid SRI of the empty string, which will not match.
+                value: "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_owned(),
+            }],
+            digest_function: 0,
+        }))
+        .await?
+        .into_inner();
+
+    assert_error_info(response.status.as_ref(), Code::Aborted, "FETCH_FAILED");
+    assert!(response.root_directory_digest.is_none());
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_active_download_with_h1() -> Result<(), Status> {
+    use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::Fetch as _;
+
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+
+    let entries: &[(&str, &[u8])] = &[("a.txt", b"alpha"), ("dir/b.txt", b"beta")];
+    let zip_data = build_zip(entries);
+    let h1 = h1_of(entries);
+    let uri = serve_once(zip_data).await;
+
+    let response = fs
+        .fetch_directory(Request::new(FetchDirectoryRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec![uri],
+            qualifiers: vec![Qualifier {
+                name: "checksum.h1".to_owned(),
+                value: h1,
+            }],
+            digest_function: 0,
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert!(response.root_directory_digest.is_some());
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_h1_mismatch_is_aborted() -> Result<(), Status> {
+    use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::Fetch as _;
+
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+
+    let zip_data = build_zip(&[("a.txt", b"alpha")]);
+    let uri = serve_once(zip_data).await;
+
+    let response = fs
+        .fetch_directory(Request::new(FetchDirectoryRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec![uri],
+            qualifiers: vec![Qualifier {
+                name: "checksum.h1".to_owned(),
+                value: "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            }],
+            digest_function: 0,
+        }))
+        .await?
+        .into_inner();
+
+    assert_error_info(response.status.as_ref(), Code::Aborted, "FETCH_FAILED");
+    assert!(response.root_directory_digest.is_none());
+
+    Ok(())
+}
+
+/// Builds an in-memory tar.gz archive from `(name, content)` entries.
+fn build_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, content) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(u64::try_from(content.len()).unwrap());
+        header.set_entry_type(tar::EntryType::Regular);
+        builder.append_data(&mut header, name, *content).unwrap();
+    }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&builder.into_inner().unwrap()).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Reads the root `Directory` a successful directory fetch returned from the CAS.
+async fn read_root(store_manager: &StoreManager, response: &FetchDirectoryResponse) -> Directory {
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    let root_info: DigestInfo = response
+        .root_directory_digest
+        .clone()
+        .expect("expected a root directory digest")
+        .try_into()
+        .unwrap();
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    Directory::decode(
+        cas_store
+            .get_part_unchunked(root_info, 0, None)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn directory_request_with(
+    uris: Vec<String>,
+    qualifiers: Vec<Qualifier>,
+) -> Request<FetchDirectoryRequest> {
+    let mut request = directory_request(uris);
+    request.get_mut().qualifiers = qualifiers;
+    request
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_without_checksum_succeeds() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let uri = serve_once(build_zip(&[("a.txt", b"alpha"), ("dir/b.txt", b"beta")])).await;
+
+    let response = fs
+        .fetch_directory(directory_request_with(vec![uri.clone()], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(response.uri, uri);
+    let root = read_root(&store_manager, &response).await;
+    assert_eq!(root.files.len(), 1);
+    assert_eq!(root.files[0].name, "a.txt");
+    assert_eq!(root.directories[0].name, "dir");
+
+    // The content is in the CAS.
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    let file: DigestInfo = root.files[0].digest.clone().unwrap().try_into().unwrap();
+    assert_eq!(
+        cas_store
+            .get_part_unchunked(file, 0, None)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"alpha"
+    );
+    Ok(())
+}
+
+/// URIs whose archives fail the checksum (or are not archives at all) are
+/// skipped in favour of a later one that matches.
+async fn directory_checksum_mismatch_falls_through(
+    checksum: impl Fn(&[u8]) -> Qualifier,
+) -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let good = build_zip(&[("a.txt", b"alpha"), ("dir/b.txt", b"beta")]);
+    let qualifier = checksum(&good);
+    let not_an_archive = serve_once(b"<html>moved</html>".to_vec()).await;
+    let other_archive = serve_once(build_zip(&[("a.txt", b"different")])).await;
+    let good_uri = serve_once(good).await;
+
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec![not_an_archive, other_archive, good_uri.clone()],
+            vec![qualifier],
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(response.uri, good_uri);
+    let root = read_root(&store_manager, &response).await;
+    assert_eq!(root.files[0].name, "a.txt");
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    let file: DigestInfo = root.files[0].digest.clone().unwrap().try_into().unwrap();
+    assert_eq!(
+        cas_store
+            .get_part_unchunked(file, 0, None)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"alpha"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_sri_mismatch_falls_through_to_next_uri() -> Result<(), Status> {
+    directory_checksum_mismatch_falls_through(|archive| {
+        header_qualifier("checksum.sri", &sri_of(archive))
+    })
+    .await
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_h1_mismatch_falls_through_to_next_uri() -> Result<(), Status> {
+    directory_checksum_mismatch_falls_through(|_archive| {
+        header_qualifier(
+            "checksum.h1",
+            &h1_of(&[("a.txt", b"alpha"), ("dir/b.txt", b"beta")]),
+        )
+    })
+    .await
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_every_checksum_must_match() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let entries: &[(&str, &[u8])] = &[("a.txt", b"alpha")];
+    let archive = build_zip(entries);
+    let sri = header_qualifier("checksum.sri", &sri_of(&archive));
+
+    // The SRI matches but the h1 does not.
+    let uri = serve_once(archive.clone()).await;
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec![uri],
+            vec![
+                sri.clone(),
+                header_qualifier(
+                    "checksum.h1",
+                    "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                ),
+            ],
+        ))
+        .await?
+        .into_inner();
+    assert_error_info(response.status.as_ref(), Code::Aborted, "FETCH_FAILED");
+
+    // Both match.
+    let uri = serve_once(archive).await;
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec![uri],
+            vec![sri, header_qualifier("checksum.h1", &h1_of(entries))],
+        ))
+        .await?
+        .into_inner();
+    read_root(&store_manager, &response).await;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_all_uris_mismatching_reports_the_last_error() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let archive = build_zip(&[("a.txt", b"alpha")]);
+    let uris = vec![
+        serve_once(archive.clone()).await,
+        serve_once(archive.clone()).await,
+    ];
+    let response = fs
+        .fetch_directory(directory_request_with(
+            uris,
+            vec![header_qualifier(
+                "checksum.sri",
+                // Valid SRI of the empty string.
+                "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+            )],
+        ))
+        .await?
+        .into_inner();
+    assert_error_info(response.status.as_ref(), Code::Aborted, "FETCH_FAILED");
+    assert!(response.root_directory_digest.is_none());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_streamed_body_over_limit_is_resource_exhausted() -> Result<(), Status>
+{
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas_and_limit(&store_manager, Some(20));
+    // No `Content-Length`, so only the bytes received can trip the cap.
+    let uri = serve_once_without_content_length(build_zip(&[("a.txt", b"alpha")])).await;
+
+    let response = fs
+        .fetch_directory(directory_request_with(vec![uri], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(
+        response.status.as_ref().map(|s| s.code),
+        Some(i32::from(Code::ResourceExhausted))
+    );
+    assert!(response.root_directory_digest.is_none());
+    Ok(())
+}
+
+/// A URL fetcher spec with the given archive limits and nothing else set.
+fn archive_limits_spec(
+    max_archive_entries: Option<usize>,
+    max_archive_uncompressed_bytes: Option<u64>,
+) -> UrlFetcherSpec {
+    UrlFetcherSpec {
+        cas_store: String::from("test_cas_store"),
+        temp_path: None,
+        max_size_bytes: None,
+        archive_entry_inline_threshold_bytes: None,
+        max_archive_entries,
+        max_archive_uncompressed_bytes,
+        ..Default::default()
+    }
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_archive_entry_limit() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_url_spec(&store_manager, archive_limits_spec(Some(2), None));
+    let archive = build_tar_gz(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
+    let uri = serve_once(archive).await;
+
+    let response = fs
+        .fetch_directory(directory_request_with(vec![uri], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(
+        response.status.as_ref().map(|s| s.code),
+        Some(i32::from(Code::ResourceExhausted))
+    );
+    assert!(response.root_directory_digest.is_none());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_archive_uncompressed_bytes_limit() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs =
+        make_fetch_server_with_url_spec(&store_manager, archive_limits_spec(None, Some(1 << 20)));
+    // 8 MiB of zeroes compresses to a few KiB, far below any download cap.
+    let bomb = vec![0u8; 8 << 20];
+    let archive = build_tar_gz(&[("bomb.bin", &bomb)]);
+    assert!(archive.len() < 64 * 1024);
+    let first = serve_once(archive).await;
+    // The next URI is tried after the first fails, and the last error returned.
+    let second = serve_once(build_tar_gz(&[("a.txt", b"a"), ("b.txt", b"b")])).await;
+    let fs_ok =
+        make_fetch_server_with_url_spec(&store_manager, archive_limits_spec(None, Some(1 << 20)));
+
+    let response = fs
+        .fetch_directory(directory_request_with(vec![first.clone()], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(
+        response.status.as_ref().map(|s| s.code),
+        Some(i32::from(Code::ResourceExhausted))
+    );
+    assert!(response.root_directory_digest.is_none());
+
+    let response = fs_ok
+        .fetch_directory(directory_request_with(vec![second.clone()], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(response.uri, second);
+    assert_eq!(read_root(&store_manager, &response).await.files.len(), 2);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_archive_over_limit_uri_falls_back_to_next() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_url_spec(&store_manager, archive_limits_spec(Some(2), None));
+    let too_many = serve_once(build_tar_gz(&[("a", b"a"), ("b", b"b"), ("c", b"c")])).await;
+    let fine = serve_once(build_tar_gz(&[("a", b"a")])).await;
+
+    let response = fs
+        .fetch_directory(directory_request_with(vec![too_many, fine.clone()], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(response.uri, fine);
+    assert_eq!(read_root(&store_manager, &response).await.files.len(), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_archive_under_limits_succeeds() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_url_spec(
+        &store_manager,
+        archive_limits_spec(Some(10), Some(1 << 20)),
+    );
+    let uri = serve_once(build_tar_gz(&[("a.txt", b"alpha"), ("dir/b.txt", b"beta")])).await;
+
+    let response = fs
+        .fetch_directory(directory_request_with(vec![uri.clone()], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(response.uri, uri);
+    let root = read_root(&store_manager, &response).await;
+    assert_eq!(root.files[0].name, "a.txt");
+    assert_eq!(root.directories[0].name, "dir");
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_tar_gz_is_streamed_end_to_end() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let temp_dir = tempfile::tempdir().unwrap();
+    // Files over 1 KiB are written to a temp file on their way to the CAS.
+    let fs = make_fetch_server_with_url_spec(
+        &store_manager,
+        UrlFetcherSpec {
+            cas_store: String::from("test_cas_store"),
+            temp_path: Some(temp_dir.path().to_str().unwrap().to_owned()),
+            max_size_bytes: None,
+            archive_entry_inline_threshold_bytes: Some(1024),
+            max_archive_entries: None,
+            max_archive_uncompressed_bytes: None,
+            ..Default::default()
+        },
+    );
+    let big = vec![b'x'; 3 * 1024 * 1024];
+    let entries: &[(&str, &[u8])] = &[("small.txt", b"alpha"), ("dir/big.bin", &big)];
+    let tar_gz = build_tar_gz(entries);
+    let h1 = h1_of(entries);
+
+    // Verified by SRI of the compressed bytes, and by h1 of the files.
+    let mut roots = Vec::new();
+    for qualifier in [
+        header_qualifier("checksum.sri", &sri_of(&tar_gz)),
+        header_qualifier("checksum.h1", &h1),
+    ] {
+        let uri = serve_once(tar_gz.clone()).await;
+        let response = fs
+            .fetch_directory(directory_request_with(vec![uri], vec![qualifier]))
+            .await?
+            .into_inner();
+        let root = read_root(&store_manager, &response).await;
+        assert_eq!(root.files[0].name, "small.txt");
+        assert_eq!(root.directories[0].name, "dir");
+        roots.push(response.root_directory_digest);
+    }
+    assert_eq!(roots[0], roots[1]);
+
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    let dir: DigestInfo = Directory::decode(
+        cas_store
+            .get_part_unchunked(
+                DigestInfo::try_from(roots[0].clone().unwrap()).unwrap(),
+                0,
+                None,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .directories[0]
+        .digest
+        .clone()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let dir = Directory::decode(cas_store.get_part_unchunked(dir, 0, None).await.unwrap()).unwrap();
+    let big_digest: DigestInfo = dir.files[0].digest.clone().unwrap().try_into().unwrap();
+    assert_eq!(
+        cas_store
+            .get_part_unchunked(big_digest, 0, None)
+            .await
+            .unwrap()
+            .as_ref(),
+        big.as_slice()
+    );
+    // Temp files are gone once uploaded.
+    assert_eq!(std::fs::read_dir(temp_dir.path()).unwrap().count(), 0);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_zip_with_stored_entries_and_data_descriptors() -> Result<(), Status> {
+    use std::io::{Cursor, Write};
+
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    // Written to a non-seekable stream, so entries carry a data descriptor
+    // instead of sizes in their headers, which a reader of the stream can not
+    // delimit when they are stored uncompressed.
+    let mut writer = ZipWriter::new_stream(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    for (name, content) in [("a.txt", &b"alpha"[..]), ("dir/b.txt", b"beta")] {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(content).unwrap();
+    }
+    let archive = writer.finish().unwrap().into_inner().into_inner();
+    assert_eq!(archive[8], 0, "first entry is stored");
+    assert_ne!(archive[6] & 8, 0, "first entry has a data descriptor");
+
+    let expected = make_fetch_server_with_cas(&store_manager)
+        .fetch_directory(directory_request_with(
+            vec![serve_once(build_zip(&[("a.txt", b"alpha"), ("dir/b.txt", b"beta")])).await],
+            vec![],
+        ))
+        .await?
+        .into_inner();
+
+    let sri = sri_of(&archive);
+    let uri = serve_once(archive).await;
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec![uri],
+            vec![header_qualifier("checksum.sri", &sri)],
+        ))
+        .await?
+        .into_inner();
+    read_root(&store_manager, &response).await;
+    assert_eq!(
+        response.root_directory_digest,
+        expected.root_directory_digest
+    );
+    Ok(())
+}
+
 /// Builds a lookup-only `FetchServer` (no fetcher) over the completeness-checked
 /// `test_fetch_store`.
 fn make_lookup_server(store_manager: &StoreManager) -> FetchServer {
@@ -1082,6 +1802,33 @@ fn make_lookup_server(store_manager: &StoreManager) -> FetchServer {
         store_manager,
     )
     .expect("FetchServer config error")
+}
+
+fn directory_request(uris: Vec<String>) -> Request<FetchDirectoryRequest> {
+    Request::new(FetchDirectoryRequest {
+        instance_name: "foo_instance_name".to_string(),
+        timeout: None,
+        oldest_content_accepted: None,
+        uris,
+        qualifiers: vec![],
+        digest_function: 0,
+    })
+}
+
+fn sha256_digest_of(data: &[u8]) -> DigestInfo {
+    let mut hasher = DigestHasherFunc::Sha256.hasher();
+    hasher.update(data);
+    hasher.finalize_digest()
+}
+
+/// Stores `data` in `store` under its digest, and returns that digest.
+async fn put_blob(store: &Store, data: &[u8]) -> Digest {
+    let info = sha256_digest_of(data);
+    store
+        .update_oneshot(info, data.to_vec().into())
+        .await
+        .unwrap();
+    info.into()
 }
 
 /// The Action Cache key of the blob entry for `uri` and `qualifiers`, under the
@@ -1104,18 +1851,88 @@ async fn write_entry(
     stored_at: Option<prost_types::Timestamp>,
 ) {
     let fetch_store = store_manager.get_store("test_fetch_store").unwrap();
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
     write_remote_asset_entry(
         &fetch_store,
+        Some(&cas_store),
         &RemoteAssetEntry {
             query: RemoteAssetQuery::new(kind, uri.to_owned(), qualifiers),
             digest,
             expire_at,
             stored_at,
             digest_function: 0,
+            tree_digest: None,
         },
     )
     .await
     .unwrap();
+}
+
+/// Removes `digest` from the in-memory CAS, as an eviction would.
+async fn evict(store_manager: &StoreManager, digest: &Digest) {
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    let memory_store = cas_store
+        .downcast_ref::<MemoryStore>(None)
+        .expect("test_cas_store is a memory store");
+    assert!(
+        memory_store
+            .remove_entry(DigestInfo::try_from(digest).unwrap().into())
+            .await,
+        "{digest:?} was not in the CAS"
+    );
+}
+
+/// The digests of a directory seeded by [`seed_directory`].
+struct SeededDirectory {
+    root: Digest,
+    file_a: Digest,
+    file_b: Digest,
+    sub: Digest,
+}
+
+/// Seeds the CAS with `root -> {a.txt, sub -> {b.txt}}` and records the
+/// directory in the metadata store under `uri`.
+async fn seed_directory(store_manager: &StoreManager, uri: &str) -> SeededDirectory {
+    let cas = store_manager.get_store("test_cas_store").unwrap();
+    let file_node = |name: &str, digest: &Digest| FileNode {
+        name: name.to_owned(),
+        digest: Some(digest.clone()),
+        ..Default::default()
+    };
+    let file_a = put_blob(&cas, b"alpha").await;
+    let file_b = put_blob(&cas, b"beta").await;
+    let sub = Directory {
+        files: vec![file_node("b.txt", &file_b)],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let sub = put_blob(&cas, &sub).await;
+    let root = Directory {
+        files: vec![file_node("a.txt", &file_a)],
+        directories: vec![DirectoryNode {
+            name: "sub".to_owned(),
+            digest: Some(sub.clone()),
+        }],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let root = put_blob(&cas, &root).await;
+    write_entry(
+        store_manager,
+        AssetKind::Directory,
+        uri,
+        vec![],
+        root.clone(),
+        None,
+        None,
+    )
+    .await;
+    SeededDirectory {
+        root,
+        file_a,
+        file_b,
+        sub,
+    }
 }
 
 /// Records `uri` -> the `HELLO_WORLD` blob in the metadata store without putting
@@ -1212,6 +2029,138 @@ async fn test_fetch_blob_missing_from_cas_is_refetched() -> Result<(), Status> {
     Ok(())
 }
 
+#[nativelink_test]
+async fn test_fetch_directory_complete_in_cas_is_a_hit() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_lookup_server(&store_manager);
+    let uri = "http://example.invalid/dir".to_owned();
+    let seeded = seed_directory(&store_manager, &uri).await;
+
+    let response = fs
+        .fetch_directory(directory_request(vec![uri]))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(response.root_directory_digest, Some(seeded.root));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_with_missing_file_is_a_miss() -> Result<(), Status> {
+    // `a.txt` is in the tree's root, `b.txt` in a child directory.
+    for evicted in ["a.txt", "b.txt"] {
+        let store_manager = make_store_manager().await?;
+        let fs = make_lookup_server(&store_manager);
+        let uri = "http://example.invalid/dir".to_owned();
+        let seeded = seed_directory(&store_manager, &uri).await;
+        evict(
+            &store_manager,
+            if evicted == "a.txt" {
+                &seeded.file_a
+            } else {
+                &seeded.file_b
+            },
+        )
+        .await;
+
+        let response = fs
+            .fetch_directory(directory_request(vec![uri]))
+            .await?
+            .into_inner();
+        assert_eq!(
+            response.status.as_ref().map(|s| s.code),
+            Some(i32::from(Code::NotFound)),
+            "evicting {evicted}"
+        );
+        assert!(response.root_directory_digest.is_none());
+    }
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_with_missing_tree_is_a_miss() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_lookup_server(&store_manager);
+    let uri = "http://example.invalid/dir".to_owned();
+    seed_directory(&store_manager, &uri).await;
+    let tree_digest =
+        Digest::from(stored_tree_digest(&store_manager, AssetKind::Directory, &uri, vec![]).await);
+    evict(&store_manager, &tree_digest).await;
+
+    let response = fs
+        .fetch_directory(directory_request(vec![uri]))
+        .await?
+        .into_inner();
+    assert_eq!(
+        response.status.as_ref().map(|s| s.code),
+        Some(i32::from(Code::NotFound))
+    );
+    assert!(response.root_directory_digest.is_none());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_with_missing_directory_blob_is_a_miss() -> Result<(), Status> {
+    // The root `Directory` blob, then the child's.
+    for evicted in ["root", "sub"] {
+        let store_manager = make_store_manager().await?;
+        let fs = make_lookup_server(&store_manager);
+        let uri = "http://example.invalid/dir".to_owned();
+        let seeded = seed_directory(&store_manager, &uri).await;
+        evict(
+            &store_manager,
+            if evicted == "root" {
+                &seeded.root
+            } else {
+                &seeded.sub
+            },
+        )
+        .await;
+
+        let response = fs
+            .fetch_directory(directory_request(vec![uri]))
+            .await?
+            .into_inner();
+        assert_eq!(
+            response.status.as_ref().map(|s| s.code),
+            Some(i32::from(Code::NotFound)),
+            "evicting {evicted}"
+        );
+        assert!(response.root_directory_digest.is_none());
+    }
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_missing_from_cas_is_refetched() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let zip_data = build_zip(&[("a.txt", b"alpha")]);
+    let sri = sri_of(&zip_data);
+    let (uri, requests) = serve_recording(zip_data).await;
+    let request = || {
+        let mut request = directory_request(vec![uri.clone()]);
+        request.get_mut().qualifiers = vec![header_qualifier("checksum.sri", &sri)];
+        request
+    };
+
+    let first = fs.fetch_directory(request()).await?.into_inner();
+    assert_eq!(first.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(requests.lock().len(), 1);
+    // A second request is a hit.
+    let second = fs.fetch_directory(request()).await?.into_inner();
+    assert_eq!(second.root_directory_digest, first.root_directory_digest);
+    assert_eq!(requests.lock().len(), 1);
+
+    // Once the archive's file leaves the CAS, the entry is a miss and the
+    // directory is fetched again.
+    evict(&store_manager, &Digest::from(sha256_digest_of(b"alpha"))).await;
+    let third = fs.fetch_directory(request()).await?.into_inner();
+    assert_eq!(third.root_directory_digest, first.root_directory_digest);
+    assert_eq!(requests.lock().len(), 2);
+    Ok(())
+}
+
 /// Decodes the `ActionResult` stored in `test_ac_store` for an asset.
 async fn stored_action_result(
     store_manager: &StoreManager,
@@ -1229,6 +2178,24 @@ async fn stored_action_result(
         .await
         .expect("entry should be stored");
     ActionResult::decode(raw).expect("entry should be an ActionResult")
+}
+
+/// The digest of the `Tree` of a stored directory entry.
+async fn stored_tree_digest(
+    store_manager: &StoreManager,
+    kind: AssetKind,
+    uri: &str,
+    qualifiers: Vec<Qualifier>,
+) -> DigestInfo {
+    let action_result = stored_action_result(store_manager, kind, uri, qualifiers).await;
+    assert_eq!(action_result.output_directories.len(), 1);
+    DigestInfo::try_from(
+        action_result.output_directories[0]
+            .tree_digest
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap()
 }
 
 #[nativelink_test]
@@ -1462,6 +2429,56 @@ async fn test_fetch_blob_too_old_entry_is_refetched_and_restamped() -> Result<()
 }
 
 #[nativelink_test]
+async fn test_fetch_directory_expired_or_too_old_entry_is_a_miss() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_lookup_server(&store_manager);
+    let uri = "http://example.invalid/dir".to_owned();
+    let seeded = seed_directory(&store_manager, &uri).await;
+    let store_entry = |expire_at, stored_at| {
+        write_entry(
+            &store_manager,
+            AssetKind::Directory,
+            &uri,
+            vec![],
+            seeded.root.clone(),
+            expire_at,
+            stored_at,
+        )
+    };
+    let fetch = |oldest_content_accepted| {
+        let mut request = directory_request(vec![uri.clone()]);
+        request.get_mut().oldest_content_accepted = oldest_content_accepted;
+        fs.fetch_directory(request)
+    };
+
+    store_entry(Some(timestamp_ago(60)), None).await;
+    assert!(
+        fetch(None)
+            .await?
+            .into_inner()
+            .root_directory_digest
+            .is_none()
+    );
+
+    store_entry(None, Some(timestamp_ago(100))).await;
+    assert!(
+        fetch(Some(timestamp_ago(10)))
+            .await?
+            .into_inner()
+            .root_directory_digest
+            .is_none()
+    );
+    assert!(
+        fetch(Some(timestamp_ago(3600)))
+            .await?
+            .into_inner()
+            .root_directory_digest
+            .is_some()
+    );
+    Ok(())
+}
+
+#[nativelink_test]
 async fn test_fetch_blob_unsupported_qualifier_is_invalid_argument() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
     let fs = make_fetch_server_with_cas(&store_manager);
@@ -1632,6 +2649,145 @@ async fn test_fetch_blob_supported_qualifiers_are_accepted() -> Result<(), Statu
     Ok(())
 }
 
+#[nativelink_test]
+async fn test_fetch_directory_miss_without_fetcher_is_not_cached() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_lookup_server(&store_manager);
+    let qualifiers = vec![header_qualifier("checksum.h1", "h1:abc")];
+    let mut request = directory_request(vec!["http://example.invalid/dir".to_owned()]);
+    request.get_mut().qualifiers = qualifiers.clone();
+    request.get_mut().digest_function = i32::from(digest_function::Value::Sha256);
+
+    let response = fs.fetch_directory(request).await?.into_inner();
+    assert_error_info(
+        response.status.as_ref(),
+        Code::NotFound,
+        "NOT_CACHED_NO_FETCHER",
+    );
+    assert_eq!(
+        response.status.as_ref().map(|s| s.message.as_str()),
+        Some("not cached, and this instance has no fetcher configured")
+    );
+    assert!(response.root_directory_digest.is_none());
+    assert_eq!(response.qualifiers, qualifiers);
+    assert_eq!(
+        response.digest_function,
+        i32::from(digest_function::Value::Sha256)
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_qualifiers() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let entries: &[(&str, &[u8])] = &[("a.txt", b"alpha")];
+    let zip_data = build_zip(entries);
+    let (uri, requests) = serve_recording(zip_data.clone()).await;
+    let request = |qualifiers| {
+        let mut request = directory_request(vec![uri.clone()]);
+        request.get_mut().qualifiers = qualifiers;
+        request
+    };
+
+    // On a miss with a fetcher, an unsupported qualifier is rejected before
+    // anything is downloaded.
+    for name in ["resource_type", "vcs.commit"] {
+        let err = fs
+            .fetch_directory(request(vec![header_qualifier(name, "v")]))
+            .await
+            .expect_err(name);
+        assert_eq!(err.code(), Code::InvalidArgument, "{name}");
+        assert!(err.message().contains(name), "{}", err.message());
+        assert!(err.message().contains("checksum.h1"), "{}", err.message());
+        assert_eq!(
+            violations_of(&bad_request_of(&err)),
+            vec![(
+                "qualifiers.name",
+                format!("\"{name}\" not supported").as_str()
+            )],
+            "{name}"
+        );
+    }
+    assert!(
+        requests.lock().is_empty(),
+        "no download should be attempted"
+    );
+
+    // Both checksum flavours, the canonical id and headers are supported, so
+    // the fetch goes ahead.
+    fs.fetch_directory(request(vec![
+        header_qualifier("checksum.sri", &sri_of(&zip_data)),
+        header_qualifier("checksum.h1", &h1_of(entries)),
+        header_qualifier("bazel.canonical_id", "id"),
+        header_qualifier("http_header:Authorization", "Bearer t"),
+    ]))
+    .await?;
+    assert_eq!(requests.lock().len(), 1);
+    Ok(())
+}
+
+/// The spec lets a server trust the qualifiers of a pushed directory, so one
+/// stored under a qualifier we could not honour on a download is still found,
+/// with or without a fetcher, and nothing is downloaded.
+#[nativelink_test]
+async fn test_fetch_directory_pushed_with_unsupported_qualifier_is_a_hit() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let (uri, requests) = serve_recording(build_zip(&[("a.txt", b"alpha")])).await;
+    let seeded = seed_directory(&store_manager, &uri).await;
+    let qualifiers = vec![header_qualifier("resource_type", "test")];
+    write_entry(
+        &store_manager,
+        AssetKind::Directory,
+        &uri,
+        qualifiers.clone(),
+        seeded.root.clone(),
+        None,
+        None,
+    )
+    .await;
+
+    for fs in [
+        make_lookup_server(&store_manager),
+        make_fetch_server_with_cas(&store_manager),
+    ] {
+        let response = fs
+            .fetch_directory(directory_request_with(
+                vec![uri.clone()],
+                qualifiers.clone(),
+            ))
+            .await?
+            .into_inner();
+        assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+        assert_eq!(response.root_directory_digest, Some(seeded.root.clone()));
+        assert_eq!(response.qualifiers, qualifiers);
+    }
+    assert!(requests.lock().is_empty(), "a hit needs no download");
+    Ok(())
+}
+
+/// Without a fetcher nothing is downloaded, so there is nothing to reject: an
+/// unsupported qualifier on a directory miss is just a miss.
+#[nativelink_test]
+async fn test_fetch_directory_unsupported_qualifier_without_fetcher_is_not_cached()
+-> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_lookup_server(&store_manager);
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec!["http://example.invalid/dir".to_owned()],
+            vec![header_qualifier("resource_type", "test")],
+        ))
+        .await?
+        .into_inner();
+    assert_error_info(
+        response.status.as_ref(),
+        Code::NotFound,
+        "NOT_CACHED_NO_FETCHER",
+    );
+    Ok(())
+}
+
 /// The status code a response carries.
 fn status_code_of(status: Option<&GoogleStatus>) -> Option<i32> {
     Some(status?.code)
@@ -1665,6 +2821,29 @@ async fn test_fetch_blob_timeout_bounds_a_trickling_body() -> Result<(), Status>
         "the fetch outlived its timeout: {:?}",
         started.elapsed()
     );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_timeout_bounds_a_trickling_body() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let archive = build_tar_gz(&[("a.txt", b"alpha")]);
+    let (uri, _requests) = serve_trickling(archive, 1, Duration::from_millis(100)).await;
+
+    let mut request = directory_request_with(vec![uri], vec![]);
+    request.get_mut().timeout = Some(prost_types::Duration {
+        seconds: 0,
+        nanos: 300_000_000,
+    });
+    let response = fs.fetch_directory(request).await?.into_inner();
+
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(i32::from(Code::DeadlineExceeded)),
+        "{response:?}"
+    );
+    assert!(response.root_directory_digest.is_none());
     Ok(())
 }
 
@@ -1800,6 +2979,23 @@ async fn test_rpc_deadline_returns_deadline_exceeded_and_a_retry_joins_the_fetch
         HELLO_WORLD_SHA256_HEX
     );
     assert_eq!(requests.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_rpc_deadline_applies_to_directory_fetches() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let archive = build_tar_gz(&[("a.txt", b"alpha")]);
+    let (uri, _requests) = serve_trickling(archive, 1, Duration::from_millis(100)).await;
+
+    let mut request = directory_request_with(vec![uri], vec![]);
+    request.set_timeout(Duration::from_millis(300));
+    let err = fs
+        .fetch_directory(request)
+        .await
+        .expect_err("the fetch cannot finish within the RPC deadline");
+    assert_eq!(err.code(), Code::DeadlineExceeded, "{err:?}");
     Ok(())
 }
 
@@ -2116,6 +3312,23 @@ async fn test_require_checksum_rejects_a_blob_without_one() -> Result<(), Status
 }
 
 #[nativelink_test]
+async fn test_require_checksum_rejects_a_directory_without_one() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_url_spec(&store_manager, require_checksum_spec());
+    let (uri, origin_requests) = serve_recording(build_tar_gz(&[("a.txt", b"alpha")])).await;
+
+    let err = fs
+        .fetch_directory(directory_request(vec![uri]))
+        .await
+        .expect_err("a directory without a checksum is rejected");
+
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("checksum"), "{}", err.message());
+    assert!(origin_requests.lock().is_empty());
+    Ok(())
+}
+
+#[nativelink_test]
 async fn test_require_checksum_downloads_when_there_is_one() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
     let fs = make_fetch_server_with_url_spec(&store_manager, require_checksum_spec());
@@ -2138,6 +3351,27 @@ async fn test_require_checksum_downloads_when_there_is_one() -> Result<(), Statu
         HELLO_WORLD_SHA256_HEX
     );
     assert_eq!(origin_requests.lock().len(), 1);
+
+    // A directory is satisfied by a checksum of the archive, and by a tree hash.
+    let entries: &[(&str, &[u8])] = &[("a.txt", b"alpha")];
+    let archive = build_tar_gz(entries);
+    for qualifier in [
+        header_qualifier("checksum.sri", &sri_of(&archive)),
+        header_qualifier("checksum.h1", &h1_of(entries)),
+    ] {
+        let (uri, origin_requests) = serve_recording(archive.clone()).await;
+        let response = fs
+            .fetch_directory(directory_request_with(vec![uri], vec![qualifier]))
+            .await?
+            .into_inner();
+        assert_eq!(
+            status_code_of(response.status.as_ref()),
+            Some(0),
+            "{response:?}"
+        );
+        assert!(response.root_directory_digest.is_some());
+        assert_eq!(origin_requests.lock().len(), 1);
+    }
     Ok(())
 }
 
@@ -2185,5 +3419,27 @@ async fn test_require_checksum_still_serves_a_pushed_asset_without_one() -> Resu
     );
     assert_eq!(response.blob_digest, Some(digest));
     assert!(origin_requests.lock().is_empty());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_malformed_archive_is_a_fetch_failure_not_an_invalid_request() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let uri = serve_once(b"this is not an archive".to_vec()).await;
+
+    // The origin served bad content, which is outside the server's control, so
+    // it is reported in the response status; INVALID_ARGUMENT is reserved for
+    // a bad request.
+    let response = fs
+        .fetch_directory(directory_request(vec![uri]))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(i32::from(Code::Aborted)),
+        "{response:?}"
+    );
+    assert!(response.root_directory_digest.is_none());
     Ok(())
 }

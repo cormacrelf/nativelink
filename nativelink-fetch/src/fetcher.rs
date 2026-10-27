@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The [`Fetcher`] abstraction: something that downloads a blob from one of a
-//! set of URIs, verifies it, stores it in a CAS, and returns the resulting
-//! digest.
+//! The [`Fetcher`] abstraction: something that downloads a blob or directory
+//! from one of a set of URIs, verifies it, stores it in a CAS, and returns the
+//! resulting digest.
 //!
 //! Implementations compose as decorators. The leaf is
 //! [`crate::url_fetcher::UrlFetcher`], which does the real HTTP work; wrappers
@@ -37,6 +37,17 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use tonic::async_trait;
 
 use crate::remote_asset_proto::{QUALIFIER_HTTP_HEADER_PREFIX, QUALIFIER_HTTP_HEADER_URL_PREFIX};
+use crate::tree_hash::TreeChecksum;
+
+/// A checksum used to verify a downloaded directory archive: either of the
+/// raw archive bytes, or of the expanded files.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DirectoryChecksum {
+    /// A hash of the raw archive bytes: the `checksum.sri` qualifier.
+    Bytes(ByteChecksum),
+    /// A hash of the expanded tree in one of the [`crate::tree_hash`] formats.
+    Tree(TreeChecksum),
+}
 
 /// HTTP headers a request asks the fetcher to send to the origin, parsed from
 /// its `http_header:<name>` and `http_header_url:<idx>:<name>` qualifiers (the
@@ -164,6 +175,33 @@ pub struct FetchBlobTask {
     pub headers: FetchHeaders,
 }
 
+/// A request to fetch a directory (a zip, tar or tar.gz archive) from one of
+/// `uris`.
+///
+/// `Hash`/`Eq` follow the same identity rules as [`FetchBlobTask`].
+#[derive(Clone, Debug)]
+pub struct FetchDirectoryJob {
+    /// Candidate URIs, tried in order until one downloads successfully.
+    pub uris: Vec<String>,
+    /// The request's qualifiers as `(name, value)` pairs. Used to build/key the
+    /// cached asset metadata and included in the deduplication identity
+    /// (order-insensitively).
+    pub qualifiers: Vec<(String, String)>,
+    /// Checksums the downloaded archive must all match. When empty the
+    /// archive is expanded without verification, as for a blob without a
+    /// checksum.
+    pub checksums: Vec<DirectoryChecksum>,
+    /// Hash function used to compute the CAS digests of the expanded tree.
+    pub hasher_func: DigestHasherFunc,
+    /// The time budget for the whole job: every URI attempt, the download,
+    /// archive expansion, verification and the CAS upload. Not part of the
+    /// deduplication identity.
+    pub timeout: Option<Duration>,
+    /// HTTP headers to send to the origin. Not part of the deduplication
+    /// identity.
+    pub headers: FetchHeaders,
+}
+
 /// Returns `qualifiers` sorted by `(name, value)`, the canonical order used for
 /// identity so that request qualifier order never matters.
 fn sorted_qualifiers(qualifiers: &[(String, String)]) -> Vec<&(String, String)> {
@@ -192,16 +230,38 @@ impl Hash for FetchBlobTask {
     }
 }
 
+impl PartialEq for FetchDirectoryJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.uris == other.uris
+            && sorted_qualifiers(&self.qualifiers) == sorted_qualifiers(&other.qualifiers)
+            && self.checksums == other.checksums
+            && self.hasher_func == other.hasher_func
+    }
+}
+
+impl Eq for FetchDirectoryJob {}
+
+impl Hash for FetchDirectoryJob {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.uris.hash(state);
+        sorted_qualifiers(&self.qualifiers).hash(state);
+        self.checksums.hash(state);
+
+        self.hasher_func.hash(state);
+    }
+}
+
 /// The result of a successful fetch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchOutcome {
     /// The URI that successfully served the content.
     pub uri: String,
-    /// CAS digest of the fetched blob.
+    /// CAS digest of the fetched blob, or of the root `Directory` for a
+    /// directory fetch.
     pub digest: DigestInfo,
 }
 
-/// Fetches blobs from URIs into a CAS.
+/// Fetches blobs and directories from URIs into a CAS.
 ///
 /// A returned `Err` carries a meaningful gRPC [`Code`](nativelink_error::Code)
 /// (e.g. `Aborted` on checksum mismatch, `DeadlineExceeded` on timeout,
@@ -211,4 +271,8 @@ pub struct FetchOutcome {
 pub trait Fetcher: core::fmt::Debug + Send + Sync + 'static {
     /// Fetches a blob, returning its CAS digest and the URI that served it.
     async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error>;
+
+    /// Fetches and expands a directory archive, returning the root `Directory`
+    /// digest and the URI that served it.
+    async fn fetch_directory(&self, job: &FetchDirectoryJob) -> Result<FetchOutcome, Error>;
 }

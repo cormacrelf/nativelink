@@ -19,10 +19,17 @@
 //! digest and the (optional) byte checksums are computed on the fly, so the full
 //! payload is never buffered in memory. The temp file is then moved into the
 //! CAS via `update_with_whole_file`.
+//!
+//! Directory archives are never held or stored in full: the response body is
+//! checksummed and size-capped as it is pulled through the archive expander,
+//! which uploads each file to the CAS as it is read (see
+//! [`crate::archive_expander`]).
 
 use core::future::Future;
 use core::time::Duration;
 use std::ffi::OsString;
+use std::io;
+use std::path::PathBuf;
 
 use futures::StreamExt;
 use nativelink_error::{Error, ResultExt, make_err, make_input_err};
@@ -33,10 +40,15 @@ use nativelink_util::redact::{redact_uri, redact_uris_in_text};
 use nativelink_util::sri::{ByteChecksum, ChecksumVerifier};
 use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio_util::io::StreamReader;
 use tonic::{Code, async_trait};
 use tracing::{debug, info};
 
-use crate::fetcher::{FetchBlobTask, FetchOutcome, Fetcher};
+use crate::archive_expander::{
+    ArchiveLimits, ArchiveOptions, DEFAULT_INLINE_THRESHOLD, extract_archive,
+};
+use crate::fetcher::{DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher};
+use crate::tree_hash::{TreeHashContext, TreeHashFailure, TreeHashSet};
 
 /// Default connect timeout applied to all origin fetches. Guards against
 /// hanging forever on an unresponsive host when a request carries no explicit
@@ -99,8 +111,8 @@ fn describe_error(e: &reqwest::Error) -> String {
 }
 
 /// Default cap on the total duration of one fetch: all URI attempts, the
-/// download, verification and the CAS upload. A request's `timeout` can only
-/// shorten it.
+/// download, archive expansion, verification and the CAS upload. A request's
+/// `timeout` can only shorten it.
 pub const DEFAULT_MAX_FETCH_DURATION: Duration = Duration::from_hours(1);
 
 /// Maps a reqwest error to the appropriate gRPC code: a timeout becomes
@@ -155,16 +167,35 @@ fn check_size_limit(uri: &str, size: u64, max_size_bytes: Option<u64>) -> Result
 
 /// The outcome of attempting to download and hash a single URI.
 enum FetchAttempt {
-    /// The content was downloaded and its checksum (if any) verified: it was
-    /// streamed to the temp file and its CAS digest computed, which this
-    /// carries.
+    /// The content was downloaded and its checksum (if any) verified. For a
+    /// blob it was streamed to the temp file and its CAS digest computed; for a
+    /// directory it was expanded into the CAS. Carries the CAS digest (of the
+    /// blob, or of the root `Directory`).
     Verified(DigestInfo),
     /// The downloaded content did not match the expected checksum. Like a
     /// download failure this is retried against the remaining URIs (a different
     /// mirror may serve correct content).
     ChecksumMismatch(Error),
-    /// Downloading from this URI failed; the caller should try the next URI.
+    /// Downloading (or, for a directory, expanding) from this URI failed; the
+    /// caller should try the next URI.
     DownloadFailed(Error),
+    /// A directory checksum cannot be checked against the archive this URI
+    /// served (`FailedPrecondition`). Not a mismatch: it says nothing about
+    /// the content. Another URI may serve an archive that can be checked.
+    Unverifiable(Error),
+}
+
+/// Reports a malformed archive, which the expander calls `InvalidArgument`, as
+/// `Aborted`. The origin served bad content, so it is not the request that is
+/// invalid, and `InvalidArgument` is what a fetcher uses to reject a request,
+/// which the server returns as an RPC error rather than in the response status.
+/// `Aborted` is the Remote Asset API's code for an asset failing a consistency
+/// check. Other codes are left as they are.
+fn origin_content_fault(mut err: Error) -> Error {
+    if err.code == Code::InvalidArgument {
+        err.code = Code::Aborted;
+    }
+    err
 }
 
 /// Truncates `file` back to an empty file positioned at offset 0 so it can be
@@ -390,6 +421,13 @@ pub struct UrlFetcher {
     max_fetch_duration: Duration,
     /// Largest download accepted from any single URI. `None` is unbounded.
     max_size_bytes: Option<u64>,
+    /// Archive files up to this many bytes are held in memory while being
+    /// uploaded; larger ones go through a temp file.
+    archive_entry_inline_threshold: u64,
+    /// Most entries accepted in an archive. `None` is unbounded.
+    max_archive_entries: Option<usize>,
+    /// Most decompressed bytes accepted from an archive. `None` is unbounded.
+    max_archive_uncompressed_bytes: Option<u64>,
 }
 
 /// Tuning for [`UrlFetcher`].
@@ -400,6 +438,13 @@ pub struct UrlFetcherOptions {
     pub temp_path: Option<String>,
     /// Largest download accepted from any single URI. `None` is unbounded.
     pub max_size_bytes: Option<u64>,
+    /// Archive files up to this many bytes are held in memory while being
+    /// uploaded; larger ones go through a temp file. `None` uses the default.
+    pub archive_entry_inline_threshold_bytes: Option<u64>,
+    /// Most entries accepted in an archive. `None` is unbounded.
+    pub max_archive_entries: Option<usize>,
+    /// Most decompressed bytes accepted from an archive. `None` is unbounded.
+    pub max_archive_uncompressed_bytes: Option<u64>,
     /// Reject a job that has no checksum, before contacting any origin.
     pub require_checksum: bool,
     /// The forward proxy to fetch through. `None` connects directly. The
@@ -419,6 +464,9 @@ impl Default for UrlFetcherOptions {
         Self {
             temp_path: None,
             max_size_bytes: None,
+            archive_entry_inline_threshold_bytes: None,
+            max_archive_entries: None,
+            max_archive_uncompressed_bytes: None,
             require_checksum: false,
             proxy: None,
             max_fetch_duration: DEFAULT_MAX_FETCH_DURATION,
@@ -434,6 +482,9 @@ impl UrlFetcher {
         let UrlFetcherOptions {
             temp_path,
             max_size_bytes,
+            archive_entry_inline_threshold_bytes,
+            max_archive_entries,
+            max_archive_uncompressed_bytes,
             require_checksum,
             proxy,
             max_fetch_duration,
@@ -482,6 +533,10 @@ impl UrlFetcher {
             proxy_configured: proxy.is_some(),
             max_fetch_duration,
             max_size_bytes,
+            archive_entry_inline_threshold: archive_entry_inline_threshold_bytes
+                .unwrap_or(DEFAULT_INLINE_THRESHOLD),
+            max_archive_entries,
+            max_archive_uncompressed_bytes,
         })
     }
 
@@ -498,6 +553,19 @@ impl UrlFetcher {
         Ok(())
     }
 
+    /// Fails a directory job that has no checksum of any kind when
+    /// `require_checksum` is set. See [`Self::check_blob_checksum`].
+    fn check_directory_checksum(&self, job: &FetchDirectoryJob) -> Result<(), Error> {
+        if self.require_checksum && job.checksums.is_empty() {
+            return Err(make_input_err!(
+                "This server only fetches content the request gives a checksum for, and the \
+                 request has none: set the checksum.sri qualifier or a tree hash such as \
+                 checksum.h1"
+            ));
+        }
+        Ok(())
+    }
+
     /// The time budget for a job with `job_timeout`: the smaller of it and the
     /// cap.
     fn budget(&self, job_timeout: Option<Duration>) -> Duration {
@@ -505,11 +573,118 @@ impl UrlFetcher {
             timeout.min(self.max_fetch_duration)
         })
     }
+
+    /// Streams the archive at `uri` through the archive expander, which uploads its
+    /// files to the CAS as they are read. Every byte of the response is counted
+    /// against `max_size_bytes` and fed to `verifiers` on its way
+    /// to the expander, which reads the response to its end. The tree hashes
+    /// among `checksums` are computed in the same pass, as the expander
+    /// reports each entry, and checked once it is done.
+    ///
+    /// `verifiers` are reset before use, so the same ones can be reused across
+    /// retries against multiple URIs.
+    async fn stream_uri_to_directory(
+        &self,
+        req: reqwest::RequestBuilder,
+        uri: &str,
+        verifiers: &mut [ChecksumVerifier],
+        checksums: &[DirectoryChecksum],
+        options: &ArchiveOptions,
+    ) -> FetchAttempt {
+        let max_size_bytes = self.max_size_bytes;
+        reset_verifiers(verifiers);
+
+        let response = match send_awaiting_headers(req, uri).await {
+            Ok(response) => response,
+            Err(err) => return FetchAttempt::DownloadFailed(err),
+        };
+        if let Err(err) =
+            check_size_limit(uri, response.content_length().unwrap_or(0), max_size_bytes)
+        {
+            return FetchAttempt::DownloadFailed(err);
+        }
+
+        // The expander reports a failing body as a malformed archive, so remember
+        // the real cause here.
+        let mut source_err: Option<Error> = None;
+        let mut received: u64 = 0;
+        let body = Box::pin(response.bytes_stream().map(|chunk| {
+            let chunk = chunk
+                .map_err(|e| {
+                    make_err!(
+                        download_error_code(&e),
+                        "Failed to read body of '{uri}': {e}"
+                    )
+                })
+                .and_then(|chunk| {
+                    received += chunk.len() as u64;
+                    check_size_limit(uri, received, max_size_bytes)?;
+                    Ok(chunk)
+                });
+            match chunk {
+                Ok(chunk) => {
+                    for verifier in verifiers.iter_mut() {
+                        verifier.update(chunk.as_ref());
+                    }
+                    Ok(chunk)
+                }
+                Err(err) => {
+                    let io_err = io::Error::other(err.message_string());
+                    source_err = Some(err);
+                    Err(io_err)
+                }
+            }
+        }));
+        let tree_checksums = checksums.iter().filter_map(|checksum| match checksum {
+            DirectoryChecksum::Tree(checksum) => Some(checksum),
+            DirectoryChecksum::Bytes(_) => None,
+        });
+        let context = TreeHashContext {
+            hasher_func: options.hasher_func,
+            temp_dir: options.temp_dir.clone(),
+        };
+        let mut tree_hashes = TreeHashSet::new(tree_checksums, &context);
+        let mut reader = StreamReader::new(body);
+        let result = extract_archive(
+            &mut reader,
+            self.cas_store.as_pin(),
+            options,
+            &mut tree_hashes,
+        )
+        .await;
+        drop(reader);
+
+        if let Some(err) = source_err {
+            return FetchAttempt::DownloadFailed(err);
+        }
+        let tree = match result {
+            Ok(tree) => tree,
+            Err(err) => {
+                return FetchAttempt::DownloadFailed(origin_content_fault(
+                    err.append(format!("Expanding directory archive fetched from '{uri}'")),
+                ));
+            }
+        };
+
+        if let Err(err) = verify_all(verifiers) {
+            return FetchAttempt::ChecksumMismatch(err);
+        }
+        match tree_hashes.finish(&tree.listing).await {
+            Ok(()) => FetchAttempt::Verified(tree.root_digest),
+            Err(TreeHashFailure::Mismatch(err)) => FetchAttempt::ChecksumMismatch(err),
+            Err(TreeHashFailure::Unverifiable(err)) => FetchAttempt::Unverifiable(err),
+            Err(TreeHashFailure::Failed(err)) => {
+                FetchAttempt::DownloadFailed(origin_content_fault(
+                    err.append(format!("Checking the directory fetched from '{uri}'")),
+                ))
+            }
+        }
+    }
 }
 
 /// Runs `fetch` for at most `budget`, failing with `DeadlineExceeded` when it
 /// runs out. The future is dropped on expiry, which closes the connection and
-/// deletes the temp file (it is a `TempPath`, removed on drop).
+/// deletes the temp files (they are `TempPath`s, removed on drop).
 async fn within_budget(
     budget: Duration,
     what: &str,
@@ -534,6 +709,15 @@ impl core::fmt::Debug for UrlFetcher {
             .field("proxy_configured", &self.proxy_configured)
             .field("max_fetch_duration", &self.max_fetch_duration)
             .field("max_size_bytes", &self.max_size_bytes)
+            .field(
+                "archive_entry_inline_threshold",
+                &self.archive_entry_inline_threshold,
+            )
+            .field("max_archive_entries", &self.max_archive_entries)
+            .field(
+                "max_archive_uncompressed_bytes",
+                &self.max_archive_uncompressed_bytes,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -584,8 +768,9 @@ impl UrlFetcher {
                     last_err = Some(err);
                 }
                 // Corrupt content from this mirror; another URI may serve the
-                // correct bytes, so try the rest before giving up.
-                FetchAttempt::ChecksumMismatch(err) => {
+                // correct bytes, so try the rest before giving up. (Only a
+                // directory can be unverifiable.)
+                FetchAttempt::ChecksumMismatch(err) | FetchAttempt::Unverifiable(err) => {
                     info!(
                         uri = %redact_uri(uri),
                         code = ?err.code,
@@ -619,6 +804,86 @@ impl UrlFetcher {
 
         Err(last_err.unwrap_or_else(|| make_err!(Code::NotFound, "No URIs available to fetch")))
     }
+
+    async fn fetch_directory_unbounded(
+        &self,
+        job: &FetchDirectoryJob,
+    ) -> Result<FetchOutcome, Error> {
+        // As for blobs, one verifier per byte checksum. Those are over the
+        // raw archive bytes; the tree checksums are over the files in it. All
+        // of them must match.
+        let byte_checksums: Vec<ByteChecksum> = job
+            .checksums
+            .iter()
+            .filter_map(|checksum| match checksum {
+                DirectoryChecksum::Bytes(checksum) => Some(checksum.clone()),
+                DirectoryChecksum::Tree(_) => None,
+            })
+            .collect();
+        let mut verifiers = make_verifiers(&byte_checksums);
+        let mut options = ArchiveOptions::new(job.hasher_func);
+        options.inline_threshold = self.archive_entry_inline_threshold;
+        options.limits = ArchiveLimits {
+            max_entries: self.max_archive_entries,
+            max_total_uncompressed_bytes: self.max_archive_uncompressed_bytes,
+        };
+        options.temp_dir = self.temp_path.as_ref().map(PathBuf::from);
+
+        // Remembers the most recent failure so that, if every URI fails, we
+        // return a meaningful error rather than a generic not-found. An
+        // archive whose checksum cannot be checked is reported only when no
+        // URI failed in another way.
+        let mut last_err: Option<Error> = None;
+        let mut last_unverifiable: Option<Error> = None;
+        for (idx, uri) in job.uris.iter().enumerate() {
+            debug!(uri = %redact_uri(uri), idx, "Downloading fetch directory archive");
+            let req = self.client.get(uri).headers(job.headers.for_uri(idx));
+            match self
+                .stream_uri_to_directory(req, uri, &mut verifiers, &job.checksums, &options)
+                .await
+            {
+                FetchAttempt::Verified(digest) => {
+                    return Ok(FetchOutcome {
+                        uri: uri.clone(),
+                        digest,
+                    });
+                }
+                FetchAttempt::DownloadFailed(err) => {
+                    info!(
+                        uri = %redact_uri(uri),
+                        code = ?err.code,
+                        message = %redact_uris_in_text(&err.message_string()),
+                        "Failed to fetch directory archive, trying next uri"
+                    );
+                    last_err = Some(err);
+                }
+                // Blobs the bad archive left in the CAS are simply unused and
+                // age out of it.
+                FetchAttempt::ChecksumMismatch(err) => {
+                    info!(
+                        uri = %redact_uri(uri),
+                        code = ?err.code,
+                        message = %redact_uris_in_text(&err.message_string()),
+                        "Checksum mismatch, trying next uri"
+                    );
+                    last_err = Some(err);
+                }
+                FetchAttempt::Unverifiable(err) => {
+                    info!(
+                        uri = %redact_uri(uri),
+                        code = ?err.code,
+                        message = %redact_uris_in_text(&err.message_string()),
+                        "Checksum cannot be checked against this archive, trying next uri"
+                    );
+                    last_unverifiable = Some(err);
+                }
+            }
+        }
+
+        Err(last_err
+            .or(last_unverifiable)
+            .unwrap_or_else(|| make_err!(Code::NotFound, "No URIs available to fetch")))
+    }
 }
 
 #[async_trait]
@@ -629,6 +894,16 @@ impl Fetcher for UrlFetcher {
             self.budget(job.timeout),
             "blob",
             self.fetch_blob_unbounded(job),
+        )
+        .await
+    }
+
+    async fn fetch_directory(&self, job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+        self.check_directory_checksum(job)?;
+        within_budget(
+            self.budget(job.timeout),
+            "directory",
+            self.fetch_directory_unbounded(job),
         )
         .await
     }

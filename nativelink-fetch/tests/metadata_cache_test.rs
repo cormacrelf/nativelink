@@ -12,21 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_error::{Code, Error, make_err};
-use nativelink_fetch::fetcher::{FetchBlobTask, FetchHeaders, FetchOutcome, Fetcher};
+use nativelink_fetch::fetcher::{
+    DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchHeaders, FetchOutcome, Fetcher,
+};
 use nativelink_fetch::metadata_cache::MetadataCache;
 use nativelink_fetch::remote_asset_proto::{
     AssetKind, RemoteAssetMetadata, RemoteAssetQuery, read_remote_asset_entry, timestamp_is_before,
 };
+use nativelink_fetch::tree_hash::TreeChecksum;
+use nativelink_fetch::tree_hash::h1::H1;
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
 use nativelink_proto::build::bazel::remote::execution::v2::command::EnvironmentVariable;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    Action, ActionResult, Command, Digest, OutputFile, digest_function,
+    Action, ActionResult, Command, Digest, Directory, DirectoryNode, FileNode, OutputFile, Tree,
+    digest_function,
 };
+use nativelink_store::ac_utils::{get_and_decode_digest, serialize_and_upload_message};
 use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
@@ -50,6 +57,12 @@ impl Fetcher for OkFetcher {
             digest: self.digest,
         })
     }
+    async fn fetch_directory(&self, _job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+        Ok(FetchOutcome {
+            uri: self.uri.clone(),
+            digest: self.digest,
+        })
+    }
 }
 
 /// An inner `Fetcher` that always fails.
@@ -60,6 +73,9 @@ struct ErrFetcher;
 impl Fetcher for ErrFetcher {
     async fn fetch_blob(&self, _job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
         Err(make_err!(Code::NotFound, "no uri served the blob"))
+    }
+    async fn fetch_directory(&self, _job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+        Err(make_err!(Code::NotFound, "no uri served the directory"))
     }
 }
 
@@ -96,6 +112,83 @@ fn blob_job(uri: &str, qualifiers: Vec<(String, String)>) -> FetchBlobTask {
     }
 }
 
+fn directory_job(uri: &str) -> FetchDirectoryJob {
+    FetchDirectoryJob {
+        uris: vec![uri.to_string()],
+        qualifiers: qualifiers(),
+        checksums: vec![DirectoryChecksum::Tree(
+            TreeChecksum::parse(&H1, "h1:abc").unwrap(),
+        )],
+        hasher_func: DigestHasherFunc::Sha256,
+        timeout: None,
+        headers: FetchHeaders::default(),
+    }
+}
+
+fn sha256_digest_of(bytes: &[u8]) -> DigestInfo {
+    let mut hasher = DigestHasherFunc::Sha256.hasher();
+    hasher.update(bytes);
+    hasher.finalize_digest()
+}
+
+/// Uploads `directory` to `cas` and returns its digest.
+async fn upload_directory(cas: &Store, directory: &Directory) -> DigestInfo {
+    serialize_and_upload_message(
+        directory,
+        cas.as_pin(),
+        &mut DigestHasherFunc::Sha256.hasher(),
+    )
+    .await
+    .unwrap()
+}
+
+fn file_node(name: &str, content: &[u8]) -> FileNode {
+    FileNode {
+        name: name.to_string(),
+        digest: Some(sha256_digest_of(content).into()),
+        ..Default::default()
+    }
+}
+
+fn directory_node(name: &str, digest: DigestInfo) -> DirectoryNode {
+    DirectoryNode {
+        name: name.to_string(),
+        digest: Some(digest.into()),
+    }
+}
+
+/// Uploads `root/{a.txt, sub/{b.txt, deep/c.txt}}` and returns the digests of
+/// `(root, sub, deep)`.
+async fn upload_nested_directories(cas: &Store) -> (DigestInfo, DigestInfo, DigestInfo) {
+    let deep = upload_directory(
+        cas,
+        &Directory {
+            files: vec![file_node("c.txt", b"c")],
+            ..Default::default()
+        },
+    )
+    .await;
+    let sub = upload_directory(
+        cas,
+        &Directory {
+            files: vec![file_node("b.txt", b"b")],
+            directories: vec![directory_node("deep", deep)],
+            ..Default::default()
+        },
+    )
+    .await;
+    let root = upload_directory(
+        cas,
+        &Directory {
+            files: vec![file_node("a.txt", b"a")],
+            directories: vec![directory_node("sub", sub)],
+            ..Default::default()
+        },
+    )
+    .await;
+    (root, sub, deep)
+}
+
 /// Reads and decodes the raw `ActionResult` stored under `key`.
 async fn stored_action_result(store: &Store, key: DigestInfo) -> ActionResult {
     let raw = store
@@ -127,12 +220,13 @@ fn key_of(kind: AssetKind, uri: &str, qualifiers: Vec<Qualifier>) -> DigestInfo 
 #[nativelink_test]
 async fn writes_blob_metadata_as_an_action_result_on_success() {
     let ac_store = memory_store().await;
+    let cas_store = memory_store().await;
     let digest = DigestInfo::try_new(&"ab".repeat(32), 11).unwrap();
     let inner: Arc<dyn Fetcher> = Arc::new(OkFetcher {
         uri: "http://example/blob".to_string(),
         digest,
     });
-    let mc = MetadataCache::new(inner, ac_store.clone());
+    let mc = MetadataCache::new(inner, ac_store.clone(), cas_store);
 
     let outcome = mc
         .fetch_blob(&blob_job("http://example/blob", qualifiers()))
@@ -191,8 +285,8 @@ async fn writes_blob_metadata_as_an_action_result_on_success() {
 #[nativelink_test]
 async fn key_is_the_digest_of_a_synthetic_action() {
     let query = RemoteAssetQuery::new(
-        AssetKind::Blob,
-        "http://example/blob".to_string(),
+        AssetKind::Directory,
+        "http://example/dir".to_string(),
         vec![
             Qualifier {
                 name: "b".to_string(),
@@ -212,8 +306,8 @@ async fn key_is_the_digest_of_a_synthetic_action() {
         let command = Command {
             arguments: vec![
                 "nativelink-remote-asset".to_string(),
-                "blob".to_string(),
-                "http://example/blob".to_string(),
+                "directory".to_string(),
+                "http://example/dir".to_string(),
             ],
             environment_variables: vec![
                 EnvironmentVariable {
@@ -247,6 +341,14 @@ async fn key_is_the_digest_of_a_synthetic_action() {
 }
 
 #[nativelink_test]
+async fn blob_and_directory_keys_differ_for_the_same_uri() {
+    assert_ne!(
+        key_of(AssetKind::Blob, "http://example/x", vec![]),
+        key_of(AssetKind::Directory, "http://example/x", vec![])
+    );
+}
+
+#[nativelink_test]
 async fn key_does_not_depend_on_qualifier_order_or_headers() {
     let qualifier = |name: &str, value: &str| Qualifier {
         name: name.to_string(),
@@ -268,10 +370,94 @@ async fn key_does_not_depend_on_qualifier_order_or_headers() {
 }
 
 #[nativelink_test]
+async fn writes_directory_metadata_with_a_tree_on_success() {
+    let ac_store = memory_store().await;
+    let cas_store = memory_store().await;
+    let (root, sub, deep) = upload_nested_directories(&cas_store).await;
+    let inner: Arc<dyn Fetcher> = Arc::new(OkFetcher {
+        uri: "http://example/dir".to_string(),
+        digest: root,
+    });
+    let mc = MetadataCache::new(inner, ac_store.clone(), cas_store.clone());
+
+    let outcome = mc
+        .fetch_directory(&directory_job("http://example/dir"))
+        .await
+        .unwrap();
+    assert_eq!(outcome.digest, root);
+
+    let key = key_of(
+        AssetKind::Directory,
+        "http://example/dir",
+        proto_qualifiers(),
+    );
+    let action_result = stored_action_result(&ac_store, key).await;
+    assert!(action_result.output_files.is_empty());
+    assert_eq!(action_result.output_directories.len(), 1);
+    let output_directory = &action_result.output_directories[0];
+    assert_eq!(output_directory.path, "out");
+    let tree_digest = DigestInfo::try_from(output_directory.tree_digest.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        stored_metadata(&action_result).root_directory_digest,
+        Some(Digest::from(root))
+    );
+
+    // The Tree is in the CAS and holds the root and every descendant.
+    let tree: Tree = get_and_decode_digest(&cas_store, tree_digest.into())
+        .await
+        .unwrap();
+    let expected_root: Directory = get_and_decode_digest(&cas_store, root.into())
+        .await
+        .unwrap();
+    assert_eq!(tree.root, Some(expected_root));
+    let child_digests: HashSet<DigestInfo> = tree
+        .children
+        .iter()
+        .map(|child| sha256_digest_of(&child.encode_to_vec()))
+        .collect();
+    assert_eq!(tree.children.len(), 2);
+    assert_eq!(child_digests, HashSet::from([sub, deep]));
+}
+
+#[nativelink_test]
+async fn directory_with_a_missing_subdirectory_is_an_error_and_writes_nothing() {
+    let ac_store = memory_store().await;
+    let cas_store = memory_store().await;
+    // The root refers to a subdirectory that was never uploaded.
+    let missing = DigestInfo::try_new(&"ef".repeat(32), 5).unwrap();
+    let root = upload_directory(
+        &cas_store,
+        &Directory {
+            directories: vec![directory_node("sub", missing)],
+            ..Default::default()
+        },
+    )
+    .await;
+    let inner: Arc<dyn Fetcher> = Arc::new(OkFetcher {
+        uri: "http://example/dir".to_string(),
+        digest: root,
+    });
+    let mc = MetadataCache::new(inner, ac_store.clone(), cas_store);
+
+    let err = mc
+        .fetch_directory(&directory_job("http://example/dir"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Code::NotFound);
+
+    let key = key_of(
+        AssetKind::Directory,
+        "http://example/dir",
+        proto_qualifiers(),
+    );
+    assert!(ac_store.get_part_unchunked(key, 0, None).await.is_err());
+}
+
+#[nativelink_test]
 async fn does_not_write_metadata_on_failure() {
     let ac_store = memory_store().await;
     let inner: Arc<dyn Fetcher> = Arc::new(ErrFetcher);
-    let mc = MetadataCache::new(inner, ac_store.clone());
+    let mc = MetadataCache::new(inner, ac_store.clone(), memory_store().await);
 
     let err = mc
         .fetch_blob(&blob_job("http://example/blob", qualifiers()))
@@ -295,7 +481,7 @@ async fn does_not_persist_or_key_on_header_qualifiers() {
         uri: "http://example/blob".to_string(),
         digest,
     });
-    let mc = MetadataCache::new(inner, ac_store.clone());
+    let mc = MetadataCache::new(inner, ac_store.clone(), memory_store().await);
 
     // Even if header qualifiers reach the job's qualifiers, they must be
     // neither persisted nor part of the metadata key.

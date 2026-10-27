@@ -16,9 +16,11 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 
-use nativelink_error::Error;
+use nativelink_error::{Code, Error, make_err};
 use nativelink_fetch::background_fetcher::{BackgroundFetcher, BackgroundFetcherOpts};
-use nativelink_fetch::fetcher::{FetchBlobTask, FetchHeaders, FetchOutcome, Fetcher};
+use nativelink_fetch::fetcher::{
+    FetchBlobTask, FetchDirectoryJob, FetchHeaders, FetchOutcome, Fetcher,
+};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
 use nativelink_util::common::DigestInfo;
@@ -106,6 +108,13 @@ impl Fetcher for MockFetcher {
             uri: job.uris.first().cloned().unwrap_or_default(),
             digest: DigestInfo::try_new(&"0".repeat(64), 1).unwrap(),
         })
+    }
+
+    async fn fetch_directory(&self, _job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+        Err(make_err!(
+            Code::Unimplemented,
+            "fetch_directory is not exercised by these tests"
+        ))
     }
 }
 

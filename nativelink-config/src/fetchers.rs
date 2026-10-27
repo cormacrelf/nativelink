@@ -65,6 +65,10 @@ pub struct UrlFetcherSpec {
     /// block device as that store's `content_path`; otherwise the upload falls
     /// back to a streaming copy. When unset, the system temporary directory is
     /// used.
+    ///
+    /// Directory (archive) fetches also use it, for files in the archive larger
+    /// than `archive_entry_inline_threshold_bytes` and, for zip archives, for a
+    /// copy of the archive kept while it downloads.
     #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
     pub temp_path: Option<String>,
 
@@ -73,17 +77,56 @@ pub struct UrlFetcherSpec {
     /// one that streams more than this many bytes (including when the server
     /// omits or misreports `Content-Length`) is aborted. The URI is then treated
     /// as failed and the next one is tried; if none succeed the request fails
-    /// with `RESOURCE_EXHAUSTED`. When unset, downloads are unbounded.
+    /// with `RESOURCE_EXHAUSTED`. When unset, downloads are unbounded. For a
+    /// directory fetch this limits the size of the (compressed) archive.
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
     pub max_size_bytes: Option<u64>,
 
+    /// Directory fetches expand an archive (zip, tar or tar.gz) as it downloads,
+    /// uploading each file to the CAS as soon as it has been read. A file needs
+    /// its digest before it can be uploaded, so it is first held either in
+    /// memory or in a temporary file in `temp_path`. Files up to this many bytes
+    /// are held in memory; larger files go through a temporary file. Raising it
+    /// trades memory for fewer temporary files, lowering it does the reverse.
+    /// Defaults to 1 MiB.
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub archive_entry_inline_threshold_bytes: Option<u64>,
+
+    /// Maximum number of entries (files, directories and links) in an archive
+    /// fetched by a directory fetch. An archive with more is aborted as it is
+    /// read; the URI is then treated as failed and the next one is tried, and if
+    /// none succeed the request fails with `RESOURCE_EXHAUSTED`. Counted as the
+    /// archive is read rather than taken from any header, so a lying archive
+    /// does not get past it. When unset, the number of entries is unbounded.
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub max_archive_entries: Option<usize>,
+
+    /// Maximum total size, in bytes, of the decompressed file contents of an
+    /// archive fetched by a directory fetch. Unlike `max_size_bytes`, which caps
+    /// the compressed download, this guards against decompression bombs: a tiny
+    /// archive that expands to a huge amount of data. It is counted on the bytes
+    /// actually decompressed, never on sizes declared in the archive, so lying
+    /// headers do not get past it. Exceeding it fails the URI as for
+    /// `max_archive_entries`. When unset, the expanded size is unbounded.
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub max_archive_uncompressed_bytes: Option<u64>,
+
     /// Hard cap, in seconds, on the total duration of a single fetch: every
-    /// URI attempt, the download, checksum verification and the CAS upload
-    /// together. A fetch that runs out of time fails with `DEADLINE_EXCEEDED`
-    /// in the response status, whatever else is going on.
+    /// URI attempt, the download, archive expansion, checksum verification and
+    /// the CAS upload together. A fetch that runs out of time fails with
+    /// `DEADLINE_EXCEEDED` in the response status, whatever else is going on.
     ///
     /// A request's own `timeout` can only shorten this. The effective budget is
     /// the smaller of the request's `timeout` (after any `min_timeout_s` and
@@ -142,9 +185,10 @@ pub struct UrlFetcherSpec {
     pub no_proxy: Vec<String>,
 
     /// Refuse to download content that the request gives no checksum for: a
-    /// blob request needs a `checksum.sri` qualifier. A request without one
-    /// fails with `INVALID_ARGUMENT` before any origin is contacted. Use it so
-    /// that nothing unverified is ever fetched into the CAS.
+    /// blob request needs a `checksum.sri` qualifier, and a directory request
+    /// that or a tree hash such as `checksum.h1`. A request without one fails
+    /// with `INVALID_ARGUMENT` before any origin is contacted. Use it so that
+    /// nothing unverified is ever fetched into the CAS.
     ///
     /// The check is part of fetching, so it applies only when content would be
     /// downloaded. A request that finds an asset already pushed with
@@ -168,6 +212,12 @@ pub struct MetadataCacheSpec {
     /// a central cluster.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub fetch_store: StoreRefName,
+
+    /// The CAS store (from the `stores` map) the fetched content lives in; the
+    /// `cas_store` of the inner `url` fetcher. For a directory it is read to
+    /// build the `Tree` stored with the metadata.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub cas_store: StoreRefName,
 
     /// The inner fetcher (from the `fetchers` list) this decorates.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]

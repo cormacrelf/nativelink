@@ -22,12 +22,15 @@ use std::time::Instant;
 use bytes::Bytes;
 use nativelink_config::cas_server::{FetchConfig, WithInstanceName};
 use nativelink_error::{Error, ResultExt, make_input_err};
-use nativelink_fetch::fetcher::{FetchBlobTask, FetchHeaders, Fetcher};
+use nativelink_fetch::fetcher::{
+    DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchHeaders, Fetcher,
+};
 use nativelink_fetch::remote_asset_proto::{
     AssetKind, QUALIFIER_BAZEL_CANONICAL_ID, QUALIFIER_HTTP_HEADER_PREFIX,
     QUALIFIER_HTTP_HEADER_URL_PREFIX, RemoteAssetEntry, RemoteAssetQuery, is_http_header_qualifier,
     now_timestamp, qualifier_names, read_remote_asset_entry, redacted_uris, timestamp_is_before,
 };
+use nativelink_fetch::tree_hash::{TREE_HASH_FORMATS, TreeChecksum};
 use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::{
     Fetch, FetchServer as Server,
 };
@@ -55,6 +58,19 @@ use tracing::{Instrument, Level, debug, error_span, info, instrument, warn};
 /// download plain HTTP(S) content, so they are rejected rather than ignored.
 const BLOB_QUALIFIERS: &[&str] = &[QUALIFIER_CHECKSUM_SRI, QUALIFIER_BAZEL_CANONICAL_ID];
 
+/// Qualifiers `FetchDirectory` honours, besides HTTP header qualifiers and
+/// those of the [`TREE_HASH_FORMATS`] (see [`directory_qualifiers`]).
+const DIRECTORY_QUALIFIERS: &[&str] = &[QUALIFIER_CHECKSUM_SRI, QUALIFIER_BAZEL_CANONICAL_ID];
+
+/// Every qualifier `FetchDirectory` honours, besides HTTP header qualifiers.
+fn directory_qualifiers() -> Vec<&'static str> {
+    DIRECTORY_QUALIFIERS
+        .iter()
+        .copied()
+        .chain(TREE_HASH_FORMATS.iter().map(|format| format.qualifier()))
+        .collect()
+}
+
 /// The `checksum.sri` a request asks for, if any. It is parsed only once a
 /// fetch is needed, so that an asset pushed under a qualifier set with an
 /// unparsable SRI can still be found. A malformed value is an
@@ -63,6 +79,19 @@ fn sri_checksum(qualifiers: &[Qualifier]) -> Result<Option<ByteChecksum>, Error>
     find_qualifier(qualifiers, QUALIFIER_CHECKSUM_SRI)
         .map(ByteChecksum::from_sri)
         .transpose()
+}
+
+/// The tree-hash checksums a `FetchDirectory` request asks for, all of which
+/// the fetched directory must match. A malformed value is an
+/// `InvalidArgument` error.
+fn directory_checksums(qualifiers: &[Qualifier]) -> Result<Vec<DirectoryChecksum>, Error> {
+    let mut checksums = Vec::new();
+    for &format in TREE_HASH_FORMATS {
+        if let Some(value) = find_qualifier(qualifiers, format.qualifier()) {
+            checksums.push(DirectoryChecksum::Tree(TreeChecksum::parse(format, value)?));
+        }
+    }
+    Ok(checksums)
 }
 
 /// `ErrorInfo.domain` of every error detail this server attaches.
@@ -109,7 +138,8 @@ fn not_cached_status(reason: &str, message: &str) -> GoogleStatus {
 /// Converts a failed fetch into a response status that keeps the fetch error's
 /// code and message and marks it as a fetch failure. An `InvalidArgument` is
 /// not one: it is the request that is at fault, so it is returned as an RPC
-/// error instead (see the callers).
+/// error instead (see the callers). The URL fetcher makes sure of that by
+/// reporting a malformed archive, which is the origin's fault, as `Aborted`.
 fn fetch_failed_status(err: Error) -> GoogleStatus {
     let mut status = GoogleStatus::from(err);
     status.details.push(error_info(REASON_FETCH_FAILED));
@@ -537,6 +567,163 @@ impl FetchServer {
             digest_function: request.digest_function,
         }))
     }
+
+    async fn inner_fetch_directory(
+        &self,
+        request: FetchDirectoryRequest,
+        rpc_deadline: Option<TokioInstant>,
+    ) -> Result<Response<FetchDirectoryResponse>, Status> {
+        let instance_name = &request.instance_name;
+        let store_info = self
+            .stores
+            .get(instance_name)
+            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?;
+        let start = Instant::now();
+
+        if request.uris.is_empty() {
+            return Err(
+                Error::new(Code::InvalidArgument, "No uris in fetch request".to_owned()).into(),
+            );
+        }
+        let now = now_timestamp();
+
+        for uri in &request.uris {
+            let query = RemoteAssetQuery::new(
+                AssetKind::Directory,
+                uri.clone(),
+                request.qualifiers.clone(),
+            );
+            let entry = lookup_entry(
+                &store_info.store,
+                &query,
+                request.digest_function,
+                request.oldest_content_accepted.as_ref(),
+                &now,
+            )
+            .await;
+            debug!(
+                uri = %redact_uri(uri),
+                hit = entry.is_some(),
+                "Looked up fetch directory asset"
+            );
+            if let Some(entry) = entry {
+                info!(
+                    uri = %redact_uri(uri),
+                    digest = %entry.digest.hash,
+                    size_bytes = entry.digest.size_bytes,
+                    source = "cache",
+                    duration = ?start.elapsed(),
+                    "Fetched directory"
+                );
+                return Ok(Response::new(FetchDirectoryResponse {
+                    status: Some(GoogleStatus {
+                        code: Code::Ok.into(),
+                        message: "Fetch directory found".to_owned(),
+                        details: vec![],
+                    }),
+                    uri: entry.query.uri,
+                    qualifiers: entry.query.qualifiers,
+                    expires_at: entry.expire_at,
+                    root_directory_digest: Some(entry.digest),
+                    digest_function: entry.digest_function,
+                }));
+            }
+        }
+
+        // No previously cached directory matched. If a fetcher is configured,
+        // actively download the archive, expand it into a Directory tree,
+        // cache the metadata, and return the root directory digest.
+        // `checksum.sri` and the tree hashes (such as `checksum.h1`, Go's
+        // directory hash) are all accepted, and every one present must match.
+        // A checksum is optional: when absent the archive is expanded
+        // unverified, as a blob without `checksum.sri` is.
+        let Some(fetcher) = &store_info.fetcher else {
+            return Ok(Response::new(FetchDirectoryResponse {
+                status: Some(not_cached_status(
+                    REASON_NOT_CACHED_NO_FETCHER,
+                    "not cached, and this instance has no fetcher configured",
+                )),
+                uri: request.uris.first().cloned().unwrap_or_default(),
+                qualifiers: request.qualifiers,
+                expires_at: None,
+                root_directory_digest: None,
+                digest_function: request.digest_function,
+            }));
+        };
+        // Only a download needs the qualifiers checked: the content must
+        // match all of them, so reject any we cannot honour, and malformed
+        // ones, before sending anything to the origin.
+        if let Some(status) =
+            unsupported_qualifiers_status(&request.qualifiers, &directory_qualifiers())
+        {
+            return Err(status);
+        }
+        let headers = FetchHeaders::from_qualifiers(&request.qualifiers, request.uris.len())?;
+        let mut checksums = directory_checksums(&request.qualifiers)?;
+        let hasher_func = DigestHasherFunc::try_from(request.digest_function)
+            .err_tip(|| "In FetchServer::inner_fetch_directory")?;
+        checksums.extend(sri_checksum(&request.qualifiers)?.map(DirectoryChecksum::Bytes));
+        let job = FetchDirectoryJob {
+            uris: request.uris.clone(),
+            qualifiers: qualifier_pairs(&request.qualifiers),
+            checksums,
+            hasher_func,
+            timeout: request_timeout(request.timeout.as_ref()),
+            headers,
+        };
+        // The fetcher (via MetadataCache) caches the directory metadata
+        // itself; here we only shape the response.
+        info!("Directory is not cached, fetching it");
+        match until_rpc_deadline(rpc_deadline, fetcher.fetch_directory(&job)).await? {
+            Ok(outcome) => {
+                let proto_digest: Digest = outcome.digest.into();
+                info!(
+                    uri = %redact_uri(&outcome.uri),
+                    digest = %proto_digest.hash,
+                    size_bytes = proto_digest.size_bytes,
+                    source = "download",
+                    duration = ?start.elapsed(),
+                    "Fetched directory"
+                );
+                Ok(Response::new(FetchDirectoryResponse {
+                    status: Some(GoogleStatus {
+                        code: Code::Ok.into(),
+                        message: "Fetch directory found".to_owned(),
+                        details: vec![],
+                    }),
+                    uri: outcome.uri,
+                    qualifiers: request.qualifiers.clone(),
+                    expires_at: None,
+                    root_directory_digest: Some(proto_digest),
+                    digest_function: hasher_func.proto_digest_func().into(),
+                }))
+            }
+            // As for a blob: an invalid request is an RPC error.
+            Err(err) if err.code == Code::InvalidArgument => {
+                warn!(
+                    message = %redact_uris_in_text(&err.message_string()),
+                    "Fetch directory request rejected by the fetcher"
+                );
+                Err(err.into())
+            }
+            Err(err) => {
+                warn!(
+                    code = ?err.code,
+                    message = %redact_uris_in_text(&err.message_string()),
+                    duration = ?start.elapsed(),
+                    "Failed to fetch directory from any uri"
+                );
+                Ok(Response::new(FetchDirectoryResponse {
+                    status: Some(fetch_failed_status(err)),
+                    uri: request.uris.first().cloned().unwrap_or_default(),
+                    qualifiers: request.qualifiers.clone(),
+                    expires_at: None,
+                    root_directory_digest: None,
+                    digest_function: hasher_func.proto_digest_func().into(),
+                }))
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -573,16 +760,34 @@ impl Fetch for FetchServer {
     }
 
     #[allow(clippy::blocks_in_conditions)]
+    // The response echoes the request's qualifiers, header values included, so
+    // it is not logged either.
     #[instrument(
         err(level = Level::WARN),
-        ret(level = Level::INFO),
         skip_all,
-        fields(request = ?_grpc_request.get_ref())
+        fields(
+            // Qualifier values and URI credentials must never be logged.
+            request.instance_name = ?grpc_request.get_ref().instance_name,
+            request.uris = ?redacted_uris(&grpc_request.get_ref().uris),
+            request.qualifiers = ?qualifier_names(&grpc_request.get_ref().qualifiers),
+            request.digest_function = ?grpc_request.get_ref().digest_function,
+            request.has_timeout = grpc_request.get_ref().timeout.is_some(),
+        )
     )]
     async fn fetch_directory(
         &self,
-        _grpc_request: Request<FetchDirectoryRequest>,
+        grpc_request: Request<FetchDirectoryRequest>,
     ) -> Result<Response<FetchDirectoryResponse>, Status> {
-        Err(Status::unimplemented("FetchDirectory not implemented"))
+        let rpc_deadline = rpc_wait_deadline(grpc_request.metadata());
+        let request = grpc_request.into_inner();
+        let digest_function = request.digest_function;
+        self.inner_fetch_directory(request, rpc_deadline)
+            .instrument(error_span!("fetch_server_fetch_directory"))
+            .with_context(
+                make_ctx_for_hash_func(digest_function)
+                    .err_tip(|| "In FetchServer::fetch_directory")?,
+            )
+            .await
+            .map_err(|status| status_tip(&status, "Failed on fetch_directory() command"))
     }
 }

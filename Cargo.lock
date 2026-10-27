@@ -3247,6 +3247,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "fastcdc",
+ "flate2",
  "futures",
  "hex",
  "http-body-util",
@@ -3271,6 +3272,7 @@ dependencies = [
  "serde_json",
  "serde_json5",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -3281,6 +3283,7 @@ dependencies = [
  "tracing",
  "tracing-test",
  "uuid",
+ "zip",
  "zstd",
 ]
 
