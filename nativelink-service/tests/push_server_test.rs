@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use nativelink_config::cas_server::{FetchConfig, PushConfig, WithInstanceName};
@@ -96,8 +97,10 @@ fn make_fetch_server(store_manager: &StoreManager) -> FetchServer {
             instance_name: INSTANCE_NAME.to_string(),
             config: FetchConfig {
                 fetch_store: String::from("test_push_store"),
+                fetcher: None,
             },
         }],
+        &HashMap::new(),
         store_manager,
     )
     .expect("FetchServer config error")

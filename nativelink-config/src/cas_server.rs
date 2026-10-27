@@ -20,6 +20,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::fetchers::{FetcherRefName, FetcherSpec};
 use crate::schedulers::SchedulerSpec;
 use crate::serde_utils::{
     convert_boolean_with_shellexpand, convert_data_size_with_shellexpand,
@@ -303,8 +304,30 @@ pub struct ExecutionConfig {
 pub struct FetchConfig {
     /// The store name referenced in the `stores` map in the main config.
     /// This store name referenced here may be reused multiple times.
+    ///
+    /// This must be an Action Cache store. It holds the `RemoteAsset` metadata
+    /// that maps a fetched URI + qualifiers to the digest of its content in
+    /// the CAS, as an `ActionResult` stored under the digest of a synthetic
+    /// `Action` (which cannot collide with a real action). It is read on every
+    /// Fetch to serve previously pushed/fetched assets. When a `fetcher` is
+    /// configured, that fetcher's `MetadataCache` layer should write to this
+    /// same store, or one backed by the same data, so actively-fetched assets
+    /// become discoverable here.
+    ///
+    /// Wrap it in a `completeness_checking` store whose `cas_store` is the one
+    /// the content lives in: an entry whose content has left the CAS is then
+    /// treated as a miss, and re-fetched if a fetcher is configured. Without
+    /// it, such entries are served as if the content were still there.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub fetch_store: StoreRefName,
+
+    /// The fetcher (from the `fetchers` list in the main config) used to
+    /// actively download content when a Fetch misses the metadata lookup.
+    ///
+    /// When unset, the server only performs metadata lookups of previously
+    /// pushed assets and never downloads anything.
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub fetcher: Option<FetcherRefName>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -313,6 +336,11 @@ pub struct FetchConfig {
 pub struct PushConfig {
     /// The store name referenced in the `stores` map in the main config.
     /// This store name referenced here may be reused multiple times.
+    ///
+    /// This must be an Action Cache store holding the `RemoteAsset` metadata in
+    /// the same format as `FetchConfig::fetch_store`, which see. It should
+    /// normally be the same store (or one backed by the same data), so that
+    /// pushed assets are found by Fetch.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub push_store: StoreRefName,
 
@@ -1811,6 +1839,7 @@ pub struct GlobalConfig {
 
 pub type StoreConfig = NamedConfig<StoreSpec>;
 pub type SchedulerConfig = NamedConfig<SchedulerSpec>;
+pub type FetcherConfig = NamedConfig<FetcherSpec>;
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -1827,6 +1856,12 @@ pub struct CasConfig {
     /// The keys can be used in other configs when needing to reference a
     /// scheduler.
     pub schedulers: Option<Vec<SchedulerConfig>>,
+
+    /// List of fetchers available to use in this config. The names can be
+    /// referenced from a `FetchConfig::fetcher` or from another fetcher that
+    /// wraps it. A fetcher must be defined before any fetcher (or service) that
+    /// references it.
+    pub fetchers: Option<Vec<FetcherConfig>>,
 
     /// Servers to setup for this process.
     pub servers: Vec<ServerConfig>,

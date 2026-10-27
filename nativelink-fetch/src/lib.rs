@@ -14,5 +14,7 @@
 
 pub mod background_fetcher;
 pub mod fetcher;
+pub mod fetcher_factory;
 pub mod metadata_cache;
 pub mod remote_asset_proto;
+pub mod url_fetcher;

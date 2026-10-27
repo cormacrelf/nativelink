@@ -3007,6 +3007,7 @@ dependencies = [
  "mimalloc",
  "nativelink-config",
  "nativelink-error",
+ "nativelink-fetch",
  "nativelink-proto",
  "nativelink-scheduler",
  "nativelink-service",
@@ -3071,6 +3072,7 @@ name = "nativelink-fetch"
 version = "1.8.0"
 dependencies = [
  "bytes",
+ "futures",
  "nativelink-config",
  "nativelink-error",
  "nativelink-macro",
@@ -3081,6 +3083,8 @@ dependencies = [
  "prost",
  "prost-types",
  "reqwest",
+ "rustls",
+ "tempfile",
  "tokio",
  "tonic",
  "tracing",

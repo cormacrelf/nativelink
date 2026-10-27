@@ -13,38 +13,170 @@
 // limitations under the License.
 
 use core::convert::Into;
+use core::time::Duration;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use nativelink_config::cas_server::{FetchConfig, WithInstanceName};
-use nativelink_error::{Error, ResultExt, make_err, make_input_err};
+use nativelink_error::{Error, ResultExt, make_input_err};
+use nativelink_fetch::fetcher::{FetchBlobTask, FetchHeaders, Fetcher};
 use nativelink_fetch::remote_asset_proto::{
-    AssetKind, RemoteAssetEntry, RemoteAssetQuery, now_timestamp, qualifier_names,
-    read_remote_asset_entry, redacted_uris, timestamp_is_before,
+    AssetKind, QUALIFIER_BAZEL_CANONICAL_ID, QUALIFIER_HTTP_HEADER_PREFIX,
+    QUALIFIER_HTTP_HEADER_URL_PREFIX, RemoteAssetEntry, RemoteAssetQuery, is_http_header_qualifier,
+    now_timestamp, qualifier_names, read_remote_asset_entry, redacted_uris, timestamp_is_before,
 };
 use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::{
     Fetch, FetchServer as Server,
 };
 use nativelink_proto::build::bazel::remote::asset::v1::{
-    FetchBlobRequest, FetchBlobResponse, FetchDirectoryRequest, FetchDirectoryResponse,
+    FetchBlobRequest, FetchBlobResponse, FetchDirectoryRequest, FetchDirectoryResponse, Qualifier,
 };
-use nativelink_proto::google::rpc::Status as GoogleStatus;
+use nativelink_proto::build::bazel::remote::execution::v2::Digest;
+use nativelink_proto::google::rpc::bad_request::FieldViolation;
+use nativelink_proto::google::rpc::{BadRequest, ErrorInfo, Status as GoogleStatus};
 use nativelink_store::store_manager::StoreManager;
-use nativelink_util::digest_hasher::make_ctx_for_hash_func;
-use nativelink_util::redact::redact_uri;
+use nativelink_util::digest_hasher::{DigestHasherFunc, make_ctx_for_hash_func};
+use nativelink_util::redact::{redact_uri, redact_uris_in_text};
+use nativelink_util::sri::{ByteChecksum, QUALIFIER_CHECKSUM_SRI};
 use nativelink_util::store_trait::Store;
 use opentelemetry::context::FutureExt;
+use prost::Message;
 use prost_types::Timestamp;
 use tonic::{Code, Request, Response, Status};
 use tracing::{Instrument, Level, debug, error_span, info, instrument, warn};
 
+/// Qualifiers `FetchBlob` honours, besides HTTP header qualifiers. Others, such
+/// as `resource_type` and `vcs.*`, would change what must be fetched and we only
+/// download plain HTTP(S) content, so they are rejected rather than ignored.
+const BLOB_QUALIFIERS: &[&str] = &[QUALIFIER_CHECKSUM_SRI, QUALIFIER_BAZEL_CANONICAL_ID];
+
+/// The `checksum.sri` a request asks for, if any. It is parsed only once a
+/// fetch is needed, so that an asset pushed under a qualifier set with an
+/// unparsable SRI can still be found. A malformed value is an
+/// `InvalidArgument` error.
+fn sri_checksum(qualifiers: &[Qualifier]) -> Result<Option<ByteChecksum>, Error> {
+    find_qualifier(qualifiers, QUALIFIER_CHECKSUM_SRI)
+        .map(ByteChecksum::from_sri)
+        .transpose()
+}
+
+/// `ErrorInfo.domain` of every error detail this server attaches.
+const ERROR_DOMAIN: &str = "nativelink.com";
+
+/// `ErrorInfo.reason`: a miss on an instance with no fetcher configured.
+const REASON_NOT_CACHED_NO_FETCHER: &str = "NOT_CACHED_NO_FETCHER";
+/// `ErrorInfo.reason`: the fetcher ran and failed.
+const REASON_FETCH_FAILED: &str = "FETCH_FAILED";
+
+const ERROR_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.ErrorInfo";
+const BAD_REQUEST_TYPE_URL: &str = "type.googleapis.com/google.rpc.BadRequest";
+
+/// Wraps `message` into a `google.protobuf.Any` under `type_url`.
+fn pack_any<M: Message>(type_url: &str, message: &M) -> prost_types::Any {
+    prost_types::Any {
+        type_url: type_url.to_owned(),
+        value: message.encode_to_vec(),
+    }
+}
+
+/// An `ErrorInfo` detail telling clients why the request failed, so that e.g.
+/// "not cached" can be told apart from "fetch failed" without parsing messages.
+fn error_info(reason: &str) -> prost_types::Any {
+    pack_any(
+        ERROR_INFO_TYPE_URL,
+        &ErrorInfo {
+            reason: reason.to_owned(),
+            domain: ERROR_DOMAIN.to_owned(),
+            metadata: HashMap::new(),
+        },
+    )
+}
+
+/// A `NOT_FOUND` status for a miss that was not, and could not be, fetched.
+fn not_cached_status(reason: &str, message: &str) -> GoogleStatus {
+    GoogleStatus {
+        code: Code::NotFound.into(),
+        message: message.to_owned(),
+        details: vec![error_info(reason)],
+    }
+}
+
+/// Converts a failed fetch into a response status that keeps the fetch error's
+/// code and message and marks it as a fetch failure.
+fn fetch_failed_status(err: Error) -> GoogleStatus {
+    let mut status = GoogleStatus::from(err);
+    status.details.push(error_info(REASON_FETCH_FAILED));
+    status
+}
+
+/// Appends `context` to the message of `status`, keeping its details. Mirrors
+/// `err_tip` for statuses that cannot go through `Error`, which has no details.
+fn status_tip(status: &Status, context: &str) -> Status {
+    Status::with_details(
+        status.code(),
+        format!("{} : {context}", status.message()),
+        Bytes::copy_from_slice(status.details()),
+    )
+}
+
+/// The `InvalidArgument` status rejecting any qualifier that is neither in
+/// `supported` nor an HTTP header qualifier, if there is one. It is checked only
+/// before a download. The spec says servers "MUST ensure Fetch'd content
+/// matches all the specified qualifiers except in the case of previously
+/// Push'd resources, for which the server MAY trust the pushing client", so a
+/// qualifier we cannot honour must fail a fetch rather than be ignored, while
+/// a cached entry, only ever found under the exact qualifiers it was stored
+/// with, is served whatever they are. The spec recommends a `BadRequest`
+/// detail with one violation per unsupported qualifier.
+fn unsupported_qualifiers_status(qualifiers: &[Qualifier], supported: &[&str]) -> Option<Status> {
+    let unsupported: Vec<&str> = qualifiers
+        .iter()
+        .map(|qualifier| qualifier.name.as_str())
+        .filter(|name| !supported.contains(name) && !is_http_header_qualifier(name))
+        .collect();
+    if unsupported.is_empty() {
+        return None;
+    }
+    let message = format!(
+        "Unsupported qualifiers: {}. Supported qualifiers: {}, {QUALIFIER_HTTP_HEADER_PREFIX}<name>, {QUALIFIER_HTTP_HEADER_URL_PREFIX}<idx>:<name>",
+        unsupported.join(", "),
+        supported.join(", "),
+    );
+    let bad_request = BadRequest {
+        field_violations: unsupported
+            .iter()
+            .map(|name| FieldViolation {
+                field: "qualifiers.name".to_owned(),
+                description: format!("\"{name}\" not supported"),
+                ..Default::default()
+            })
+            .collect(),
+    };
+    let status = GoogleStatus {
+        code: Code::InvalidArgument.into(),
+        message: message.clone(),
+        details: vec![pack_any(BAD_REQUEST_TYPE_URL, &bad_request)],
+    };
+    Some(Status::with_details(
+        Code::InvalidArgument,
+        message,
+        Bytes::from(status.encode_to_vec()),
+    ))
+}
+
 /// Per-instance state: the Action Cache store holding the Remote Asset metadata
-/// (mapping URI+qualifiers -> digest) the server reads. Whether a hit's content
-/// is still in the CAS is the store's business: wrap it in a
-/// `completeness_checking` store to have such entries read as misses.
+/// (mapping URI+qualifiers -> digest) the server reads, and the `Fetcher` used
+/// to actively download content on a cache miss. `fetcher` is `None` when no
+/// fetcher is configured for the instance, in which case only metadata lookups
+/// are served. Whether a hit's content is still in the CAS is the store's
+/// business: wrap it in a `completeness_checking` store to have such entries
+/// read as misses.
 #[derive(Clone, Debug)]
 pub struct FetchStoreInfo {
     store: Store,
+    fetcher: Option<Arc<dyn Fetcher>>,
 }
 
 /// Whether a cached entry may be served at `now`. An entry past its
@@ -103,6 +235,37 @@ async fn lookup_entry(
     Some(entry)
 }
 
+/// Returns the value of the qualifier named `name`, if present.
+fn find_qualifier<'a>(qualifiers: &'a [Qualifier], name: &str) -> Option<&'a str> {
+    qualifiers
+        .iter()
+        .find(|qualifier| qualifier.name == name)
+        .map(|qualifier| qualifier.value.as_str())
+}
+
+/// Flattens proto qualifiers into the `(name, value)` pairs a fetch job carries,
+/// leaving out HTTP header qualifiers (those travel separately as
+/// `FetchHeaders` and must not be persisted or affect identity).
+fn qualifier_pairs(qualifiers: &[Qualifier]) -> Vec<(String, String)> {
+    qualifiers
+        .iter()
+        .filter(|qualifier| !is_http_header_qualifier(&qualifier.name))
+        .map(|qualifier| (qualifier.name.clone(), qualifier.value.clone()))
+        .collect()
+}
+
+/// Converts the request's `timeout` (a `google.protobuf.Duration`) into a
+/// `Duration`, treating unset/zero/negative values as "no explicit deadline".
+fn request_timeout(timeout: Option<&prost_types::Duration>) -> Option<Duration> {
+    let timeout = timeout?;
+    if timeout.seconds <= 0 && timeout.nanos <= 0 {
+        return None;
+    }
+    let seconds = u64::try_from(timeout.seconds).ok()?;
+    let nanos = u32::try_from(timeout.nanos).unwrap_or(0);
+    Some(Duration::new(seconds, nanos))
+}
+
 #[derive(Debug, Clone)]
 pub struct FetchServer {
     stores: HashMap<String, FetchStoreInfo>,
@@ -111,6 +274,7 @@ pub struct FetchServer {
 impl FetchServer {
     pub fn new(
         configs: &[WithInstanceName<FetchConfig>],
+        fetchers: &HashMap<String, Arc<dyn Fetcher>>,
         store_manager: &StoreManager,
     ) -> Result<Self, Error> {
         let mut stores = HashMap::with_capacity(configs.len());
@@ -120,11 +284,20 @@ impl FetchServer {
                 .ok_or_else(|| {
                     make_input_err!("'fetch_store': '{}' does not exist", config.fetch_store)
                 })?;
-            stores.insert(config.instance_name.clone(), FetchStoreInfo { store });
+            let fetcher: Option<Arc<dyn Fetcher>> = match &config.fetcher {
+                Some(fetcher_name) => {
+                    Some(fetchers.get(fetcher_name).cloned().ok_or_else(|| {
+                        make_input_err!("'fetcher': '{fetcher_name}' does not exist")
+                    })?)
+                }
+                None => None,
+            };
+            stores.insert(
+                config.instance_name.clone(),
+                FetchStoreInfo { store, fetcher },
+            );
         }
-        Ok(Self {
-            stores: stores.clone(),
-        })
+        Ok(Self { stores })
     }
 
     pub fn into_service(self) -> Server<Self> {
@@ -134,7 +307,7 @@ impl FetchServer {
     async fn inner_fetch_blob(
         &self,
         request: FetchBlobRequest,
-    ) -> Result<Response<FetchBlobResponse>, Error> {
+    ) -> Result<Response<FetchBlobResponse>, Status> {
         let instance_name = &request.instance_name;
         let store_info = self
             .stores
@@ -143,10 +316,9 @@ impl FetchServer {
         let start = Instant::now();
 
         if request.uris.is_empty() {
-            return Err(Error::new(
-                Code::InvalidArgument,
-                "No uris in fetch request".to_owned(),
-            ));
+            return Err(
+                Error::new(Code::InvalidArgument, "No uris in fetch request".to_owned()).into(),
+            );
         }
         let now = now_timestamp();
         for uri in &request.uris {
@@ -189,8 +361,86 @@ impl FetchServer {
             }
         }
 
+        // No previously pushed asset matched. If a fetcher is configured (i.e.
+        // a CAS store exists), actively download the content, verify it against
+        // the `checksum.sri` qualifier when present, cache it, and return its
+        // digest. A checksum is optional: when absent the content is still
+        // downloaded and stored under its computed CAS digest, just unverified.
+        if let Some(fetcher) = &store_info.fetcher {
+            // Only a download needs the qualifiers checked: the content must
+            // match all of them, so reject any we cannot honour, and malformed
+            // ones, before sending anything to the origin.
+            if let Some(status) =
+                unsupported_qualifiers_status(&request.qualifiers, BLOB_QUALIFIERS)
+            {
+                return Err(status);
+            }
+            let headers = FetchHeaders::from_qualifiers(&request.qualifiers, request.uris.len())?;
+            let hasher_func = DigestHasherFunc::try_from(request.digest_function)
+                .err_tip(|| "In FetchServer::inner_fetch_blob")?;
+            let checksums = sri_checksum(&request.qualifiers)?.into_iter().collect();
+            let job = FetchBlobTask {
+                uris: request.uris.clone(),
+                qualifiers: qualifier_pairs(&request.qualifiers),
+                checksums,
+                hasher_func,
+                header_timeout: request_timeout(request.timeout.as_ref()),
+                headers,
+            };
+            // The fetcher (via MetadataCache) caches the asset metadata itself;
+            // here we only shape the response.
+            info!("Asset is not cached, fetching it");
+            match fetcher.fetch_blob(&job).await {
+                Ok(outcome) => {
+                    let proto_digest: Digest = outcome.digest.into();
+                    info!(
+                        uri = %redact_uri(&outcome.uri),
+                        digest = %proto_digest.hash,
+                        size_bytes = proto_digest.size_bytes,
+                        source = "download",
+                        duration = ?start.elapsed(),
+                        "Fetched asset"
+                    );
+                    return Ok(Response::new(FetchBlobResponse {
+                        status: Some(GoogleStatus {
+                            code: Code::Ok.into(),
+                            message: "Fetch object found".to_owned(),
+                            details: vec![],
+                        }),
+                        uri: outcome.uri,
+                        qualifiers: request.qualifiers.clone(),
+                        expires_at: None,
+                        blob_digest: Some(proto_digest),
+                        digest_function: hasher_func.proto_digest_func().into(),
+                    }));
+                }
+                // Fetch failures (checksum mismatch, timeout, no URI served the
+                // content, ...) surface in the response status, not as a gRPC
+                // error, per the Remote Asset API.
+                Err(err) => {
+                    warn!(
+                        code = ?err.code,
+                        message = %redact_uris_in_text(&err.message_string()),
+                        duration = ?start.elapsed(),
+                        "Failed to fetch asset from any uri"
+                    );
+                    return Ok(Response::new(FetchBlobResponse {
+                        status: Some(fetch_failed_status(err)),
+                        uri: request.uris.first().cloned().unwrap_or_default(),
+                        qualifiers: request.qualifiers.clone(),
+                        expires_at: None,
+                        blob_digest: None,
+                        digest_function: hasher_func.proto_digest_func().into(),
+                    }));
+                }
+            }
+        }
+
         Ok(Response::new(FetchBlobResponse {
-            status: Some(make_err!(Code::NotFound, "No item found").into()),
+            status: Some(not_cached_status(
+                REASON_NOT_CACHED_NO_FETCHER,
+                "not cached, and this instance has no fetcher configured",
+            )),
             uri: request.uris.first().cloned().unwrap_or_default(),
             qualifiers: request.qualifiers,
             expires_at: None,
@@ -229,8 +479,7 @@ impl Fetch for FetchServer {
                 make_ctx_for_hash_func(digest_function).err_tip(|| "In FetchServer::fetch_blob")?,
             )
             .await
-            .err_tip(|| "Failed on fetch_blob() command")
-            .map_err(Into::into)
+            .map_err(|status| status_tip(&status, "Failed on fetch_blob() command"))
     }
 
     #[allow(clippy::blocks_in_conditions)]
