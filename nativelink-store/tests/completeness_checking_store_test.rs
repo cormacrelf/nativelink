@@ -253,6 +253,141 @@ async fn verify_completeness_get() -> Result<(), Error> {
     Ok(())
 }
 
+/// Like `setup`, but the output directory's `Directory` blobs are uploaded to
+/// the CAS, and the `ActionResult` names them through `tree_digest`,
+/// `root_directory_digest` or both. Returns the child `Directory`'s digest too.
+async fn setup_with_directories(
+    with_tree: bool,
+    with_root_directory: bool,
+) -> Result<
+    (
+        Arc<CompletenessCheckingStore>,
+        Arc<MemoryStore>,
+        DigestInfo,
+        DigestInfo,
+    ),
+    Error,
+> {
+    let backend_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let cas_store = MemoryStore::new(&MemorySpec::default());
+    let ac_store =
+        CompletenessCheckingStore::new(backend_store.clone(), Store::new(cas_store.clone()));
+    let hasher = || DigestHasherFunc::Blake3.hasher();
+
+    cas_store.update_oneshot(ROOT_FILE, "".into()).await?;
+    cas_store.update_oneshot(CHILD_FILE, "".into()).await?;
+
+    let child = Directory {
+        files: vec![FileNode {
+            digest: Some(CHILD_FILE.into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let child_digest =
+        serialize_and_upload_message(&child, cas_store.as_pin(), &mut hasher()).await?;
+    let root = Directory {
+        files: vec![FileNode {
+            digest: Some(ROOT_FILE.into()),
+            ..Default::default()
+        }],
+        directories: vec![DirectoryNode {
+            digest: Some(child_digest.into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let root_digest =
+        serialize_and_upload_message(&root, cas_store.as_pin(), &mut hasher()).await?;
+
+    let mut output_directory = OutputDirectory::default();
+    if with_tree {
+        let tree = Tree {
+            root: Some(root),
+            children: vec![child],
+        };
+        let tree_digest =
+            serialize_and_upload_message(&tree, cas_store.as_pin(), &mut hasher()).await?;
+        output_directory.tree_digest = Some(tree_digest.into());
+    }
+    if with_root_directory {
+        output_directory.root_directory_digest = Some(root_digest.into());
+    }
+    let action_result = ProtoActionResult {
+        output_directories: vec![output_directory],
+        ..Default::default()
+    };
+    let action_result_digest =
+        serialize_and_upload_message(&action_result, ac_store.as_pin(), &mut hasher()).await?;
+
+    Ok((ac_store, cas_store, action_result_digest, child_digest))
+}
+
+async fn is_complete(
+    ac_store: &Arc<CompletenessCheckingStore>,
+    action_result_digest: DigestInfo,
+) -> bool {
+    ac_store
+        .has_many(&[action_result_digest.into()])
+        .await
+        .unwrap()[0]
+        .is_some()
+}
+
+#[nativelink_test]
+async fn tree_only_output_directory_ignores_directory_blobs() -> Result<(), Error> {
+    let (ac_store, cas_store, action_result_digest, child_digest) =
+        setup_with_directories(true, false).await?;
+    assert!(is_complete(&ac_store, action_result_digest).await);
+
+    // Nothing promised the `Directory` blobs, so their absence is fine.
+    cas_store.remove_entry(child_digest.into()).await;
+    assert!(is_complete(&ac_store, action_result_digest).await);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn tree_and_directory_output_directory_checks_directory_blobs() -> Result<(), Error> {
+    let (ac_store, cas_store, action_result_digest, child_digest) =
+        setup_with_directories(true, true).await?;
+    assert!(is_complete(&ac_store, action_result_digest).await);
+
+    cas_store.remove_entry(child_digest.into()).await;
+    assert!(
+        !is_complete(&ac_store, action_result_digest).await,
+        "A missing child Directory should make the entry incomplete"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn directory_only_output_directory_is_walked() -> Result<(), Error> {
+    {
+        let (ac_store, _cas_store, action_result_digest, _child_digest) =
+            setup_with_directories(false, true).await?;
+        assert!(is_complete(&ac_store, action_result_digest).await);
+    }
+    {
+        let (ac_store, cas_store, action_result_digest, child_digest) =
+            setup_with_directories(false, true).await?;
+        cas_store.remove_entry(child_digest.into()).await;
+        assert!(
+            !is_complete(&ac_store, action_result_digest).await,
+            "A missing child Directory should make the entry incomplete"
+        );
+    }
+    {
+        let (ac_store, cas_store, action_result_digest, _child_digest) =
+            setup_with_directories(false, true).await?;
+        cas_store.remove_entry(CHILD_FILE.into()).await;
+        assert!(
+            !is_complete(&ac_store, action_result_digest).await,
+            "A missing file in a child Directory should make the entry incomplete"
+        );
+    }
+    Ok(())
+}
+
 /// A store driver whose reads always fail with a configurable, non-`NotFound`
 /// backend error. Used to prove that a genuine backend read failure on the
 /// action-result record is surfaced with its real code rather than laundered
