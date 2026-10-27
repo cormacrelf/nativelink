@@ -185,10 +185,11 @@ pub struct UrlFetcherSpec {
     pub no_proxy: Vec<String>,
 
     /// Refuse to download content that the request gives no checksum for: a
-    /// blob request needs a `checksum.sri` qualifier, and a directory request
-    /// that or a tree hash such as `checksum.h1`. A request without one fails
-    /// with `INVALID_ARGUMENT` before any origin is contacted. Use it so that
-    /// nothing unverified is ever fetched into the CAS.
+    /// blob request needs a `checksum.sri` or a hex `checksum.sha*` qualifier,
+    /// and a directory request one of those or a tree hash such as
+    /// `checksum.h1`. A request without one fails with `INVALID_ARGUMENT`
+    /// before any origin is contacted. Use it so that nothing unverified is
+    /// ever fetched into the CAS.
     ///
     /// The check is part of fetching, so it applies only when content would be
     /// downloaded. A request that finds an asset already pushed with

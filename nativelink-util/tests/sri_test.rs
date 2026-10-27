@@ -14,8 +14,12 @@
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-use nativelink_error::Code;
-use nativelink_util::sri::verify_sri_hash;
+use nativelink_error::{Code, Error};
+use nativelink_util::sri::{
+    ByteChecksum, ChecksumVerifier, QUALIFIER_CHECKSUM_SHA1, QUALIFIER_CHECKSUM_SHA256,
+    QUALIFIER_CHECKSUM_SHA384, QUALIFIER_CHECKSUM_SHA512, QUALIFIER_CHECKSUM_SRI,
+    verify_byte_checksums, verify_sri_hash,
+};
 use sha2::{Digest, Sha384, Sha512};
 
 #[test]
@@ -65,6 +69,157 @@ fn invalid_base64_is_invalid_argument() {
     let err = verify_sri_hash(b"data", "sha256-not valid base64!!!")
         .expect_err("invalid base64 should error");
     assert_eq!(err.code, Code::InvalidArgument);
+}
+
+// Known vectors, each from `printf 'hello world' | <algo>sum`.
+const HELLO_WORLD: &[u8] = b"hello world";
+const SHA1: &str = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
+const SHA256: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+const SHA384: &str = "fdbd8e75a67f29f701a4e040385e2e23986303ea10239211af907fcbb83578b3e417cb71ce646efd0819dd8c088de1bd";
+const SHA512: &str = "309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f";
+
+const HEX_VECTORS: [(&str, &str); 4] = [
+    (QUALIFIER_CHECKSUM_SHA1, SHA1),
+    (QUALIFIER_CHECKSUM_SHA256, SHA256),
+    (QUALIFIER_CHECKSUM_SHA384, SHA384),
+    (QUALIFIER_CHECKSUM_SHA512, SHA512),
+];
+
+fn verify_qualifier(data: &[u8], qualifier: &str, value: &str) -> Result<(), Error> {
+    verify_byte_checksums(data, &[ByteChecksum::from_qualifier(qualifier, value)?])
+}
+
+#[test]
+fn hex_checksums_verify_each_algorithm() {
+    for (qualifier, digest) in HEX_VECTORS {
+        verify_qualifier(HELLO_WORLD, qualifier, digest).expect(qualifier);
+    }
+}
+
+#[test]
+fn hex_checksums_accept_either_case() {
+    for (qualifier, digest) in HEX_VECTORS {
+        verify_qualifier(HELLO_WORLD, qualifier, &digest.to_uppercase()).expect(qualifier);
+        // Mixed case.
+        let (head, tail) = digest.split_at(digest.len() / 2);
+        let mixed = format!("{}{tail}", head.to_uppercase());
+        verify_qualifier(HELLO_WORLD, qualifier, &mixed).expect(qualifier);
+    }
+}
+
+#[test]
+fn hex_checksums_accept_a_matching_algorithm_prefix() {
+    for (qualifier, digest) in HEX_VECTORS {
+        let algorithm = qualifier.strip_prefix("checksum.").unwrap();
+        verify_qualifier(HELLO_WORLD, qualifier, &format!("{algorithm}:{digest}"))
+            .expect(qualifier);
+        verify_qualifier(
+            HELLO_WORLD,
+            qualifier,
+            &format!("{}:{digest}", algorithm.to_uppercase()),
+        )
+        .expect(qualifier);
+    }
+}
+
+#[test]
+fn hex_checksum_mismatch_is_aborted() {
+    for (qualifier, digest) in HEX_VECTORS {
+        let err = verify_qualifier(b"not hello world", qualifier, digest)
+            .expect_err("mismatch should error");
+        assert_eq!(err.code, Code::Aborted, "{qualifier}");
+    }
+}
+
+#[test]
+fn hex_checksum_of_the_wrong_length_is_invalid_argument() {
+    for (qualifier, digest) in HEX_VECTORS {
+        for value in [
+            &digest[..digest.len() - 1],
+            &format!("{digest}0"),
+            "",
+            "sha1:",
+        ] {
+            let err = ByteChecksum::from_qualifier(qualifier, value)
+                .expect_err("wrong length should error");
+            assert_eq!(err.code, Code::InvalidArgument, "{qualifier}={value}");
+        }
+    }
+    // A digest of one algorithm is the wrong length for another.
+    let err = ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SHA256, SHA1)
+        .expect_err("a SHA-1 is not a SHA-256");
+    assert_eq!(err.code, Code::InvalidArgument);
+}
+
+#[test]
+fn hex_checksum_with_non_hex_characters_is_invalid_argument() {
+    for (qualifier, digest) in HEX_VECTORS {
+        for bad in ['g', ' ', '-', '+', '='] {
+            let value = format!("{}{bad}", &digest[..digest.len() - 1]);
+            let err =
+                ByteChecksum::from_qualifier(qualifier, &value).expect_err("non-hex should error");
+            assert_eq!(err.code, Code::InvalidArgument, "{qualifier}={value}");
+        }
+    }
+}
+
+#[test]
+fn hex_checksum_with_a_different_algorithm_prefix_is_invalid_argument() {
+    for (qualifier, digest) in HEX_VECTORS {
+        for other in ["sha1", "sha256", "sha384", "sha512", "md5"] {
+            if qualifier.ends_with(other) {
+                continue;
+            }
+            let err = ByteChecksum::from_qualifier(qualifier, &format!("{other}:{digest}"))
+                .expect_err("mismatched prefix should error");
+            assert_eq!(err.code, Code::InvalidArgument, "{qualifier} with {other}:");
+        }
+    }
+}
+
+#[test]
+fn unknown_qualifier_is_invalid_argument() {
+    let err = ByteChecksum::from_qualifier("checksum.md5", "d41d8cd98f00b204e9800998ecf8427e")
+        .expect_err("unknown qualifier should error");
+    assert_eq!(err.code, Code::InvalidArgument);
+}
+
+#[test]
+fn sri_and_hex_spellings_of_one_digest_are_the_same_checksum() {
+    let sri = ByteChecksum::from_qualifier(
+        QUALIFIER_CHECKSUM_SRI,
+        "sha256-uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=",
+    )
+    .unwrap();
+    let hex = ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SHA256, SHA256).unwrap();
+    assert_eq!(sri, hex);
+}
+
+#[test]
+fn every_checksum_must_match() {
+    let sha1 = ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SHA1, SHA1).unwrap();
+    let sha256 = ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SHA256, SHA256).unwrap();
+    verify_byte_checksums(HELLO_WORLD, &[sha1.clone(), sha256.clone()]).expect("both match");
+    let err = verify_byte_checksums(b"other", &[sha1, sha256]).expect_err("neither matches");
+    assert_eq!(err.code, Code::Aborted);
+}
+
+#[test]
+fn verifier_is_reusable_after_reset() {
+    let checksum = ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SHA1, SHA1).unwrap();
+    let mut verifier = ChecksumVerifier::new(&checksum);
+    verifier.update(b"partial garbage");
+    verifier.reset();
+    verifier.update(b"hello ");
+    verifier.update(b"world");
+    verifier
+        .finalize_and_verify()
+        .expect("verifies after reset");
+    // Finalizing also resets, so a failed attempt can follow.
+    verifier.update(b"other");
+    verifier
+        .finalize_and_verify()
+        .expect_err("different bytes mismatch");
 }
 
 fn sri_of<D: Digest>(algorithm: &str, data: &[u8]) -> String {

@@ -3127,6 +3127,253 @@ async fn test_fetch_directory_unsupported_qualifier_without_fetcher_is_not_cache
     Ok(())
 }
 
+// Known vectors for the hex checksum qualifiers, from
+// `printf 'hello world' | sha1sum` (and `sha384sum`, `sha512sum`).
+const HELLO_WORLD_SHA1_HEX: &str = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed";
+const HELLO_WORLD_SHA384_HEX: &str = "fdbd8e75a67f29f701a4e040385e2e23986303ea10239211af907fcbb83578b3e417cb71ce646efd0819dd8c088de1bd";
+const HELLO_WORLD_SHA512_HEX: &str = "309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f";
+
+/// The `sha256` of `data` as lowercase hex.
+fn sha256_hex_of(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(data))
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_with_each_hex_checksum() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let upper_sha1 = HELLO_WORLD_SHA1_HEX.to_uppercase();
+    let prefixed_sha256 = format!("sha256:{HELLO_WORLD_SHA256_HEX}");
+    let cases: [(&str, &str); 5] = [
+        ("checksum.sha1", HELLO_WORLD_SHA1_HEX),
+        ("checksum.sha1", &upper_sha1),
+        ("checksum.sha256", &prefixed_sha256),
+        ("checksum.sha384", HELLO_WORLD_SHA384_HEX),
+        ("checksum.sha512", HELLO_WORLD_SHA512_HEX),
+    ];
+    for (name, value) in cases {
+        let uri = serve_once(HELLO_WORLD.to_vec()).await;
+        let response = fs
+            .fetch_blob(blob_request(
+                vec![uri.clone()],
+                vec![header_qualifier(name, value)],
+            ))
+            .await?
+            .into_inner();
+        assert_eq!(response.status.as_ref().map(|s| s.code), Some(0), "{name}");
+        assert_eq!(response.uri, uri, "{name}");
+        assert_eq!(
+            response.blob_digest.expect("blob digest").hash,
+            HELLO_WORLD_SHA256_HEX,
+            "{name}"
+        );
+    }
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_sha1_mismatch_falls_through_to_next_uri() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let bad_uri = serve_once(b"corrupted".to_vec()).await;
+    let good_uri = serve_once(HELLO_WORLD.to_vec()).await;
+
+    let response = fs
+        .fetch_blob(blob_request(
+            vec![bad_uri, good_uri.clone()],
+            vec![header_qualifier("checksum.sha1", HELLO_WORLD_SHA1_HEX)],
+        ))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(response.uri, good_uri);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_hex_checksum_mismatch_is_aborted() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let uri = serve_once(b"corrupted".to_vec()).await;
+
+    let response = fs
+        .fetch_blob(blob_request(
+            vec![uri],
+            vec![header_qualifier("checksum.sha256", HELLO_WORLD_SHA256_HEX)],
+        ))
+        .await?
+        .into_inner();
+
+    assert_error_info(response.status.as_ref(), Code::Aborted, "FETCH_FAILED");
+    assert!(response.blob_digest.is_none());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_every_checksum_must_match() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let wrong_sha1 = "0".repeat(40);
+    let empty_sri = "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+
+    // The SRI matches but the SHA-1 does not.
+    let uri = serve_once(HELLO_WORLD.to_vec()).await;
+    let response = fs
+        .fetch_blob(blob_request(
+            vec![uri],
+            vec![
+                header_qualifier("checksum.sri", HELLO_WORLD_SRI),
+                header_qualifier("checksum.sha1", &wrong_sha1),
+            ],
+        ))
+        .await?
+        .into_inner();
+    assert_error_info(response.status.as_ref(), Code::Aborted, "FETCH_FAILED");
+
+    // The SHA-1 matches but the SRI (of the empty string) does not.
+    let uri = serve_once(HELLO_WORLD.to_vec()).await;
+    let response = fs
+        .fetch_blob(blob_request(
+            vec![uri],
+            vec![
+                header_qualifier("checksum.sri", empty_sri),
+                header_qualifier("checksum.sha1", HELLO_WORLD_SHA1_HEX),
+            ],
+        ))
+        .await?
+        .into_inner();
+    assert_error_info(response.status.as_ref(), Code::Aborted, "FETCH_FAILED");
+
+    // All of them match.
+    let uri = serve_once(HELLO_WORLD.to_vec()).await;
+    let response = fs
+        .fetch_blob(blob_request(
+            vec![uri],
+            vec![
+                header_qualifier("checksum.sri", HELLO_WORLD_SRI),
+                header_qualifier("checksum.sha1", HELLO_WORLD_SHA1_HEX),
+                header_qualifier("checksum.sha512", HELLO_WORLD_SHA512_HEX),
+            ],
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_malformed_hex_checksum_is_invalid_argument() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let too_short = &HELLO_WORLD_SHA1_HEX[..39];
+    let non_hex = format!("{}g", &HELLO_WORLD_SHA1_HEX[..39]);
+    let sha256_prefix_on_sha1 = format!("sha256:{HELLO_WORLD_SHA1_HEX}");
+    let sha1_prefix_on_sha256 = format!("sha1:{HELLO_WORLD_SHA256_HEX}");
+    let cases: [(&str, &str); 6] = [
+        ("checksum.sha1", too_short),
+        ("checksum.sha1", &non_hex),
+        ("checksum.sha1", &sha256_prefix_on_sha1),
+        ("checksum.sha256", &sha1_prefix_on_sha256),
+        ("checksum.sha256", HELLO_WORLD_SHA1_HEX),
+        ("checksum.sha512", ""),
+    ];
+    for (name, value) in cases {
+        let err = fs
+            .fetch_blob(blob_request(
+                vec!["http://example.invalid/blob".to_owned()],
+                vec![header_qualifier(name, value)],
+            ))
+            .await
+            .expect_err(value);
+        assert_eq!(err.code(), Code::InvalidArgument, "{name}={value}");
+        assert!(err.message().contains(name), "{}", err.message());
+    }
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_with_sha256_of_archive() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let archive = build_zip(&[("a.txt", b"alpha"), ("dir/b.txt", b"beta")]);
+    let checksum = header_qualifier("checksum.sha256", &sha256_hex_of(&archive));
+    let uri = serve_once(archive).await;
+
+    let response = fs
+        .fetch_directory(directory_request_with(vec![uri.clone()], vec![checksum]))
+        .await?
+        .into_inner();
+    assert_eq!(response.uri, uri);
+    let root = read_root(&store_manager, &response).await;
+    assert_eq!(root.files[0].name, "a.txt");
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_sha256_mismatch_falls_through_to_next_uri() -> Result<(), Status> {
+    directory_checksum_mismatch_falls_through(|archive| {
+        header_qualifier("checksum.sha256", &sha256_hex_of(archive))
+    })
+    .await
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_hex_and_sri_must_all_match() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let archive = build_zip(&[("a.txt", b"alpha")]);
+    let sri = header_qualifier("checksum.sri", &sri_of(&archive));
+
+    // The SRI matches but the SHA-256 does not.
+    let uri = serve_once(archive.clone()).await;
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec![uri],
+            vec![
+                sri.clone(),
+                header_qualifier("checksum.sha256", HELLO_WORLD_SHA256_HEX),
+            ],
+        ))
+        .await?
+        .into_inner();
+    assert_error_info(response.status.as_ref(), Code::Aborted, "FETCH_FAILED");
+
+    // Both match.
+    let uri = serve_once(archive.clone()).await;
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec![uri],
+            vec![
+                sri,
+                header_qualifier("checksum.sha256", &sha256_hex_of(&archive)),
+            ],
+        ))
+        .await?
+        .into_inner();
+    read_root(&store_manager, &response).await;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_malformed_hex_checksum_is_invalid_argument() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let sha1_prefix = format!("sha1:{HELLO_WORLD_SHA256_HEX}");
+    for value in ["abc", "zz", &sha1_prefix] {
+        let err = fs
+            .fetch_directory(directory_request_with(
+                vec!["http://example.invalid/dir".to_owned()],
+                vec![header_qualifier("checksum.sha256", value)],
+            ))
+            .await
+            .expect_err(value);
+        assert_eq!(err.code(), Code::InvalidArgument, "{value}");
+    }
+    Ok(())
+}
+
 /// The status code a response carries.
 fn status_code_of(status: Option<&GoogleStatus>) -> Option<i32> {
     Some(status?.code)

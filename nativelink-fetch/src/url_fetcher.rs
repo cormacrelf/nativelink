@@ -547,7 +547,8 @@ impl UrlFetcher {
         if self.require_checksum && job.checksums.is_empty() {
             return Err(make_input_err!(
                 "This server only fetches content the request gives a checksum for, and the \
-                 request has none: set the checksum.sri qualifier"
+                 request has none: set the checksum.sri qualifier or a hex checksum.sha* \
+                 qualifier"
             ));
         }
         Ok(())
@@ -559,8 +560,8 @@ impl UrlFetcher {
         if self.require_checksum && job.checksums.is_empty() {
             return Err(make_input_err!(
                 "This server only fetches content the request gives a checksum for, and the \
-                 request has none: set the checksum.sri qualifier or a tree hash such as \
-                 checksum.h1"
+                 request has none: set the checksum.sri qualifier, a hex checksum.sha* \
+                 qualifier or a tree hash such as checksum.h1"
             ));
         }
         Ok(())
