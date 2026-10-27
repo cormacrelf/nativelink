@@ -19,4 +19,5 @@ pub mod fetcher_factory;
 pub mod metadata_cache;
 pub mod remote_asset_proto;
 mod spill;
+pub mod tree_hash;
 pub mod url_fetcher;

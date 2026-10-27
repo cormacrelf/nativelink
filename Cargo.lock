@@ -3118,6 +3118,7 @@ version = "1.8.0"
 dependencies = [
  "astral-tokio-tar",
  "async-compression",
+ "base64 0.22.1",
  "bytes",
  "crc32fast",
  "flate2",
@@ -3134,6 +3135,7 @@ dependencies = [
  "prost-types",
  "reqwest",
  "rustls",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
  "tokio",

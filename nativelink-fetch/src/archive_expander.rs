@@ -24,10 +24,10 @@
 //! reached are the `Directory` protos built, so memory use is proportional to
 //! the number of entries, not their size.
 //!
-//! Callers that check a hash of the expanded contents pass an
-//! [`ExpandHook`], which sees every entry in archive order and every file's
-//! content as it streams past, and get back a [`Listing`] of the finished
-//! tree. The hook can keep a file's bytes after
+//! Callers that check a hash of the expanded contents (see
+//! [`crate::tree_hash`]) pass an [`ExpandHook`], which sees every entry in
+//! archive order and every file's content as it streams past, and get back a
+//! [`Listing`] of the finished tree. The hook can keep a file's bytes after
 //! upload through its [`Held`] handle, so nothing ever needs to be read back
 //! from the CAS.
 //!

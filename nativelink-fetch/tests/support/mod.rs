@@ -21,6 +21,15 @@ use std::path::Path;
 
 use flate2::Compression;
 use flate2::write::{DeflateEncoder, GzEncoder};
+use nativelink_config::stores::MemorySpec;
+use nativelink_error::Error;
+use nativelink_fetch::archive_expander::{ArchiveOptions, extract_archive};
+use nativelink_fetch::tree_hash::{
+    Computed, TreeChecksum, TreeHashContext, TreeHashFailure, TreeHashFormat, TreeHashSet,
+};
+use nativelink_store::memory_store::MemoryStore;
+use nativelink_util::digest_hasher::DigestHasherFunc;
+use nativelink_util::store_trait::{Store, StoreLike};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -200,10 +209,147 @@ pub fn zip_with_data_descriptors(entries: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
+/// How [`hash_archive`] runs.
+#[derive(Clone, Copy, Debug)]
+pub struct Run {
+    pub hasher_func: DigestHasherFunc,
+    pub inline_threshold: Option<u64>,
+}
+
+impl Default for Run {
+    fn default() -> Self {
+        Self {
+            hasher_func: DigestHasherFunc::Sha256,
+            inline_threshold: None,
+        }
+    }
+}
+
+/// Expands `archive` once, computing every checksum in `checksums` in the
+/// same pass, and returns what each format computed. Checks that no temp
+/// file outlives the run.
+pub async fn compute_with(
+    archive: &[u8],
+    checksums: &[(&'static dyn TreeHashFormat, &str)],
+    run: Run,
+) -> Result<Vec<Computed>, Error> {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let parsed: Vec<TreeChecksum> = checksums
+        .iter()
+        .map(|(format, value)| TreeChecksum::parse(*format, value))
+        .collect::<Result<_, _>>()?;
+    let store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let result = expand(archive, &store, temp_dir.path(), &parsed, run).await;
+    assert_temp_dir_is_empty(temp_dir.path());
+    result
+}
+
+async fn expand(
+    archive: &[u8],
+    store: &Store,
+    temp_dir: &Path,
+    checksums: &[TreeChecksum],
+    run: Run,
+) -> Result<Vec<Computed>, Error> {
+    let mut options = ArchiveOptions::new(run.hasher_func);
+    options.temp_dir = Some(temp_dir.to_path_buf());
+    if let Some(threshold) = run.inline_threshold {
+        options.inline_threshold = threshold;
+    }
+    let context = TreeHashContext {
+        hasher_func: run.hasher_func,
+        temp_dir: Some(temp_dir.to_path_buf()),
+    };
+    let mut set = TreeHashSet::new(checksums, &context);
+    let mut reader = archive;
+    let tree = extract_archive(&mut reader, store.as_pin(), &options, &mut set).await?;
+    let computed = set.compute(&tree.listing).await?;
+    Ok(computed.into_iter().map(|(_, computed)| computed).collect())
+}
+
+pub async fn compute(
+    archive: &[u8],
+    format: &'static dyn TreeHashFormat,
+    expected: &str,
+) -> Result<Computed, Error> {
+    let mut computed = compute_with(archive, &[(format, expected)], Run::default()).await?;
+    Ok(computed.remove(0))
+}
+
+/// The values `format` computes for `archive`, which must be some.
+pub async fn values(archive: &[u8], format: &'static dyn TreeHashFormat, any: &str) -> Vec<String> {
+    match compute(archive, format, any).await.unwrap() {
+        Computed::Values(values) => values,
+        other => panic!("expected values, got {other:?}"),
+    }
+}
+
+/// Expands `archive` once and checks it against all of `checksums`.
+pub async fn verify_with(
+    archive: &[u8],
+    checksums: &[(&'static dyn TreeHashFormat, &str)],
+    run: Run,
+) -> Result<(), TreeHashFailure> {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let parsed: Vec<TreeChecksum> = checksums
+        .iter()
+        .map(|(format, value)| TreeChecksum::parse(*format, value))
+        .collect::<Result<_, _>>()
+        .map_err(TreeHashFailure::Failed)?;
+    let store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let mut options = ArchiveOptions::new(run.hasher_func);
+    options.temp_dir = Some(temp_dir.path().to_path_buf());
+    if let Some(threshold) = run.inline_threshold {
+        options.inline_threshold = threshold;
+    }
+    let context = TreeHashContext {
+        hasher_func: run.hasher_func,
+        temp_dir: Some(temp_dir.path().to_path_buf()),
+    };
+    let mut set = TreeHashSet::new(&parsed, &context);
+    let mut reader = archive;
+    let tree = extract_archive(&mut reader, store.as_pin(), &options, &mut set)
+        .await
+        .map_err(TreeHashFailure::Failed)?;
+    let result = set.finish(&tree.listing).await;
+    assert_temp_dir_is_empty(temp_dir.path());
+    result
+}
+
+pub async fn verify(
+    archive: &[u8],
+    format: &'static dyn TreeHashFormat,
+    expected: &str,
+) -> Result<(), TreeHashFailure> {
+    verify_with(archive, &[(format, expected)], Run::default()).await
+}
+
 pub fn assert_temp_dir_is_empty(dir: &Path) {
     let left: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect();
     assert!(left.is_empty(), "temp files left behind: {left:?}");
+}
+
+/// Asserts that `result` is a mismatch, and returns its message.
+pub fn expect_mismatch(result: Result<(), TreeHashFailure>) -> String {
+    match result {
+        Err(TreeHashFailure::Mismatch(err)) => {
+            assert_eq!(err.code, nativelink_error::Code::Aborted);
+            err.message_string()
+        }
+        other => panic!("expected a mismatch, got {other:?}"),
+    }
+}
+
+/// Asserts that `result` is unverifiable, and returns its message.
+pub fn expect_unverifiable(result: Result<(), TreeHashFailure>) -> String {
+    match result {
+        Err(TreeHashFailure::Unverifiable(err)) => {
+            assert_eq!(err.code, nativelink_error::Code::FailedPrecondition);
+            err.message_string()
+        }
+        other => panic!("expected unverifiable, got {other:?}"),
+    }
 }
