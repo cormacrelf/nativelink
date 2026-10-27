@@ -13,7 +13,14 @@ nativelink-proto = { path = "../nativelink-proto" }
 nativelink-store = { path = "../nativelink-store" }
 nativelink-util = { path = "../nativelink-util" }
 
+astral-tokio-tar = { version = "0.7.0", default-features = false }
+async-compression = { version = "0.4.51", default-features = false, features = [
+  "deflate",
+  "gzip",
+  "tokio",
+] }
 bytes = { version = "1.10.1", default-features = false }
+crc32fast = { version = "1.4.2", default-features = false, features = ["std"] }
 futures = { version = "0.3.31", default-features = false }
 parking_lot = { version = "0.12.3", default-features = false }
 prost = { version = "0.14.4", default-features = false }
@@ -33,6 +40,7 @@ tokio = { version = "1.52.2", features = [
   "sync",
   "time",
 ], default-features = false }
+tokio-util = { version = "0.7.14", default-features = false, features = ["io"] }
 tonic = { version = "0.14.0", features = [
   "gzip",
   "router",
@@ -40,10 +48,18 @@ tonic = { version = "0.14.0", features = [
   "transport",
 ], default-features = false }
 tracing = { version = "0.1.41", default-features = false }
+zip = { version = "9.0.0", default-features = false, features = [
+  "deflate-flate2-zlib-rs",
+] }
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
 
+flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
+pretty_assertions = { version = "1.4.1", features = [
+  "std",
+], default-features = false }
+tar = { version = "0.4.44", default-features = false }
 tokio = { version = "1.52.2", features = [
   "net",
   "test-util",

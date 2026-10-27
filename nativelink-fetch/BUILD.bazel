@@ -10,12 +10,14 @@ load(
 rust_library(
     name = "nativelink-fetch",
     srcs = [
+        "src/archive_expander.rs",
         "src/background_fetcher.rs",
         "src/fetcher.rs",
         "src/fetcher_factory.rs",
         "src/lib.rs",
         "src/metadata_cache.rs",
         "src/remote_asset_proto.rs",
+        "src/spill.rs",
         "src/url_fetcher.rs",
     ],
     visibility = ["//visibility:public"],
@@ -25,7 +27,10 @@ rust_library(
         "//nativelink-proto",
         "//nativelink-store",
         "//nativelink-util",
+        "@crates//:astral-tokio-tar",
+        "@crates//:async-compression",
         "@crates//:bytes",
+        "@crates//:crc32fast",
         "@crates//:futures",
         "@crates//:parking_lot",
         "@crates//:prost",
@@ -36,6 +41,7 @@ rust_library(
         "@crates//:tokio",
         "@crates//:tonic",
         "@crates//:tracing",
+        "@crates//:zip",
     ],
 )
 
@@ -43,6 +49,7 @@ rust_test_suite(
     name = "integration",
     timeout = "short",
     srcs = [
+        "tests/archive_expander_test.rs",
         "tests/background_fetcher_test.rs",
         "tests/metadata_cache_test.rs",
         "tests/url_fetcher_test.rs",
@@ -50,6 +57,7 @@ rust_test_suite(
     proc_macro_deps = [
         "//nativelink-macro",
     ],
+    shared_srcs = ["tests/support/mod.rs"],
     deps = [
         "//nativelink-config",
         "//nativelink-error",
@@ -57,12 +65,21 @@ rust_test_suite(
         "//nativelink-proto",
         "//nativelink-store",
         "//nativelink-util",
+        "@crates//:bytes",
+        "@crates//:crc32fast",
+        "@crates//:flate2",
+        "@crates//:futures",
         "@crates//:parking_lot",
+        "@crates//:pretty_assertions",
         "@crates//:prost",
+        "@crates//:tar",
+        "@crates//:tempfile",
         "@crates//:tokio",
+        "@crates//:tokio-util",
         "@crates//:tonic",
         "@crates//:tracing",
         "@crates//:tracing-test",
+        "@crates//:zip",
     ],
 )
 

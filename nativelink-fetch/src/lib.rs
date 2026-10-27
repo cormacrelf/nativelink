@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod archive_expander;
 pub mod background_fetcher;
 pub mod fetcher;
 pub mod fetcher_factory;
 pub mod metadata_cache;
 pub mod remote_asset_proto;
+mod spill;
 pub mod url_fetcher;
