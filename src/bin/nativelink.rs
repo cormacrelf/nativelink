@@ -36,11 +36,13 @@ use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use mimalloc::MiMalloc;
 use nativelink_config::cas_server::{
-    CasConfig, CasStoreConfig, GlobalConfig, HttpCompressionAlgorithm, ListenerConfig,
-    SchedulerConfig, ServerConfig, StoreConfig, WithInstanceName, WorkerConfig,
+    CasConfig, CasStoreConfig, FetcherConfig, GlobalConfig, HttpCompressionAlgorithm,
+    ListenerConfig, SchedulerConfig, ServerConfig, StoreConfig, WithInstanceName, WorkerConfig,
 };
 use nativelink_config::stores::ConfigDigestHashFunction;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
+use nativelink_fetch::fetcher::Fetcher;
+use nativelink_fetch::fetcher_factory::fetcher_factory;
 use nativelink_scheduler::default_scheduler_factory::scheduler_factory;
 use nativelink_service::ac_server::AcServer;
 use nativelink_service::bep_server::BepServer;
@@ -309,6 +311,15 @@ async fn inner_main(
         }
     }
 
+    // Fetchers are built in declaration order so a decorator can reference an
+    // inner fetcher defined earlier in the list.
+    let mut fetchers: HashMap<String, Arc<dyn Fetcher>> = HashMap::new();
+    for FetcherConfig { name, spec } in cfg.fetchers.iter().flatten() {
+        let fetcher = fetcher_factory(spec, &store_manager, &fetchers)
+            .err_tip(|| format!("Failed to create fetcher '{name}'"))?;
+        fetchers.insert(name.clone(), fetcher);
+    }
+
     let server_cfgs: Vec<ServerConfig> = cfg.servers.into_iter().collect();
 
     // The capabilities service advertises chunking support for CAS instances
@@ -374,7 +385,7 @@ async fn inner_main(
                 services
                     .fetch
                     .map_or(Ok(None), |cfg| {
-                        FetchServer::new(&cfg, &store_manager)
+                        FetchServer::new(&cfg, &fetchers, &store_manager)
                             .map(|v| Some(service_setup!(v.into_service(), http_config)))
                     })
                     .err_tip(|| "Could not create Fetch service")?,

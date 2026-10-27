@@ -18,6 +18,7 @@ rust_binary(
     deps = [
         "//nativelink-config",
         "//nativelink-error",
+        "//nativelink-fetch",
         "//nativelink-scheduler",
         "//nativelink-service",
         "//nativelink-store",

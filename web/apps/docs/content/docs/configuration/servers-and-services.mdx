@@ -74,7 +74,7 @@ from the `stores` or `schedulers` array. This is where the wiring described in
 | `bytestream` | Streaming reads and writes for large blobs | `cas_store` |
 | `capabilities` | What this endpoint supports; required by Bazel | optionally a scheduler |
 | `execution` | REAPI `Execution`: accepts `Execute` calls | `cas_store` and `scheduler` |
-| `fetch` | Remote Asset protocol, fetch half | `fetch_store` |
+| `fetch` | Remote Asset protocol, fetch half | `fetch_store`, optionally a `fetcher` from the top-level `fetchers` list |
 | `push` | Remote Asset protocol, push half | `push_store` |
 | `worker_api` | Where workers connect and are handed actions | `scheduler` |
 | `experimental_bep` | Build Event Protocol consumption | `store` |

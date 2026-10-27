@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use nativelink_config::cas_server::{FetchConfig, WithInstanceName};
+use nativelink_config::fetchers::{BackgroundSpec, FetcherSpec, MetadataCacheSpec, UrlFetcherSpec};
 use nativelink_config::stores::{CompletenessCheckingSpec, MemorySpec, RefSpec, StoreSpec};
 use nativelink_error::Error;
+use nativelink_fetch::fetcher::Fetcher;
+use nativelink_fetch::fetcher_factory::fetcher_factory;
 use nativelink_fetch::remote_asset_proto::{
-    AssetKind, RemoteAssetEntry, RemoteAssetQuery, now_timestamp, write_remote_asset_entry,
+    AssetKind, RemoteAssetEntry, RemoteAssetMetadata, RemoteAssetQuery, now_timestamp,
+    write_remote_asset_entry,
 };
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::Fetch;
@@ -28,14 +33,18 @@ use nativelink_proto::build::bazel::remote::asset::v1::{
 use nativelink_proto::build::bazel::remote::execution::v2::{
     ActionResult, Digest, digest_function,
 };
-use nativelink_proto::google::rpc::Status as GoogleStatus;
+use nativelink_proto::google::rpc::{BadRequest, ErrorInfo, Status as GoogleStatus};
 use nativelink_service::fetch_server::FetchServer;
 use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
+use nativelink_util::background_spawn;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::store_trait::StoreLike;
+use parking_lot::Mutex;
 use prost::Message;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tonic::{Code, Request, Status};
 
 /// Builds the stores a fetch service uses: a CAS, an Action Cache, and the
@@ -75,6 +84,115 @@ async fn make_store_manager() -> Result<Arc<StoreManager>, Error> {
     Ok(store_manager)
 }
 
+/// Spawns a single-shot HTTP/1.1 server that serves `body` for the first
+/// request it receives, then returns the URL pointing at it.
+async fn serve_once(body: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    background_spawn!("fetch_test_http_server", async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        // Drain the request line and headers, reading until the terminating
+        // blank line (`\r\n\r\n`). These are GET requests with no body, so the
+        // headers are all we need to consume before replying.
+        let mut request = Vec::new();
+        let mut buf = [0u8; 2048];
+        loop {
+            let read = socket.read(&mut buf).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..read]);
+            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(header.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+        socket.flush().await.unwrap();
+    });
+    format!("http://{addr}/blob")
+}
+
+/// Spawns an HTTP/1.1 server that serves `body` to every request, recording
+/// each raw request (lowercased, so header names compare case-insensitively).
+/// Returns the URL and the recorded requests.
+async fn serve_recording(body: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    background_spawn!("fetch_test_recording_http_server", async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 2048];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+            }
+            recorded
+                .lock()
+                .push(String::from_utf8_lossy(&request).to_lowercase());
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            socket.flush().await.unwrap();
+        }
+    });
+    (format!("http://{addr}/blob"), requests)
+}
+
+/// Spawns a single-shot server that replies with `body` but no `Content-Length`
+/// header, delimiting the body by closing the connection, so a client can only
+/// learn the size by receiving it.
+async fn serve_once_without_content_length(body: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    background_spawn!("fetch_test_no_content_length_server", async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 2048];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let read = socket.read(&mut buf).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..read]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        socket.write_all(&body).await.unwrap();
+        socket.flush().await.unwrap();
+    });
+    format!("http://{addr}/blob")
+}
+
+/// Spawns a server that accepts one connection and then never responds,
+/// holding the socket open so the client hits its own timeout.
+async fn serve_stalls() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    background_spawn!("fetch_test_stall_server", async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        // Never reply; just keep the connection open until the test ends.
+        tokio::time::sleep(core::time::Duration::from_secs(30)).await;
+        drop(socket);
+    });
+    format!("http://{addr}/blob")
+}
+
 #[nativelink_test]
 async fn test_fetch_blob() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
@@ -84,8 +202,10 @@ async fn test_fetch_blob() -> Result<(), Status> {
             instance_name: instance_name.clone(),
             config: FetchConfig {
                 fetch_store: String::from("test_fetch_store"),
+                fetcher: None,
             },
         }],
+        &HashMap::new(),
         &store_manager,
     )
     .expect("FetchServer config error");
@@ -153,8 +273,302 @@ async fn test_fetch_blob() -> Result<(), Status> {
 }
 
 const HELLO_WORLD: &[u8] = b"hello world";
+// `sha256("hello world")`, base64-encoded, as an SRI checksum value.
+const HELLO_WORLD_SRI: &str = "sha256-uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=";
 const HELLO_WORLD_SHA256_HEX: &str =
     "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+/// Builds a `FetchServer` whose fetcher is the production chain
+/// `Background(MetadataCache(Url))`, composed via the config factory exactly as
+/// the JSON config would.
+fn make_fetch_server_with_cas(store_manager: &StoreManager) -> FetchServer {
+    make_fetch_server_with_cas_and_limit(store_manager, None)
+}
+
+/// Like [`make_fetch_server_with_cas`], with the URL fetcher's download size
+/// cap set to `max_size_bytes`.
+fn make_fetch_server_with_cas_and_limit(
+    store_manager: &StoreManager,
+    max_size_bytes: Option<u64>,
+) -> FetchServer {
+    make_fetch_server_with_url_spec(
+        store_manager,
+        UrlFetcherSpec {
+            cas_store: String::from("test_cas_store"),
+            temp_path: None,
+            max_size_bytes,
+        },
+    )
+}
+
+/// Like [`make_fetch_server_with_cas`], with the URL fetcher configured by
+/// `url_spec`.
+fn make_fetch_server_with_url_spec(
+    store_manager: &StoreManager,
+    url_spec: UrlFetcherSpec,
+) -> FetchServer {
+    let mut fetchers: HashMap<String, Arc<dyn Fetcher>> = HashMap::new();
+    let url = fetcher_factory(&FetcherSpec::Url(url_spec), store_manager, &fetchers)
+        .expect("failed to build url fetcher");
+    fetchers.insert("URL".to_string(), url);
+
+    let cached = fetcher_factory(
+        &FetcherSpec::MetadataCache(MetadataCacheSpec {
+            fetch_store: String::from("test_fetch_store"),
+            fetcher: String::from("URL"),
+        }),
+        store_manager,
+        &fetchers,
+    )
+    .expect("failed to build metadata cache fetcher");
+    fetchers.insert("CACHED".to_string(), cached);
+
+    let background = fetcher_factory(
+        &FetcherSpec::Background(BackgroundSpec {
+            fetcher: String::from("CACHED"),
+            max_concurrent_fetches: None,
+            min_timeout_s: None,
+            max_timeout_s: None,
+        }),
+        store_manager,
+        &fetchers,
+    )
+    .expect("failed to build background fetcher");
+    fetchers.insert("FETCH".to_string(), background);
+
+    FetchServer::new(
+        &[WithInstanceName {
+            instance_name: "foo_instance_name".to_string(),
+            config: FetchConfig {
+                fetch_store: String::from("test_fetch_store"),
+                fetcher: Some(String::from("FETCH")),
+            },
+        }],
+        &fetchers,
+        store_manager,
+    )
+    .expect("FetchServer config error")
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_active_download_with_sri() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let uri = serve_once(HELLO_WORLD.to_vec()).await;
+
+    let response = fs
+        .fetch_blob(Request::new(FetchBlobRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec![uri.clone()],
+            qualifiers: vec![Qualifier {
+                name: "checksum.sri".to_owned(),
+                value: HELLO_WORLD_SRI.to_owned(),
+            }],
+            digest_function: 0,
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    let blob_digest = response.blob_digest.expect("expected a blob digest");
+    assert_eq!(blob_digest.hash, HELLO_WORLD_SHA256_HEX);
+    assert_eq!(
+        blob_digest.size_bytes,
+        i64::try_from(HELLO_WORLD.len()).unwrap()
+    );
+
+    // The downloaded content should have been uploaded into the CAS store.
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    let digest = DigestInfo::try_new(HELLO_WORLD_SHA256_HEX, HELLO_WORLD.len() as u64).unwrap();
+    let stored = cas_store.get_part_unchunked(digest, 0, None).await.unwrap();
+    assert_eq!(stored.as_ref(), HELLO_WORLD);
+
+    // The metadata was recorded as an `ActionResult` with the blob as its
+    // output and our metadata attached.
+    let qualifiers = vec![header_qualifier("checksum.sri", HELLO_WORLD_SRI)];
+    let action_result =
+        stored_action_result(&store_manager, AssetKind::Blob, &uri, qualifiers.clone()).await;
+    assert_eq!(action_result.output_files.len(), 1);
+    assert_eq!(action_result.output_files[0].path, "out");
+    assert_eq!(action_result.output_files[0].digest, Some(blob_digest));
+    assert!(action_result.output_directories.is_empty());
+    let execution_metadata = action_result.execution_metadata.unwrap();
+    assert_eq!(execution_metadata.worker, "nativelink-remote-asset");
+    assert!(execution_metadata.worker_start_timestamp.is_some());
+    assert!(execution_metadata.worker_completed_timestamp.is_some());
+    let metadata =
+        RemoteAssetMetadata::decode(execution_metadata.auxiliary_metadata[0].value.as_slice())
+            .unwrap();
+    assert_eq!(metadata.uri, uri);
+    assert_eq!(metadata.qualifiers, qualifiers);
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_checksum_mismatch_falls_through_to_next_uri() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    // The first URI serves corrupt content that won't match the checksum; the
+    // second serves the real content. A mismatch on the first URI must not
+    // abort the request -- we should fall through and succeed from the second.
+    let bad_uri = serve_once(b"corrupted".to_vec()).await;
+    let good_uri = serve_once(HELLO_WORLD.to_vec()).await;
+
+    let response = fs
+        .fetch_blob(Request::new(FetchBlobRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec![bad_uri, good_uri.clone()],
+            qualifiers: vec![Qualifier {
+                name: "checksum.sri".to_owned(),
+                value: HELLO_WORLD_SRI.to_owned(),
+            }],
+            digest_function: 0,
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    let blob_digest = response.blob_digest.expect("expected a blob digest");
+    assert_eq!(blob_digest.hash, HELLO_WORLD_SHA256_HEX);
+    assert_eq!(response.uri, good_uri);
+
+    // The good content should have ended up in the CAS, the corrupt one not.
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    let digest = DigestInfo::try_new(HELLO_WORLD_SHA256_HEX, HELLO_WORLD.len() as u64).unwrap();
+    let stored = cas_store.get_part_unchunked(digest, 0, None).await.unwrap();
+    assert_eq!(stored.as_ref(), HELLO_WORLD);
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_active_download_without_checksum() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    // No checksum.sri qualifier: the content is downloaded unverified and
+    // stored under its computed CAS digest.
+    let uri = serve_once(HELLO_WORLD.to_vec()).await;
+
+    let response = fs
+        .fetch_blob(Request::new(FetchBlobRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec![uri.clone()],
+            qualifiers: vec![],
+            digest_function: 0,
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    let blob_digest = response.blob_digest.expect("expected a blob digest");
+    assert_eq!(blob_digest.hash, HELLO_WORLD_SHA256_HEX);
+    assert_eq!(
+        blob_digest.size_bytes,
+        i64::try_from(HELLO_WORLD.len()).unwrap()
+    );
+
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    let digest = DigestInfo::try_new(HELLO_WORLD_SHA256_HEX, HELLO_WORLD.len() as u64).unwrap();
+    let stored = cas_store.get_part_unchunked(digest, 0, None).await.unwrap();
+    assert_eq!(stored.as_ref(), HELLO_WORLD);
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_qualifier_order_does_not_affect_cache_key() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    // `serve_once` only answers a single request, so the second fetch can only
+    // succeed by hitting the metadata cache.
+    let uri = serve_once(HELLO_WORLD.to_vec()).await;
+    let qualifier = |name: &str, value: &str| Qualifier {
+        name: name.to_owned(),
+        value: value.to_owned(),
+    };
+    let request = |qualifiers: Vec<Qualifier>| {
+        Request::new(FetchBlobRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec![uri.clone()],
+            qualifiers,
+            digest_function: 0,
+        })
+    };
+
+    let first = fs
+        .fetch_blob(request(vec![
+            qualifier("bazel.canonical_id", "x"),
+            qualifier("checksum.sri", HELLO_WORLD_SRI),
+        ]))
+        .await?
+        .into_inner();
+    assert_eq!(first.status.as_ref().map(|s| s.code), Some(0));
+
+    let second = fs
+        .fetch_blob(request(vec![
+            qualifier("checksum.sri", HELLO_WORLD_SRI),
+            qualifier("bazel.canonical_id", "x"),
+        ]))
+        .await?
+        .into_inner();
+    assert_eq!(second.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(second.blob_digest, first.blob_digest);
+
+    Ok(())
+}
+
+fn header_qualifier(name: &str, value: &str) -> Qualifier {
+    Qualifier {
+        name: name.to_owned(),
+        value: value.to_owned(),
+    }
+}
+
+/// Decodes the single `ErrorInfo` detail of `status`, checking its type URL.
+fn error_info_of(status: &GoogleStatus) -> ErrorInfo {
+    assert_eq!(status.details.len(), 1, "{status:?}");
+    let detail = &status.details[0];
+    assert_eq!(detail.type_url, "type.googleapis.com/google.rpc.ErrorInfo");
+    ErrorInfo::decode(detail.value.as_slice()).unwrap()
+}
+
+/// Asserts that `status` is `code` with a single `nativelink.com` `ErrorInfo`
+/// of `reason`.
+fn assert_error_info(status: Option<&GoogleStatus>, code: Code, reason: &str) {
+    let status = status.expect("response has no status");
+    assert_eq!(status.code, i32::from(code), "{status:?}");
+    let info = error_info_of(status);
+    assert_eq!(info.reason, reason);
+    assert_eq!(info.domain, "nativelink.com");
+}
+
+/// Decodes the `BadRequest` detail that a rejected RPC carries in its details.
+fn bad_request_of(err: &Status) -> BadRequest {
+    let status = GoogleStatus::decode(err.details()).unwrap();
+    assert_eq!(status.code, i32::from(err.code()));
+    assert_eq!(status.details.len(), 1, "{status:?}");
+    let detail = &status.details[0];
+    assert_eq!(detail.type_url, "type.googleapis.com/google.rpc.BadRequest");
+    BadRequest::decode(detail.value.as_slice()).unwrap()
+}
+
+/// The `(field, description)` pairs of `bad_request`'s violations.
+fn violations_of(bad_request: &BadRequest) -> Vec<(&str, &str)> {
+    bad_request
+        .field_violations
+        .iter()
+        .map(|violation| (violation.field.as_str(), violation.description.as_str()))
+        .collect()
+}
 
 fn blob_request(uris: Vec<String>, qualifiers: Vec<Qualifier>) -> Request<FetchBlobRequest> {
     Request::new(FetchBlobRequest {
@@ -167,6 +581,427 @@ fn blob_request(uris: Vec<String>, qualifiers: Vec<Qualifier>) -> Request<FetchB
     })
 }
 
+#[nativelink_test]
+async fn test_fetch_blob_sends_http_header_qualifiers() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+
+    let response = fs
+        .fetch_blob(blob_request(
+            vec![uri.clone()],
+            vec![
+                header_qualifier("http_header:Authorization", "Bearer global"),
+                header_qualifier("http_header:X-Other", "other"),
+                // URL-specific headers override global ones of the same name,
+                // regardless of case.
+                header_qualifier("http_header_url:0:authorization", "Bearer specific"),
+            ],
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+
+    let requests = requests.lock();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("authorization: bearer specific\r\n"));
+    assert!(!requests[0].contains("bearer global"));
+    assert!(requests[0].contains("x-other: other\r\n"));
+    Ok(())
+}
+
+const SECRET_HEADER_VALUE: &str = "Bearer header-secret-5f3a";
+const SECRET_USER: &str = "userinfo-user-77c1";
+const SECRET_PASSWORD: &str = "userinfo-pass-9d42";
+const SECRET_SIGNATURE: &str = "signature-secret-e1b8";
+const SECRET_TOKEN: &str = "token-secret-3c07";
+
+/// `uri` (an `http://host:port/path` URL) with the secrets above in its userinfo
+/// and query.
+fn uri_with_secrets(uri: &str) -> String {
+    let userinfo = format!("http://{SECRET_USER}:{SECRET_PASSWORD}@");
+    let url = uri.replacen("http://", &userinfo, 1);
+    format!("{url}?X-Amz-Signature={SECRET_SIGNATURE}&token={SECRET_TOKEN}&plain=1")
+}
+
+/// A URL nothing is listening on.
+async fn unreachable_uri() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}/blob")
+}
+
+/// Fails if any secret above is in the logs captured so far. Check that the
+/// fetch logged something first, or this proves nothing.
+fn assert_no_secrets_in_logs(logs_contain: impl Fn(&str) -> bool) {
+    for secret in [
+        SECRET_HEADER_VALUE,
+        SECRET_USER,
+        SECRET_PASSWORD,
+        SECRET_SIGNATURE,
+        SECRET_TOKEN,
+    ] {
+        assert!(!logs_contain(secret), "{secret} was logged");
+    }
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_never_logs_header_values_or_uri_credentials() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (served_uri, _requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+    let qualifiers = vec![
+        header_qualifier("http_header:Authorization", SECRET_HEADER_VALUE),
+        header_qualifier("http_header_url:0:X-Other", SECRET_HEADER_VALUE),
+    ];
+
+    // The first URI fails to connect, which makes the HTTP client's error
+    // message carry the URL, and the second is served.
+    let response = fs
+        .fetch_blob(blob_request(
+            vec![
+                uri_with_secrets(&unreachable_uri().await),
+                uri_with_secrets(&served_uri),
+            ],
+            qualifiers.clone(),
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert!(logs_contain(
+        "Failed to download fetch asset, trying next uri"
+    ));
+    assert!(logs_contain("Fetched asset"));
+    assert!(logs_contain("X-Amz-Signature=REDACTED"));
+    assert!(logs_contain("plain=REDACTED"));
+
+    // Every URI failing.
+    let response = fs
+        .fetch_blob(blob_request(
+            vec![uri_with_secrets(&unreachable_uri().await)],
+            qualifiers,
+        ))
+        .await?
+        .into_inner();
+    assert_error_info(response.status.as_ref(), Code::NotFound, "FETCH_FAILED");
+    assert_no_secrets_in_logs(logs_contain);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_url_specific_header_only_applies_to_that_uri() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    // The first URI serves content that fails the checksum, so the second is
+    // tried; only the second has the URL-specific header.
+    let (bad_uri, bad_requests) = serve_recording(b"wrong".to_vec()).await;
+    let (good_uri, good_requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+
+    let response = fs
+        .fetch_blob(blob_request(
+            vec![bad_uri, good_uri],
+            vec![
+                header_qualifier("checksum.sri", HELLO_WORLD_SRI),
+                header_qualifier("http_header_url:1:x-token", "t1"),
+            ],
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert!(!bad_requests.lock()[0].contains("x-token"));
+    assert!(good_requests.lock()[0].contains("x-token: t1\r\n"));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_headers_do_not_affect_cache_key_or_get_persisted() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+
+    let first = fs
+        .fetch_blob(blob_request(
+            vec![uri.clone()],
+            vec![
+                header_qualifier("checksum.sri", HELLO_WORLD_SRI),
+                header_qualifier("http_header:Authorization", "Bearer one"),
+            ],
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(first.status.as_ref().map(|s| s.code), Some(0));
+
+    // A different token is the same asset: served from the metadata cache
+    // without contacting the origin again.
+    let second = fs
+        .fetch_blob(blob_request(
+            vec![uri.clone()],
+            vec![
+                header_qualifier("checksum.sri", HELLO_WORLD_SRI),
+                header_qualifier("http_header:Authorization", "Bearer two"),
+            ],
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(second.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(second.blob_digest, first.blob_digest);
+    assert_eq!(requests.lock().len(), 1);
+
+    // The stored metadata holds no header qualifiers (often credentials).
+    assert!(
+        second
+            .qualifiers
+            .iter()
+            .all(|qualifier| !qualifier.name.starts_with("http_header")),
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_malformed_header_qualifier_is_invalid_argument() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+
+    for name in [
+        "http_header:",
+        "http_header_url:0:",
+        "http_header_url:x:Foo",
+        "http_header_url:5:Foo",
+        "http_header_url:Foo",
+    ] {
+        let err = fs
+            .fetch_blob(blob_request(
+                vec![uri.clone()],
+                vec![header_qualifier(name, "v")],
+            ))
+            .await
+            .expect_err(name);
+        assert_eq!(err.code(), Code::InvalidArgument, "{name}");
+    }
+    assert!(
+        requests.lock().is_empty(),
+        "no download should be attempted"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_content_length_over_limit_is_resource_exhausted() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas_and_limit(&store_manager, Some(5));
+    let uri = serve_once(HELLO_WORLD.to_vec()).await;
+
+    let response = fs
+        .fetch_blob(blob_request(vec![uri], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(
+        response.status.as_ref().map(|s| s.code),
+        Some(i32::from(Code::ResourceExhausted))
+    );
+    assert!(response.blob_digest.is_none());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_streamed_body_over_limit_is_resource_exhausted() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas_and_limit(&store_manager, Some(50));
+    // No Content-Length, so the cap can only be enforced while streaming.
+    let uri = serve_once_without_content_length(vec![b'x'; 100]).await;
+
+    let response = fs
+        .fetch_blob(blob_request(vec![uri], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(
+        response.status.as_ref().map(|s| s.code),
+        Some(i32::from(Code::ResourceExhausted))
+    );
+    assert!(response.blob_digest.is_none());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_over_limit_falls_through_to_next_uri() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let limit = HELLO_WORLD.len() as u64;
+    let fs = make_fetch_server_with_cas_and_limit(&store_manager, Some(limit));
+    let too_big = serve_once(vec![b'x'; 100]).await;
+    // Exactly at the limit is allowed.
+    let ok = serve_once_without_content_length(HELLO_WORLD.to_vec()).await;
+
+    let response = fs
+        .fetch_blob(blob_request(vec![too_big, ok.clone()], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(response.uri, ok);
+    assert_eq!(
+        response.blob_digest.expect("digest").hash,
+        HELLO_WORLD_SHA256_HEX
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_timeout_is_deadline_exceeded() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    // The server accepts the connection but never responds; the request's short
+    // timeout must surface as DEADLINE_EXCEEDED.
+    let uri = serve_stalls().await;
+
+    let response = fs
+        .fetch_blob(Request::new(FetchBlobRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: Some(prost_types::Duration {
+                seconds: 0,
+                nanos: 200_000_000,
+            }),
+            oldest_content_accepted: None,
+            uris: vec![uri],
+            qualifiers: vec![],
+            digest_function: 0,
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(
+        response.status.as_ref().map(|s| s.code),
+        Some(i32::from(Code::DeadlineExceeded))
+    );
+    assert!(response.blob_digest.is_none());
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_checksum_mismatch_is_aborted() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let uri = serve_once(HELLO_WORLD.to_vec()).await;
+
+    let response = fs
+        .fetch_blob(Request::new(FetchBlobRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec![uri],
+            qualifiers: vec![Qualifier {
+                name: "checksum.sri".to_owned(),
+                // Valid SRI of the empty string, which will not match.
+                value: "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_owned(),
+            }],
+            digest_function: 0,
+        }))
+        .await?
+        .into_inner();
+
+    // The fetch error's code survives, marked as a fetch failure rather than a
+    // miss.
+    assert_error_info(response.status.as_ref(), Code::Aborted, "FETCH_FAILED");
+    assert!(response.blob_digest.is_none());
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_no_cas_store_returns_not_found() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    // No fetcher configured: an unknown asset cannot be actively fetched.
+    let fs = FetchServer::new(
+        &[WithInstanceName {
+            instance_name: "foo_instance_name".to_string(),
+            config: FetchConfig {
+                fetch_store: String::from("test_fetch_store"),
+                fetcher: None,
+            },
+        }],
+        &HashMap::new(),
+        &store_manager,
+    )
+    .expect("FetchServer config error");
+
+    let response = fs
+        .fetch_blob(Request::new(FetchBlobRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec!["http://example.invalid/blob".to_owned()],
+            qualifiers: vec![Qualifier {
+                name: "checksum.sri".to_owned(),
+                value: HELLO_WORLD_SRI.to_owned(),
+            }],
+            digest_function: i32::from(digest_function::Value::Sha256),
+        }))
+        .await?
+        .into_inner();
+
+    assert_error_info(
+        response.status.as_ref(),
+        Code::NotFound,
+        "NOT_CACHED_NO_FETCHER",
+    );
+    assert_eq!(
+        response.status.as_ref().map(|s| s.message.as_str()),
+        Some("not cached, and this instance has no fetcher configured")
+    );
+    assert!(response.blob_digest.is_none());
+    // The request's qualifiers and digest function are echoed back.
+    assert_eq!(
+        response.qualifiers,
+        vec![header_qualifier("checksum.sri", HELLO_WORLD_SRI)]
+    );
+    assert_eq!(
+        response.digest_function,
+        i32::from(digest_function::Value::Sha256)
+    );
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_corrupt_metadata_entry_is_a_miss() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = FetchServer::new(
+        &[WithInstanceName {
+            instance_name: "foo_instance_name".to_string(),
+            config: FetchConfig {
+                fetch_store: String::from("test_fetch_store"),
+                fetcher: None,
+            },
+        }],
+        &HashMap::new(),
+        &store_manager,
+    )
+    .expect("FetchServer config error");
+
+    // Store bytes that are not a valid `ActionResult` under the key the request
+    // will look up.
+    let uri = "http://example.invalid/blob".to_owned();
+    store_manager
+        .get_store("test_ac_store")
+        .unwrap()
+        .update_oneshot(blob_key(&uri, vec![]), vec![0xff; 8].into())
+        .await
+        .unwrap();
+
+    let response = fs
+        .fetch_blob(blob_request(vec![uri], vec![]))
+        .await?
+        .into_inner();
+    assert_error_info(
+        response.status.as_ref(),
+        Code::NotFound,
+        "NOT_CACHED_NO_FETCHER",
+    );
+    assert!(response.blob_digest.is_none());
+    Ok(())
+}
+
 /// Builds a lookup-only `FetchServer` (no fetcher) over the completeness-checked
 /// `test_fetch_store`.
 fn make_lookup_server(store_manager: &StoreManager) -> FetchServer {
@@ -175,8 +1010,10 @@ fn make_lookup_server(store_manager: &StoreManager) -> FetchServer {
             instance_name: "foo_instance_name".to_string(),
             config: FetchConfig {
                 fetch_store: String::from("test_fetch_store"),
+                fetcher: None,
             },
         }],
+        &HashMap::new(),
         store_manager,
     )
     .expect("FetchServer config error")
@@ -237,42 +1074,6 @@ async fn seed_hello_world_metadata(store_manager: &StoreManager, uri: &str) -> D
 }
 
 #[nativelink_test]
-async fn test_fetch_blob_corrupt_metadata_entry_is_a_miss() -> Result<(), Status> {
-    let store_manager = make_store_manager().await?;
-    let fs = FetchServer::new(
-        &[WithInstanceName {
-            instance_name: "foo_instance_name".to_string(),
-            config: FetchConfig {
-                fetch_store: String::from("test_fetch_store"),
-            },
-        }],
-        &store_manager,
-    )
-    .expect("FetchServer config error");
-
-    // Store bytes that are not a valid `ActionResult` under the key the request
-    // will look up.
-    let uri = "http://example.invalid/blob".to_owned();
-    store_manager
-        .get_store("test_ac_store")
-        .unwrap()
-        .update_oneshot(blob_key(&uri, vec![]), vec![0xff; 8].into())
-        .await
-        .unwrap();
-
-    let response = fs
-        .fetch_blob(blob_request(vec![uri], vec![]))
-        .await?
-        .into_inner();
-    assert_eq!(
-        response.status.as_ref().map(|s| s.code),
-        Some(i32::from(Code::NotFound))
-    );
-    assert!(response.blob_digest.is_none());
-    Ok(())
-}
-
-#[nativelink_test]
 async fn test_fetch_blob_present_in_cas_is_a_hit() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
     let fs = make_lookup_server(&store_manager);
@@ -309,11 +1110,40 @@ async fn test_fetch_blob_missing_from_cas_is_a_miss() -> Result<(), Status> {
         .fetch_blob(blob_request(vec![uri], vec![]))
         .await?
         .into_inner();
-    assert_eq!(
-        response.status.as_ref().map(|s| s.code),
-        Some(i32::from(Code::NotFound))
+    assert_error_info(
+        response.status.as_ref(),
+        Code::NotFound,
+        "NOT_CACHED_NO_FETCHER",
     );
     assert!(response.blob_digest.is_none());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_missing_from_cas_is_refetched() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+    let digest = seed_hello_world_metadata(&store_manager, &uri).await;
+
+    let response = fs
+        .fetch_blob(blob_request(vec![uri], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(response.blob_digest, Some(digest.clone()));
+    // The stale entry was not served: the origin was contacted and the blob is
+    // back in the CAS.
+    assert_eq!(requests.lock().len(), 1);
+    assert!(
+        store_manager
+            .get_store("test_cas_store")
+            .unwrap()
+            .has(DigestInfo::try_from(&digest).unwrap())
+            .await
+            .unwrap()
+            .is_some()
+    );
     Ok(())
 }
 
@@ -357,9 +1187,10 @@ async fn test_fetch_blob_valid_action_result_that_is_not_an_entry_is_a_miss() ->
         .fetch_blob(blob_request(vec![uri], vec![]))
         .await?
         .into_inner();
-    assert_eq!(
-        response.status.as_ref().map(|s| s.code),
-        Some(i32::from(Code::NotFound))
+    assert_error_info(
+        response.status.as_ref(),
+        Code::NotFound,
+        "NOT_CACHED_NO_FETCHER",
     );
     Ok(())
 }
@@ -537,5 +1368,201 @@ async fn test_fetch_blob_oldest_content_accepted() -> Result<(), Status> {
         .await?
         .into_inner();
     assert!(found(&response));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_too_old_entry_is_refetched_and_restamped() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+    seed_hello_world_with_times(&store_manager, &uri, None, Some(timestamp_ago(100))).await;
+    let oldest = Some(timestamp_ago(10));
+
+    let response = fs
+        .fetch_blob(blob_request_oldest(&uri, oldest))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(requests.lock().len(), 1);
+
+    // The refetch refreshed `stored_at`, so the same request now hits.
+    let response = fs
+        .fetch_blob(blob_request_oldest(&uri, oldest))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(requests.lock().len(), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_unsupported_qualifier_is_invalid_argument() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+
+    // `checksum.h1` is only meaningful for directories.
+    for name in ["resource_type", "vcs.commit", "checksum.h1", "made.up"] {
+        let err = fs
+            .fetch_blob(blob_request(
+                vec![uri.clone()],
+                vec![
+                    header_qualifier("checksum.sri", HELLO_WORLD_SRI),
+                    header_qualifier(name, "v"),
+                ],
+            ))
+            .await
+            .expect_err(name);
+        assert_eq!(err.code(), Code::InvalidArgument, "{name}");
+        // The message names the offender and what is supported.
+        assert!(err.message().contains(name), "{}", err.message());
+        assert!(err.message().contains("checksum.sri"), "{}", err.message());
+        assert!(
+            err.message().contains("bazel.canonical_id"),
+            "{}",
+            err.message()
+        );
+        // One violation per unsupported qualifier, not per qualifier.
+        assert_eq!(
+            violations_of(&bad_request_of(&err)),
+            vec![(
+                "qualifiers.name",
+                format!("\"{name}\" not supported").as_str()
+            )],
+            "{name}"
+        );
+    }
+    assert!(
+        requests.lock().is_empty(),
+        "no download should be attempted"
+    );
+    Ok(())
+}
+
+/// The spec lets a server trust the qualifiers of a pushed asset, so one
+/// stored under a qualifier we could not honour on a download is still found,
+/// with or without a fetcher, and nothing is downloaded.
+#[nativelink_test]
+async fn test_fetch_blob_pushed_asset_with_unsupported_qualifier_is_a_hit() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+    let qualifiers = vec![header_qualifier("resource_type", "test")];
+    let digest = Digest {
+        hash: HELLO_WORLD_SHA256_HEX.to_owned(),
+        size_bytes: i64::try_from(HELLO_WORLD.len()).unwrap(),
+    };
+    store_manager
+        .get_store("test_cas_store")
+        .unwrap()
+        .update_oneshot(
+            DigestInfo::try_from(&digest).unwrap(),
+            HELLO_WORLD.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    write_entry(
+        &store_manager,
+        AssetKind::Blob,
+        &uri,
+        qualifiers.clone(),
+        digest.clone(),
+        None,
+        None,
+    )
+    .await;
+
+    for fs in [
+        make_lookup_server(&store_manager),
+        make_fetch_server_with_cas(&store_manager),
+    ] {
+        let response = fs
+            .fetch_blob(blob_request(vec![uri.clone()], qualifiers.clone()))
+            .await?
+            .into_inner();
+        assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+        assert_eq!(response.blob_digest, Some(digest.clone()));
+        assert_eq!(response.qualifiers, qualifiers);
+    }
+    assert!(requests.lock().is_empty(), "a hit needs no download");
+    Ok(())
+}
+
+/// Without a fetcher nothing is downloaded, so there is nothing to reject: an
+/// unsupported qualifier on a miss is just a miss.
+#[nativelink_test]
+async fn test_fetch_blob_unsupported_qualifier_without_fetcher_is_not_cached() -> Result<(), Status>
+{
+    let store_manager = make_store_manager().await?;
+    let fs = make_lookup_server(&store_manager);
+    let response = fs
+        .fetch_blob(blob_request(
+            vec!["http://example.invalid/blob".to_owned()],
+            vec![header_qualifier("resource_type", "test")],
+        ))
+        .await?
+        .into_inner();
+    assert_error_info(
+        response.status.as_ref(),
+        Code::NotFound,
+        "NOT_CACHED_NO_FETCHER",
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_unsupported_qualifiers_each_get_a_violation() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+    let err = fs
+        .fetch_blob(blob_request(
+            vec![uri],
+            vec![
+                header_qualifier("resource_type", "a"),
+                header_qualifier("checksum.sri", HELLO_WORLD_SRI),
+                header_qualifier("vcs.commit", "b"),
+                header_qualifier("http_header:Authorization", "Bearer t"),
+            ],
+        ))
+        .await
+        .expect_err("unsupported qualifiers");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(
+        violations_of(&bad_request_of(&err)),
+        vec![
+            ("qualifiers.name", "\"resource_type\" not supported"),
+            ("qualifiers.name", "\"vcs.commit\" not supported"),
+        ]
+    );
+    assert!(
+        requests.lock().is_empty(),
+        "no download should be attempted"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_supported_qualifiers_are_accepted() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+
+    // Nothing is cached, so this downloads, and every qualifier is one a
+    // download honours.
+    let response = fs
+        .fetch_blob(blob_request(
+            vec![uri],
+            vec![
+                header_qualifier("checksum.sri", HELLO_WORLD_SRI),
+                header_qualifier("bazel.canonical_id", "id"),
+                header_qualifier("http_header:Authorization", "Bearer t"),
+                header_qualifier("http_header_url:0:X-Token", "t"),
+            ],
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(requests.lock().len(), 1);
     Ok(())
 }

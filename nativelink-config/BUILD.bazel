@@ -12,6 +12,7 @@ load(
 _CONFIG_SRCS = [
     "src/backcompat.rs",
     "src/cas_server.rs",
+    "src/fetchers.rs",
     "src/lib.rs",
     "src/schedulers.rs",
     "src/serde_utils.rs",
