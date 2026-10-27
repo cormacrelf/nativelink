@@ -1704,6 +1704,156 @@ async fn test_fetch_directory_malformed_nar_hash_is_invalid_argument() -> Result
     Ok(())
 }
 
+/// A commit of [`NAR_TREE`] made with git 2.55.0, and its tree:
+/// `git write-tree` of the tree built on disk as for [`NAR_TREE_HASH`] (in a
+/// SHA-1 and a SHA-256 repository, `core.filemode=true`), then
+/// `git commit-tree`. Its `empty/` is not in the tree, since git does not
+/// record empty directories.
+const GIT_COMMIT: &str = "3a454c8d322612c3f261f9989db87c22a1ddee6a";
+const GIT_TREE_SHA1: &str = "5f9826c0f4c82dab9800ca2e0a49f6686301b34d";
+const GIT_TREE_SHA256: &str = "3b0894a9b14b20aebb709deaaa6fadc41eb6b7f6cf1227eff676f8ab6645b454";
+
+/// [`NAR_TREE`] as GitHub serves a commit's tarball, which is what
+/// `git archive --prefix=repo-<commit>/ <commit>` writes: a pax global
+/// header carrying the commit id, then everything under `repo-<commit>/`.
+fn github_archive() -> Vec<u8> {
+    use std::io::{Read, Write};
+
+    use flate2::Compression;
+    use flate2::read::GzDecoder;
+    use flate2::write::GzEncoder;
+
+    let mut builder = tar::Builder::new(Vec::new());
+    let comment = format!("52 comment={GIT_COMMIT}\n");
+    let mut header = tar::Header::new_ustar();
+    header.set_entry_type(tar::EntryType::XGlobalHeader);
+    header.set_mode(0o666);
+    header.set_size(u64::try_from(comment.len()).unwrap());
+    builder
+        .append_data(&mut header, "pax_global_header", comment.as_bytes())
+        .unwrap();
+    let mut tree = Vec::new();
+    GzDecoder::new(&build_tar_gz_tree(&format!("repo-{GIT_COMMIT}/"), NAR_TREE)[..])
+        .read_to_end(&mut tree)
+        .unwrap();
+    let mut entries = tar::Archive::new(&tree[..]);
+    for entry in entries.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let mut header = entry.header().clone();
+        let path = entry.path().unwrap().into_owned();
+        if let Some(target) = entry.link_name().unwrap() {
+            let target = target.into_owned();
+            builder.append_link(&mut header, path, target).unwrap();
+        } else {
+            builder.append_data(&mut header, path, &mut entry).unwrap();
+        }
+    }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&builder.into_inner().unwrap()).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_github_archive_with_git_tree_id() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+
+    // The commit's tree id, as `git rev-parse <commit>^{tree}` or a Julia
+    // `git-tree-sha1` gives it, matches the single top-level directory.
+    let mut roots = Vec::new();
+    for value in [
+        GIT_TREE_SHA1,
+        &GIT_TREE_SHA1.to_uppercase(),
+        GIT_TREE_SHA256,
+    ] {
+        let uri = serve_once(github_archive()).await;
+        let response = fs
+            .fetch_directory(directory_request_with(
+                vec![uri],
+                vec![header_qualifier("checksum.git_tree", value)],
+            ))
+            .await?
+            .into_inner();
+        // The returned root is still the archive's root, without the pax
+        // header.
+        let root = read_root(&store_manager, &response).await;
+        assert!(root.files.is_empty(), "{value}");
+        assert!(root.symlinks.is_empty(), "{value}");
+        assert_eq!(root.directories.len(), 1, "{value}");
+        assert_eq!(
+            root.directories[0].name,
+            format!("repo-{GIT_COMMIT}"),
+            "{value}"
+        );
+        roots.push(response.root_directory_digest);
+    }
+    assert_eq!(roots[0], roots[1]);
+    assert_eq!(roots[0], roots[2]);
+    Ok(())
+}
+
+/// GitHub's tarball of Julia's `Example.jl` at `v0.5.5`, downloaded from
+/// <https://github.com/JuliaLang/Example.jl/archive/refs/tags/v0.5.5.tar.gz>
+/// (SHA-256 `e758fc96eaf4d3c0cc6dfe116b1d0e26b788f880ae900012d1532b6e7370edfc`).
+const EXAMPLE_JL_ARCHIVE: &[u8] = include_bytes!("data/Example.jl-0.5.5.tar.gz");
+
+/// The `git-tree-sha1` of `Example` 0.5.5 in Julia's General registry
+/// (`E/Example/Versions.toml`). `git write-tree` and Julia's
+/// `Pkg.GitTools.tree_hash` of the archive's `Example.jl-0.5.5/` agree.
+const EXAMPLE_JL_TREE: &str = "e1f0e1a832ccd8e97d6d0348dec33ee139a5aeaf";
+
+#[nativelink_test]
+async fn test_fetch_directory_julia_package_from_github_with_git_tree_sha1() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let uri = serve_once(EXAMPLE_JL_ARCHIVE.to_vec()).await;
+    let response = fs
+        .fetch_directory(directory_request_with(
+            vec![uri],
+            vec![header_qualifier("checksum.git_tree", EXAMPLE_JL_TREE)],
+        ))
+        .await?
+        .into_inner();
+    let root = read_root(&store_manager, &response).await;
+    assert_eq!(root.directories.len(), 1);
+    assert_eq!(root.directories[0].name, "Example.jl-0.5.5");
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_git_tree_mismatch_falls_through_to_next_uri() -> Result<(), Status> {
+    directory_checksum_mismatch_falls_through(|_archive| {
+        // The SHA-1 tree id of {a.txt: "alpha", dir/b.txt: "beta"}.
+        header_qualifier(
+            "checksum.git_tree",
+            "7b202b7775c7bfcdb392cc43bf9463fd13a19eac",
+        )
+    })
+    .await
+}
+
+#[nativelink_test]
+async fn test_fetch_directory_malformed_git_tree_id_is_invalid_argument() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    for value in ["", "5f9826c", &GIT_TREE_SHA1[1..], "not a tree id"] {
+        let err = fs
+            .fetch_directory(directory_request_with(
+                vec!["http://example.invalid/dir".to_owned()],
+                vec![header_qualifier("checksum.git_tree", value)],
+            ))
+            .await
+            .expect_err(value);
+        assert_eq!(err.code(), Code::InvalidArgument, "{value}");
+        assert!(
+            err.message().contains("checksum.git_tree"),
+            "{}",
+            err.message()
+        );
+    }
+    Ok(())
+}
+
 #[nativelink_test]
 async fn test_fetch_directory_all_uris_mismatching_reports_the_last_error() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
@@ -2907,6 +3057,7 @@ async fn test_fetch_directory_qualifiers() -> Result<(), Status> {
         header_qualifier("checksum.sri", &sri_of(&zip_data)),
         header_qualifier("checksum.h1", &h1_of(entries)),
         header_qualifier("checksum.nar", NAR_TREE_HASH),
+        header_qualifier("checksum.git_tree", GIT_TREE_SHA1),
         header_qualifier("bazel.canonical_id", "id"),
         header_qualifier("http_header:Authorization", "Bearer t"),
     ]))

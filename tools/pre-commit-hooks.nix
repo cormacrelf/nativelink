@@ -51,6 +51,8 @@ in {
     excludes = [
       # Testdata for fastcdc.
       "nativelink-util/tests/data/SekienAkashita.jpg"
+      # A GitHub tarball of a Julia package, for checksum.git_tree.
+      "nativelink-service/tests/data/Example.jl-0.5.5.tar.gz"
       # Menlo Security case-study figures on the marketing site.
       "web/apps/web/public/assets/menlo-security-build-time-comparison.jpg"
       "web/apps/web/public/assets/menlo-security-kubernetes-topology.jpg"

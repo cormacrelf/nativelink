@@ -55,11 +55,12 @@ use tonic::async_trait;
 
 use crate::archive_expander::{ExpandHook, FileMeta, Held, Listing};
 
+pub mod git_tree;
 pub mod h1;
 pub mod nar;
 
 /// Every supported tree-hash format.
-pub static TREE_HASH_FORMATS: &[&dyn TreeHashFormat] = &[&h1::H1, &nar::Nar];
+pub static TREE_HASH_FORMATS: &[&dyn TreeHashFormat] = &[&h1::H1, &nar::Nar, &git_tree::GitTree];
 
 /// Describes one tree-hash format. See the [module docs](self).
 pub trait TreeHashFormat: Sync {

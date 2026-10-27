@@ -18,6 +18,7 @@ rust_library(
         "src/metadata_cache.rs",
         "src/remote_asset_proto.rs",
         "src/spill.rs",
+        "src/tree_hash/git_tree.rs",
         "src/tree_hash/h1.rs",
         "src/tree_hash/mod.rs",
         "src/tree_hash/nar.rs",
@@ -41,6 +42,7 @@ rust_library(
         "@crates//:prost-types",
         "@crates//:reqwest",
         "@crates//:rustls",
+        "@crates//:sha1",
         "@crates//:sha2",
         "@crates//:tempfile",
         "@crates//:tokio",
@@ -57,6 +59,7 @@ rust_test_suite(
     srcs = [
         "tests/archive_expander_test.rs",
         "tests/background_fetcher_test.rs",
+        "tests/git_tree_test.rs",
         "tests/h1_test.rs",
         "tests/metadata_cache_test.rs",
         "tests/nar_test.rs",

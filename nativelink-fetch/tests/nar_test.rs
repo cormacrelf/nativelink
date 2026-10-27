@@ -20,7 +20,7 @@ use nativelink_fetch::tree_hash::nar::{Nar, nix32_encode, parse_nar_hash};
 use nativelink_fetch::tree_hash::{TreeChecksum, TreeHashFormat};
 use nativelink_macro::nativelink_test;
 use support::{
-    Run, TarEntry, ZipEntry, compute_with, expect_mismatch, gzip, tar, tar_under, values,
+    FULL, Run, TarEntry, ZipEntry, compute_with, expect_mismatch, gzip, tar, tar_under, values,
     verify_with, zip, zip_with_data_descriptors,
 };
 
@@ -30,27 +30,6 @@ use support::{
 //   nix hash path --type sha256 <dir>                  (the SRI form)
 //   nix hash convert --hash-algo sha256 --to nix32 <sri>
 //   nix hash convert --hash-algo sha256 --to base16 <sri>
-
-/// The `full` tree: a regular file, an executable, a symlink, nested and
-/// empty directories, a non-ASCII name, a zero-length file, contents needing
-/// and not needing padding, and names whose bytewise order (`B` < `a` < `a-b`
-/// < `a.b` < `bin` < `café.txt`) differs from a case-insensitive or
-/// directories-first one. In NAR order.
-const FULL: &[TarEntry<'static>] = &[
-    TarEntry::File("B", b"upper", 0o644),
-    TarEntry::File("a/x", b"in a", 0o644),
-    TarEntry::File("a-b", b"dash", 0o644),
-    TarEntry::File("a.b", b"dot", 0o644),
-    TarEntry::Dir("bin/"),
-    TarEntry::File("bin/run.sh", b"#!/bin/sh\necho hi\n", 0o755),
-    TarEntry::File("café.txt", b"unicode", 0o644),
-    TarEntry::Dir("empty/"),
-    TarEntry::Link("link", "bin/run.sh"),
-    TarEntry::File("nested/deeper/f", b"deep", 0o644),
-    TarEntry::File("pad7", b"1234567", 0o644),
-    TarEntry::File("pad8", b"12345678", 0o644),
-    TarEntry::File("zero", b"", 0o644),
-];
 
 /// The `full` tree in no particular order.
 const FULL_SHUFFLED: &[TarEntry<'static>] = &[
