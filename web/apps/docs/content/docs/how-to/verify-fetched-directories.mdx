@@ -1,0 +1,435 @@
+---
+title: Verify fetched directories with an action
+description: "Pin a Remote Asset FetchDirectory to a hash of the expanded tree in a format NativeLink doesn't know, by naming a verification action in the checksum.action_digest qualifier."
+---
+
+{/* archetype: how-to, see /web/apps/docs/templates/how-to.mdx */}
+
+**Who this is for:** anyone fetching archives through the Remote Asset `Fetch`
+service whose lockfile pins the *expanded tree*, not the archive bytes, in a
+format NativeLink does not compute itself. **What you'll have at the end:** a
+`FetchDirectory` that returns a tree only after your own checker, running on a
+worker, has said it matches. **Time:** an hour, most of it on the client side.
+
+<Prerequisites>
+  A NativeLink with a `fetch` service and a `fetchers` chain, and workers that
+  run actions. See [Servers and services](/configuration/servers-and-services)
+  and [Remote execution](/remote-execution). You also need a client that can
+  upload blobs to the CAS and call `FetchDirectory`.
+</Prerequisites>
+
+## Why a byte checksum is not enough [#why-a-byte-checksum-is-not-enough]
+
+`checksum.sri` and the other byte checksums pin the archive: the exact bytes
+of a zip or tarball. Many ecosystems pin something else, a hash over the files
+the archive expands to. Go's `go.sum` is the familiar one: its `h1:` value is
+a SHA-256 over the module's file names and file hashes, and says nothing about
+how the zip was framed. A client holding only that value has nothing to put in
+`checksum.sri`.
+
+The `checksum.action_digest` qualifier closes the gap without teaching the
+server the format. The client uploads a small action (a checker, its command
+line, and the expected value), and names it in the qualifier. NativeLink
+downloads and expands the archive, runs that action on a worker with the
+expanded tree in its input root, and returns the tree only if the checker
+exits 0. The server never interprets the hash; the client supplies the check.
+
+<Callout type="info" title="Built-in tree hashes need no action">
+  NativeLink computes a few tree hashes itself during expansion, Go's `h1:`
+  among them (the `checksum.h1` qualifier), with no worker involved. Prefer a
+  built-in qualifier when one covers your format. This page uses `h1:` as its
+  example because its expected values are public, in every `go.sum`, and you
+  can send `checksum.h1` alongside the action to confirm your checker agrees.
+</Callout>
+
+<SourceLink file="nativelink-fetch/src/action_verifier.rs" symbol="ActionVerifier" />
+
+## The server configuration [#the-server-configuration]
+
+Add an `action_verify` fetcher to the chain, between `metadata_cache` and
+`url`. This is a single process serving the CAS, the Action Cache, the
+scheduler, one worker and the `fetch` service:
+
+```json5
+{
+  stores: [
+    {
+      name: "AC_STORE",
+      memory: {
+        eviction_policy: { max_bytes: 1000000000 },
+      },
+    },
+    {
+      // Workers need a fast_slow store whose fast half is a filesystem.
+      name: "CAS_STORE",
+      fast_slow: {
+        fast: {
+          filesystem: {
+            content_path: "/var/lib/nativelink/content_path-cas",
+            temp_path: "/var/lib/nativelink/tmp_path-cas",
+            eviction_policy: { max_bytes: 10000000000 },
+          },
+        },
+        slow: { noop: {} },
+      },
+    },
+    {
+      // Remote Asset metadata: URI + qualifiers -> digest, as Action Cache
+      // entries. An entry whose content has left the CAS reads as a miss.
+      name: "FETCH_METADATA_STORE",
+      completeness_checking: {
+        backend: { ref_store: { name: "AC_STORE" } },
+        cas_store: { ref_store: { name: "CAS_STORE" } },
+      },
+    },
+  ],
+  schedulers: [
+    {
+      // cache_lookup lets a verification that already passed be served from
+      // the Action Cache instead of running again.
+      name: "MAIN_SCHEDULER",
+      cache_lookup: {
+        ac_store: "AC_STORE",
+        scheduler: {
+          simple: {
+            supported_platform_properties: {
+              OSFamily: "priority",
+              "container-image": "priority",
+            },
+          },
+        },
+      },
+    },
+  ],
+  // The chain is FETCH_BG -> FETCH_CACHED -> FETCH_VERIFY -> FETCH_URL. A
+  // fetcher must be defined before any fetcher or service that names it.
+  fetchers: [
+    {
+      name: "FETCH_URL",
+      url: {
+        cas_store: "CAS_STORE",
+        temp_path: "/var/lib/nativelink/tmp_path-fetch",
+        max_size_bytes: 1073741824,
+        max_archive_entries: 1000000,
+        max_archive_uncompressed_bytes: 10737418240,
+      },
+    },
+    {
+      // Runs the action a request names in checksum.action_digest. Below the
+      // metadata cache, so a tree that fails is never recorded.
+      name: "FETCH_VERIFY",
+      action_verify: {
+        fetcher: "FETCH_URL",
+        cas_store: "CAS_STORE",
+        scheduler: "MAIN_SCHEDULER",
+        instance_name: "",
+      },
+    },
+    {
+      name: "FETCH_CACHED",
+      metadata_cache: {
+        fetch_store: "FETCH_METADATA_STORE",
+        cas_store: "CAS_STORE",
+        fetcher: "FETCH_VERIFY",
+      },
+    },
+    {
+      name: "FETCH_BG",
+      background: {
+        fetcher: "FETCH_CACHED",
+        max_concurrent_fetches: 8,
+      },
+    },
+  ],
+  workers: [
+    {
+      local: {
+        worker_api_endpoint: { uri: "grpc://127.0.0.1:50061" },
+        cas_fast_slow_store: "CAS_STORE",
+        upload_action_result: { ac_store: "AC_STORE" },
+        work_directory: "/var/lib/nativelink/work",
+        platform_properties: {
+          OSFamily: { values: ["linux"] },
+          "container-image": { values: [""] },
+        },
+      },
+    },
+  ],
+  servers: [
+    {
+      listener: { http: { socket_address: "0.0.0.0:50051" } },
+      services: {
+        cas: [{ instance_name: "", cas_store: "CAS_STORE" }],
+        ac: [{ instance_name: "", ac_store: "AC_STORE" }],
+        bytestream: [{ instance_name: "", cas_store: "CAS_STORE" }],
+        capabilities: [{ instance_name: "" }],
+        fetch: [
+          {
+            instance_name: "",
+            fetch_store: "FETCH_METADATA_STORE",
+            fetcher: "FETCH_BG",
+          },
+        ],
+      },
+    },
+    {
+      // Workers only. Keep this port off any network clients reach.
+      listener: { http: { socket_address: "0.0.0.0:50061" } },
+      services: {
+        worker_api: { scheduler: "MAIN_SCHEDULER" },
+      },
+    },
+  ],
+}
+```
+
+<Callout type="warn" title="This fetcher lets Fetch callers run commands">
+  The action is the caller's, so anyone who can call `Fetch` can run any
+  command your workers can run, under the fetcher's `instance_name` rather
+  than the instance the call named. Read
+  [An `action_verify` fetcher grants execution](/operate/security-hardening#an-action-verify-fetcher-grants-execution)
+  before you expose this to anyone.
+</Callout>
+
+## What to change [#what-to-change]
+
+| Field | What it decides | Reference |
+| --- | --- | --- |
+| position in the chain | `action_verify` wraps `url` and is wrapped by `metadata_cache`. Above `metadata_cache`, a tree that failed verification could already be recorded as the answer for its URI. | <SourceLink file="nativelink-config/src/fetchers.rs" symbol="FetcherSpec" /> |
+| `cas_store` | Where the uploaded template is read from and the action that runs is written to. It must hold the fetched tree, so use the `url` fetcher's `cas_store`, and the scheduler's workers must read from it. | [`ActionVerifySpec`](/reference/nativelink-config/main#actionverifyspec) |
+| `scheduler` | A scheduler in this process that runs the action. A `cache_lookup` scheduler can answer a repeat verification from the Action Cache; a bare `simple` one runs it every time. | [`ActionVerifySpec`](/reference/nativelink-config/main#actionverifyspec) |
+| `instance_name` | The instance the action runs under, whatever instance the `Fetch` call named. Pick one in the same trust domain as your `Fetch` clients. | [`ActionVerifySpec`](/reference/nativelink-config/main#actionverifyspec) |
+
+<SourceLink file="nativelink-config/src/fetchers.rs" symbol="ActionVerifySpec" />
+
+## What the client sends [#what-the-client-sends]
+
+The client uploads a *template*: an `Action`, its `Command` and its input root,
+exactly as for `Execute`. It then calls `FetchDirectory` with the qualifier
+`checksum.action_digest` set to the Action's digest, written
+`<hash>/<size_bytes>`. A value not in that form fails the call with
+`INVALID_ARGUMENT` before anything else happens.
+
+The template is not run as uploaded. NativeLink copies it, puts the fetched
+tree into its input root, and runs the copy. These are the rules that decide
+how:
+
+- **Where the tree goes.** Set the environment variable
+  `NATIVELINK_FETCHED_DIRECTORY` in the `Command` to a relative path of plain
+  names, such as `fetched` or `src/module`. The tree is grafted there, beside
+  whatever else the input root holds, and the command can read the variable
+  to find it. The last name on the path must not already exist in the input
+  root; directories above it may. Without the variable, the tree becomes the
+  whole input root, and the template's input root must be empty.
+- **The expected value goes in the command**, as an argument or an
+  environment variable. That puts it in the Command's digest, so in the
+  Action's digest, so in the qualifier, and the qualifier is part of the key
+  the asset is cached under. Two pins of the same URI never share an entry.
+- **Platform.** The action is matched to a worker by `Action.platform` when
+  that has properties, otherwise by `Command.platform`, as `Execute` does.
+- **Timeout.** The action runs with `Action.timeout`. The `FetchDirectory`
+  request's `timeout` does not bound it.
+- **Byte checksums still apply.** `checksum.sri` or another byte checksum
+  sent alongside the qualifier is checked against the archive bytes, and a
+  built-in tree hash such as `checksum.h1` against the expanded tree. All of
+  them must match, as well as the action.
+
+<SourceLink file="nativelink-fetch/src/action_verifier.rs" symbol="FETCHED_DIRECTORY_ENV" />
+
+### The exit code is the verdict [#the-exit-code-is-the-verdict]
+
+The checker's exit code is the whole contract between it and the server:
+
+| Exit code | Meaning | What NativeLink does |
+| --- | --- | --- |
+| `0` | The tree matches. | Returns it, and records it in the metadata cache. |
+| `1` | The tree does not match. | Treats that URI as having served the wrong content and tries the next one. If no URI verifies, the response status is `ABORTED`, with the start of the checker's stderr. |
+| anything else | The checker itself failed: a missing tool (a shell's 127), bad usage, a crash, an out-of-memory kill, a signal. | Fails the request at once with `INTERNAL`, carrying the exit code and the start of stderr, and tries no further URI. |
+
+The split between the last two rows is why `1` must mean *mismatch* and nothing
+else. A checker that can exit 1 for its own errors turns a broken checker into
+a "wrong content" verdict on every mirror. Python exits 1 on an uncaught exception, so a Python
+checker has to catch its own errors and exit with something else, as the one
+below does.
+
+<SourceLink file="nativelink-fetch/src/action_verifier.rs" symbol="EXIT_MISMATCH" />
+
+## Worked example: a Go module and its h1: hash [#worked-example-a-go-module]
+
+The module is `golang.org/x/text` at `v0.14.0`, whose `go.sum` line is:
+
+```text
+golang.org/x/text v0.14.0 h1:ScX5w1eTa3QqT8oi6+ziP7dTV1S2+ALU0bI+0zXKWiQ=
+```
+
+`h1:` is `dirhash.Hash1` from `golang.org/x/mod`: for every file, sorted by
+name, the line `<sha256 hex>  <name>\n` (two spaces), then the base64
+SHA-256 of all those lines. The names are the paths in the module zip, and
+every one starts with `golang.org/x/text@v0.14.0/`. Since the zip expands into
+that prefix, the names are exactly the paths relative to the fetched
+directory.
+
+### The checker [#the-checker]
+
+`gosumcheck.py`, uploaded as the only file in the template's input root:
+
+```python
+#!/usr/bin/env python3
+"""Check a directory against a Go module h1: hash (dirhash.Hash1).
+
+Usage: gosumcheck.py DIR h1:...
+Exits 0 if the hash matches, 1 if it does not, 2 if the check itself failed.
+"""
+
+import base64
+import hashlib
+import os
+import sys
+
+
+def fail(err):
+    raise err
+
+
+def h1(root):
+    lines = []
+    for parent, _, files in os.walk(root, onerror=fail):
+        for file in files:
+            path = os.path.join(parent, file)
+            # Names are relative to DIR, so they keep the zip's
+            # "module@version/" prefix, as Go's do.
+            name = os.path.relpath(path, root).replace(os.sep, "/")
+            with open(path, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            lines.append((name, f"{digest}  {name}\n"))
+    lines.sort()
+    summary = hashlib.sha256("".join(line for _, line in lines).encode())
+    return "h1:" + base64.b64encode(summary.digest()).decode()
+
+
+def main():
+    if len(sys.argv) != 3 or not sys.argv[2].startswith("h1:"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    got, want = h1(sys.argv[1]), sys.argv[2]
+    if got != want:
+        print(f"mismatch: got {got}, want {want}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as err:
+        # Python exits 1 on an uncaught exception, which here means
+        # "mismatch". A checker that crashed has not checked anything.
+        print(f"gosumcheck: {err}", file=sys.stderr)
+        sys.exit(2)
+```
+
+It needs `python3` on the worker. Select a worker that has it with platform
+properties, as for any other action.
+
+### The template [#the-template]
+
+In protobuf text format, with digests elided. The input root holds only the
+checker; the tree is grafted beside it at `fetched`:
+
+```text
+# Directory (the input root)
+files { name: "gosumcheck.py"  digest { hash: "…"  size_bytes: … } }
+
+# Command
+arguments: "python3"
+arguments: "gosumcheck.py"
+arguments: "fetched"
+arguments: "h1:ScX5w1eTa3QqT8oi6+ziP7dTV1S2+ALU0bI+0zXKWiQ="
+environment_variables { name: "NATIVELINK_FETCHED_DIRECTORY"  value: "fetched" }
+
+# Action
+command_digest { hash: "…"  size_bytes: … }
+input_root_digest { hash: "…"  size_bytes: … }
+timeout { seconds: 60 }
+platform { properties { name: "OSFamily"  value: "linux" } }
+```
+
+The path appears twice, as an argument and in the variable, because a
+`Command`'s arguments are not run through a shell and `$NATIVELINK_FETCHED_DIRECTORY`
+would reach the checker unexpanded. Keep the two the same.
+
+Upload the four blobs (the script, the `Directory`, the `Command`, the
+`Action`) to the CAS, then call `FetchDirectory`:
+
+```text
+# FetchDirectoryRequest
+instance_name: ""
+uris: "https://proxy.golang.org/golang.org/x/text/@v/v0.14.0.zip"
+qualifiers {
+  name: "checksum.action_digest"
+  value: "<action hash>/<action size_bytes>"
+}
+```
+
+List more than one proxy in `uris` to have a mirror that serves the wrong zip
+skipped. Module paths with upper-case letters are escaped in proxy URLs (`!`
+before the lowered letter); the names inside the zip, and so the `h1:`
+names, use the path as written.
+
+## How caching applies [#how-caching-applies]
+
+Two caches sit in front of the checker, and neither can return a tree that
+was not verified by this template:
+
+- **The asset metadata.** The qualifier, and so the template digest, is part of
+  the asset's key. On a hit, `FetchDirectory` answers from the metadata store
+  before the verifier is reached: nothing is downloaded, nothing runs, and the
+  template is not even read, so its blobs need not be in the CAS. A client can
+  compute the Action's digest, call `FetchDirectory`, and upload the template
+  only if it is told the blobs are missing.
+- **The verification action.** The action that runs is keyed on the template
+  *and* the fetched tree's digest. With a `cache_lookup` scheduler, the same
+  template over the same tree (a second mirror, or a metadata entry that was
+  evicted) is answered from the Action Cache. If upstream starts serving a
+  different tree, the key changes and the checker runs again. Set
+  `do_not_cache` on the template Action to make it run on every metadata
+  miss.
+
+<SourceLink file="nativelink-service/src/fetch_server.rs" symbol="FetchServer" />
+
+<VerifyBlock>
+
+  `FetchDirectory` returns status `OK` and a `root_directory_digest` whose tree
+  has one top-level directory, `golang.org`. Change the `h1:` argument in the
+  Command to any other value, upload the new Command and Action, and fetch
+  again with the new action digest: the status is now `ABORTED`, and its
+  message carries the checker's `mismatch: got h1:ScX5…, want …`. The
+  server's log shows `Fetched directory failed its verification action` for
+  the URI.
+
+</VerifyBlock>
+
+## Troubleshooting [#troubleshooting]
+
+Failures after the qualifier parses come back in `FetchDirectoryResponse.status`,
+not as a failed RPC, with a `google.rpc.ErrorInfo` detail whose reason is
+`FETCH_FAILED`.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| RPC fails with `INVALID_ARGUMENT` naming `checksum.action_digest` | The value is not `<hash>/<size_bytes>`. | Send the Action digest's hash and size, separated by `/`. |
+| `FAILED_PRECONDITION`, message `checksum.action_digest needs an action_verify fetcher, and none is configured` | The instance's fetcher chain has no `action_verify`. | Add one, as above. The server fails rather than returning an unverified tree. |
+| `FAILED_PRECONDITION` with a `google.rpc.PreconditionFailure` detail | Template blobs are missing from the CAS. Each is one violation of type `MISSING`, subject `blobs/<hash>/<size>`. | Upload exactly the listed blobs and retry. Blobs are found level by level (Action, then Command and input root, then directories on the way to `NATIVELINK_FETCHED_DIRECTORY`), so a retry can name more. |
+| `INVALID_ARGUMENT` before anything downloads | The template is malformed: no command or input root digest, a non-empty input root without `NATIVELINK_FETCHED_DIRECTORY`, a path that is absolute or uses `..`, or a path whose last name already exists in the input root. | Fix the template. The message says which rule it broke. |
+| `ABORTED` | The checker exited 1 on the tree from every URI. | The pin or the mirrors are wrong; the checker's stderr is in the message. |
+| `INTERNAL`, "the checker itself is broken" | The checker exited with something other than 0 or 1. | Read the exit code and stderr in the message. 127 is usually a tool missing from the worker. |
+| `NOT_FOUND`, reason `NOT_CACHED_NO_FETCHER` | The `fetch` service for this instance has no `fetcher`. | Configure the chain. |
+
+<SourceLink file="nativelink-fetch/src/url_fetcher.rs" symbol="UrlFetcher" />
+
+## What's next [#whats-next]
+
+<NextStep href="/operate/security-hardening#an-action-verify-fetcher-grants-execution" title="Lock down who can call Fetch">
+  An `action_verify` fetcher is an execution endpoint. Decide which network
+  can reach it before anyone else does.
+</NextStep>
