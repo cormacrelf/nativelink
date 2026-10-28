@@ -290,6 +290,14 @@ pub struct BackgroundSpec {
 /// with `INTERNAL`, with the exit code and the start of stderr in the message,
 /// and no further URI is tried.
 ///
+/// Warning: enabling this fetcher lets anyone who can call `Fetch` run
+/// arbitrary commands on the workers. The action is uploaded by the caller, so
+/// its command is the caller's, and it runs under `instance_name`, not under
+/// the instance the `Fetch` call named. Set `instance_name` to an instance in
+/// the same trust domain as the `Fetch` clients: one whose Action Cache and
+/// workers no wider a set of clients can write to or reach. No inbound request
+/// is authenticated, so a network boundary has to be that domain.
+///
 /// Requests without the qualifier pass straight through. A request with it
 /// that reaches a `url` fetcher without passing an `action_verify` fails.
 #[derive(Deserialize, Serialize, Debug, Clone)]

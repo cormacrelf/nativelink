@@ -359,6 +359,37 @@ Containerising the worker helps only as far as your container runtime is a
 boundary. The shipped Compose executor runs `privileged: true` precisely so
 `unshare` works, which removes most of what the container was giving you.
 
+## An `action_verify` fetcher grants execution [#an-action-verify-fetcher-grants-execution]
+
+The Remote Asset `Fetch` service looks like a download proxy, and with only a
+`url` fetcher it is. Add an `action_verify` fetcher to the chain and it is also
+a way to run commands. A `FetchDirectory` request names, in its
+`checksum.action_digest` qualifier, an `Action` the *caller* uploaded to the
+CAS, with its `Command` and input root. The fetcher runs that action through
+the scheduler it names, on a worker, with the fetched tree in its input root.
+Whoever can call `Fetch` can therefore run any command a worker can run, which
+by the previous section is shell access on the worker host.
+
+Two things are commonly overlooked:
+
+- **The instance is not the one the caller used.** The action runs under the
+  fetcher's `instance_name` (default: the empty instance), whatever instance
+  the `Fetch` call named. Anything that restricts who may use the instance
+  they called does not restrict this.
+- **The caller picks the command.** The server knows nothing about the format
+  being checked; the expected value is part of the command, so the command is
+  whatever the client uploaded.
+
+Set `instance_name` to an instance in the same trust domain as the `Fetch`
+clients. In practice, that instance's Action Cache should not be writable by a
+wider set of clients than may call `Fetch`, and the workers serving it should
+be ones you would let those clients run commands on. Where that is not
+possible, leave `action_verify` out of the chain and verify with
+`checksum.sri`, `checksum.sha256` or another digest qualifier, which run no
+caller-supplied code.
+
+<SourceLink file="nativelink-config/src/fetchers.rs" symbol="ActionVerifySpec" />
+
 ## What to do, in order [#what-to-do-in-order]
 
 | Step | Why |
@@ -370,6 +401,7 @@ boundary. The shipped Compose executor runs `privileged: true` precisely so
 | Remove ambient credentials from worker hosts | An action can read them |
 | Put no secrets in `environment_variables` on the worker entrypoint | Every action sees them |
 | Decide you can rebuild a worker host at any time | Assume one will need it |
+| Point any `action_verify` fetcher at an instance only `Fetch` clients can reach | Whoever can call `Fetch` can run commands there |
 
 <VerifyBlock>
 
