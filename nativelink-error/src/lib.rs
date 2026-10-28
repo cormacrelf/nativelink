@@ -71,6 +71,11 @@ pub enum ErrorContext {
     /// located. `hash` and `size` together form the digest the client
     /// should re-upload (`REv2` `blobs/{hash}/{size}`).
     MissingDigest { hash: String, size: i64 },
+    /// The error refers to several CAS blobs that could not be located, each
+    /// a `(hash, size)` the client should re-upload. Converting the error
+    /// into a `google.rpc.Status` attaches a `PreconditionFailure` with one
+    /// `MISSING` violation per blob.
+    MissingDigests(Vec<(String, i64)>),
 }
 
 #[derive(Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -194,12 +199,40 @@ impl Error {
 
 impl core::error::Error for Error {}
 
+/// `PreconditionFailure.violations.type` of a blob the client has to upload,
+/// and the `google.protobuf.Any` type URL of the detail that carries them.
+const VIOLATION_TYPE_MISSING: &str = "MISSING";
+const PRECONDITION_FAILURE_TYPE_URL: &str = "type.googleapis.com/google.rpc.PreconditionFailure";
+
 impl From<Error> for nativelink_proto::google::rpc::Status {
     fn from(val: Error) -> Self {
+        use nativelink_proto::google::rpc::{PreconditionFailure, precondition_failure};
+        use prost::Message as _;
+
+        let details = match &val.context {
+            ErrorContext::MissingDigests(digests) if !digests.is_empty() => {
+                let failure = PreconditionFailure {
+                    violations: digests
+                        .iter()
+                        .map(|(hash, size)| precondition_failure::Violation {
+                            r#type: VIOLATION_TYPE_MISSING.to_owned(),
+                            // The `REv2` subject of a missing blob.
+                            subject: format!("blobs/{hash}/{size}"),
+                            description: String::new(),
+                        })
+                        .collect(),
+                };
+                vec![prost_types::Any {
+                    type_url: PRECONDITION_FAILURE_TYPE_URL.to_owned(),
+                    value: failure.encode_to_vec(),
+                }]
+            }
+            _ => vec![],
+        };
         Self {
             code: val.code as i32,
             message: val.message_string(),
-            details: vec![],
+            details,
         }
     }
 }

@@ -36,8 +36,11 @@
 //!   `Internal`, without trying the remaining URIs, and the error carries the
 //!   exit code and the start of the command's stderr.
 //!
-//! A template that is missing from the CAS or malformed fails the request
-//! before anything is downloaded.
+//! A template that is malformed fails the request (`InvalidArgument`) before
+//! anything is downloaded, and so does one with blobs missing from the CAS:
+//! `FailedPrecondition`, with a `google.rpc.PreconditionFailure` detail that
+//! has one `MISSING` violation, subject `blobs/<hash>/<size>`, for each blob
+//! the client has to upload before it retries.
 //!
 //! The server knows nothing about the format being checked; the expected
 //! value is part of the command. Since the qualifier is part of the asset's
@@ -49,7 +52,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
+use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err, make_input_err};
 use nativelink_proto::build::bazel::remote::execution::v2::{
     Action, Command, Directory, DirectoryNode,
 };
@@ -157,13 +160,21 @@ impl ActionVerifier {
     /// Reads the action `digest` and what it refers to from the CAS. A
     /// missing blob is `FailedPrecondition`, so the client can upload it and
     /// retry; a malformed template is `InvalidArgument`.
+    ///
+    /// The error for a missing blob carries a `PreconditionFailure` detail
+    /// naming every blob that could be found missing in one pass. Each blob
+    /// can only be read once the ones that point at it are, so that is the
+    /// action alone, then its command and input root together, then the first
+    /// missing directory along the graft path.
     async fn load_template(&self, digest: DigestInfo) -> Result<Template, Error> {
         let action: Action = self.get(digest, "action").await?;
         let command_digest = required_digest(action.command_digest.as_ref(), "command_digest")?;
         let input_root_digest =
             required_digest(action.input_root_digest.as_ref(), "input_root_digest")?;
-        let command: Command = self.get(command_digest, "command").await?;
-        let root: Directory = self.get(input_root_digest, "input root").await?;
+        let (command, root) = both(
+            self.get::<Command>(command_digest, "command").await,
+            self.get::<Directory>(input_root_digest, "input root").await,
+        )?;
 
         // As the execution service does: the action's platform, else the
         // command's.
@@ -253,6 +264,10 @@ impl ActionVerifier {
                         "The verification {what} {digest} is not in the CAS; upload the action, \
                          its command and its input root before fetching"
                     )
+                    .with_context(ErrorContext::MissingDigests(vec![(
+                        digest.packed_hash().to_string(),
+                        i64::try_from(digest.size_bytes()).unwrap_or(i64::MAX),
+                    )]))
                 } else {
                     err
                 }
@@ -516,6 +531,24 @@ impl Fetcher for ActionVerifier {
         }
         Err(last_mismatch
             .unwrap_or_else(|| make_err!(Code::NotFound, "No URIs available to fetch")))
+    }
+}
+
+/// Both results' values, or the error of a failed one. When both failed
+/// because of missing blobs, one error names all of them.
+fn both<A, B>(a: Result<A, Error>, b: Result<B, Error>) -> Result<(A, B), Error> {
+    match (a, b) {
+        (Ok(a), Ok(b)) => Ok((a, b)),
+        (Err(err), Ok(_)) | (Ok(_), Err(err)) => Err(err),
+        (Err(mut a), Err(b)) => {
+            if let (ErrorContext::MissingDigests(mine), ErrorContext::MissingDigests(theirs)) =
+                (&mut a.context, &b.context)
+            {
+                mine.extend(theirs.iter().cloned());
+                a.messages.extend(b.messages);
+            }
+            Err(a)
+        }
     }
 }
 

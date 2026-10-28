@@ -19,9 +19,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nativelink_config::cas_server::{FetchConfig, WithInstanceName};
-use nativelink_config::fetchers::{BackgroundSpec, FetcherSpec, MetadataCacheSpec, UrlFetcherSpec};
+use nativelink_config::fetchers::{
+    ActionVerifySpec, BackgroundSpec, FetcherSpec, MetadataCacheSpec, UrlFetcherSpec,
+};
 use nativelink_config::stores::{CompletenessCheckingSpec, MemorySpec, RefSpec, StoreSpec};
-use nativelink_error::Error;
+use nativelink_error::{Code as ErrorCode, Error, make_err};
 use nativelink_fetch::fetcher::Fetcher;
 use nativelink_fetch::fetcher_factory::fetcher_factory;
 use nativelink_fetch::remote_asset_proto::{
@@ -29,28 +31,38 @@ use nativelink_fetch::remote_asset_proto::{
     write_remote_asset_entry,
 };
 use nativelink_macro::nativelink_test;
+use nativelink_metric::{
+    MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+};
 use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::Fetch;
 use nativelink_proto::build::bazel::remote::asset::v1::{
     FetchBlobRequest, FetchBlobResponse, FetchDirectoryRequest, FetchDirectoryResponse, Qualifier,
 };
+use nativelink_proto::build::bazel::remote::execution::v2::command::EnvironmentVariable;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    ActionResult, Digest, Directory, DirectoryNode, FileNode, Tree, digest_function,
+    Action, ActionResult, Command, Digest, Directory, DirectoryNode, FileNode, Tree,
+    digest_function,
 };
-use nativelink_proto::google::rpc::{BadRequest, ErrorInfo, Status as GoogleStatus};
+use nativelink_proto::google::rpc::{
+    BadRequest, ErrorInfo, PreconditionFailure, Status as GoogleStatus,
+};
 use nativelink_service::fetch_server::{FetchServer, parse_grpc_timeout};
 use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::store_manager::StoreManager;
+use nativelink_util::action_messages::{ActionInfo, OperationId};
 use nativelink_util::background_spawn;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
-use nativelink_util::operation_state_manager::ClientStateManager;
+use nativelink_util::operation_state_manager::{
+    ActionStateResult, ActionStateResultStream, ClientStateManager, OperationFilter,
+};
 use nativelink_util::store_trait::{Store, StoreLike};
 use parking_lot::Mutex;
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tonic::{Code, Request, Status};
+use tonic::{Code, Request, Status, async_trait};
 
 /// Builds the stores a fetch service uses: a CAS, an Action Cache, and the
 /// fetch store, which is that Action Cache wrapped in a `completeness_checking`
@@ -4103,5 +4115,220 @@ async fn test_malformed_archive_is_a_fetch_failure_not_an_invalid_request() -> R
         "{response:?}"
     );
     assert!(response.root_directory_digest.is_none());
+    Ok(())
+}
+
+/// A scheduler for fetchers that must not reach it: a missing verification
+/// template fails before anything is scheduled.
+#[derive(Debug)]
+struct UnusedScheduler;
+
+impl MetricsComponent for UnusedScheduler {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+#[async_trait]
+impl ClientStateManager for UnusedScheduler {
+    async fn add_action(
+        &self,
+        _client_operation_id: OperationId,
+        _action_info: Arc<ActionInfo>,
+    ) -> Result<Box<dyn ActionStateResult>, Error> {
+        Err(make_err!(
+            ErrorCode::Unimplemented,
+            "no scheduler in this test"
+        ))
+    }
+
+    async fn filter_operations(
+        &self,
+        _filter: OperationFilter,
+    ) -> Result<ActionStateResultStream, Error> {
+        Err(make_err!(
+            ErrorCode::Unimplemented,
+            "no scheduler in this test"
+        ))
+    }
+}
+
+/// A `FetchServer` whose fetcher is an `action_verify` over a `url` fetcher.
+fn make_action_verify_server(store_manager: &StoreManager) -> FetchServer {
+    let mut schedulers: HashMap<String, Arc<dyn ClientStateManager>> = HashMap::new();
+    schedulers.insert("SCHEDULER".to_string(), Arc::new(UnusedScheduler));
+    let mut fetchers: HashMap<String, Arc<dyn Fetcher>> = HashMap::new();
+    let url = fetcher_factory(
+        &FetcherSpec::Url(UrlFetcherSpec {
+            cas_store: String::from("test_cas_store"),
+            temp_path: None,
+            max_size_bytes: None,
+            archive_entry_inline_threshold_bytes: None,
+            max_archive_entries: None,
+            max_archive_uncompressed_bytes: None,
+            ..Default::default()
+        }),
+        store_manager,
+        &schedulers,
+        &fetchers,
+    )
+    .expect("failed to build url fetcher");
+    fetchers.insert("URL".to_string(), url);
+    let verify = fetcher_factory(
+        &FetcherSpec::ActionVerify(ActionVerifySpec {
+            fetcher: String::from("URL"),
+            cas_store: String::from("test_cas_store"),
+            scheduler: String::from("SCHEDULER"),
+            instance_name: String::new(),
+        }),
+        store_manager,
+        &schedulers,
+        &fetchers,
+    )
+    .expect("failed to build action_verify fetcher");
+    fetchers.insert("VERIFY".to_string(), verify);
+    FetchServer::new(
+        &[WithInstanceName {
+            instance_name: "foo_instance_name".to_string(),
+            config: FetchConfig {
+                fetch_store: String::from("test_fetch_store"),
+                fetcher: Some(String::from("VERIFY")),
+            },
+        }],
+        &fetchers,
+        store_manager,
+    )
+    .expect("FetchServer config error")
+}
+
+/// The `subject`s of the `MISSING` violations in the `PreconditionFailure`
+/// detail of `status`, decoded from the wire form.
+fn missing_subjects(status: &GoogleStatus) -> Vec<String> {
+    let detail = status
+        .details
+        .iter()
+        .find(|detail| detail.type_url == "type.googleapis.com/google.rpc.PreconditionFailure")
+        .unwrap_or_else(|| panic!("no PreconditionFailure detail: {status:?}"));
+    let failure = PreconditionFailure::decode(detail.value.as_slice()).unwrap();
+    assert!(
+        failure
+            .violations
+            .iter()
+            .all(|violation| violation.r#type == "MISSING"),
+        "{failure:?}"
+    );
+    let mut subjects: Vec<String> = failure
+        .violations
+        .into_iter()
+        .map(|violation| violation.subject)
+        .collect();
+    subjects.sort();
+    subjects
+}
+
+fn blob_subject(digest: &Digest) -> String {
+    format!("blobs/{}/{}", digest.hash, digest.size_bytes)
+}
+
+/// Fetches a directory with `action` as its `checksum.action_digest`.
+async fn fetch_with_action(fs: &FetchServer, action: &Digest) -> FetchDirectoryResponse {
+    fs.fetch_directory(directory_request_with(
+        vec!["http://example.invalid/dir".to_owned()],
+        vec![header_qualifier(
+            "checksum.action_digest",
+            &format!("{}/{}", action.hash, action.size_bytes),
+        )],
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+}
+
+/// A verification template with blobs missing from the CAS fails the fetch
+/// with a `PreconditionFailure` naming every blob to upload, so that the client
+/// can upload exactly those and retry.
+#[nativelink_test]
+async fn test_fetch_directory_missing_template_blobs_are_a_precondition_failure()
+-> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_action_verify_server(&store_manager);
+    let cas = store_manager.get_store("test_cas_store").unwrap();
+    let absent = |data: &[u8]| -> Digest { sha256_digest_of(data).into() };
+
+    // The action itself is missing: it is the only blob that can be named.
+    let action_digest = absent(b"no such action");
+    let response = fetch_with_action(&fs, &action_digest).await;
+    let status = response.status.as_ref().expect("response has no status");
+    assert_eq!(
+        status.code,
+        i32::from(Code::FailedPrecondition),
+        "{status:?}"
+    );
+    assert_eq!(missing_subjects(status), vec![blob_subject(&action_digest)]);
+    // The detail does not displace the reason clients branch on.
+    assert!(
+        status
+            .details
+            .iter()
+            .any(|detail| detail.type_url == "type.googleapis.com/google.rpc.ErrorInfo"),
+        "{status:?}"
+    );
+
+    // The action is there but its command and its input root are not: both
+    // are named at once.
+    let (command, root) = (absent(b"no such command"), absent(b"no such root"));
+    let action = Action {
+        command_digest: Some(command.clone()),
+        input_root_digest: Some(root.clone()),
+        ..Default::default()
+    };
+    let action_digest = put_blob(&cas, &action.encode_to_vec()).await;
+    let response = fetch_with_action(&fs, &action_digest).await;
+    let status = response.status.as_ref().expect("response has no status");
+    assert_eq!(
+        status.code,
+        i32::from(Code::FailedPrecondition),
+        "{status:?}"
+    );
+    let mut want = vec![blob_subject(&command), blob_subject(&root)];
+    want.sort();
+    assert_eq!(missing_subjects(status), want);
+
+    // The command and the input root are there but a directory on the way to
+    // where the fetched tree goes is not.
+    let subdirectory = absent(b"no such directory");
+    let root = Directory {
+        directories: vec![DirectoryNode {
+            name: "bin".to_owned(),
+            digest: Some(subdirectory.clone()),
+        }],
+        ..Default::default()
+    };
+    let root = put_blob(&cas, &root.encode_to_vec()).await;
+    let command = Command {
+        environment_variables: vec![EnvironmentVariable {
+            name: "NATIVELINK_FETCHED_DIRECTORY".to_owned(),
+            value: "bin/src".to_owned(),
+        }],
+        ..Default::default()
+    };
+    let action = Action {
+        command_digest: Some(put_blob(&cas, &command.encode_to_vec()).await),
+        input_root_digest: Some(root),
+        ..Default::default()
+    };
+    let action_digest = put_blob(&cas, &action.encode_to_vec()).await;
+    let response = fetch_with_action(&fs, &action_digest).await;
+    let status = response.status.as_ref().expect("response has no status");
+    assert_eq!(
+        status.code,
+        i32::from(Code::FailedPrecondition),
+        "{status:?}"
+    );
+    assert_eq!(missing_subjects(status), vec![blob_subject(&subdirectory)]);
     Ok(())
 }

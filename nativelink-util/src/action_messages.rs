@@ -932,7 +932,8 @@ pub fn to_execute_response(action_result: ActionResult) -> ExecuteResponse {
                     let (hash, size) = (hash.clone(), *size);
                     missing_blob_failed_precondition_status(&err, &hash, size)
                 }
-                ErrorContext::None => err.into(),
+                // Only the fetch verifier lists several; no worker does.
+                ErrorContext::None | ErrorContext::MissingDigests(_) => err.into(),
             })
             .unwrap_or_default(),
     );
