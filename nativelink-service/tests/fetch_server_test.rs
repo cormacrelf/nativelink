@@ -2264,6 +2264,8 @@ async fn write_entry(
             stored_at,
             digest_function: 0,
             tree_digest: None,
+            etag: None,
+            last_modified: None,
         },
     )
     .await
@@ -4492,5 +4494,157 @@ async fn test_fetch_blob_pinned_entry_ignores_the_origins_max_age() -> Result<()
     assert_eq!(second.status.as_ref().map(|s| s.code), Some(0));
     assert_eq!(second.expires_at, None);
     assert_eq!(requests.lock().len(), 1, "a pinned entry never expires");
+    Ok(())
+}
+
+/// Spawns an origin that serves `body` with `ETag: "v1"` and
+/// `Cache-Control: max-age=1`, and answers a request carrying
+/// `If-None-Match: "v1"` with `304`, as long as `current` is set. Returns the
+/// URL and every request seen.
+async fn serve_validating(
+    body: Vec<u8>,
+    current: Arc<core::sync::atomic::AtomicBool>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    background_spawn!("fetch_test_validating_http_server", async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 2048];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+            }
+            let request = String::from_utf8_lossy(&request).to_lowercase();
+            let not_modified = request.contains("if-none-match: \"v1\"")
+                && current.load(core::sync::atomic::Ordering::SeqCst);
+            recorded.lock().push(request);
+            let response = if not_modified {
+                "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nCache-Control: max-age=1\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nCache-Control: max-age=1\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+            };
+            socket.write_all(response.as_bytes()).await.unwrap();
+            if !not_modified {
+                socket.write_all(&body).await.unwrap();
+            }
+            socket.flush().await.unwrap();
+        }
+    });
+    (format!("http://{addr}/blob"), requests)
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_stale_unpinned_entry_is_revalidated() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_short_ttl_server(&store_manager);
+    let current = Arc::new(core::sync::atomic::AtomicBool::new(true));
+    let (uri, requests) = serve_validating(HELLO_WORLD.to_vec(), current.clone()).await;
+
+    let first = fs
+        .fetch_blob(plain_blob_request(&uri, vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(first.status.as_ref().map(|s| s.code), Some(0));
+    assert!(!requests.lock()[0].contains("if-none-match"));
+
+    // Expired: asked whether it is still current, and it is.
+    tokio::time::sleep(core::time::Duration::from_millis(1200)).await;
+    let second = fs
+        .fetch_blob(plain_blob_request(&uri, vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(second.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(second.blob_digest, first.blob_digest);
+    assert!(requests.lock()[1].contains("if-none-match: \"v1\""));
+    assert!(second.expires_at.unwrap().seconds > first.expires_at.unwrap().seconds);
+
+    // The entry was rewritten with a new expiry, so it is fresh again.
+    fs.fetch_blob(plain_blob_request(&uri, vec![])).await?;
+    assert_eq!(requests.lock().len(), 2);
+
+    // Once the content changes, a revalidation downloads it.
+    tokio::time::sleep(core::time::Duration::from_millis(1200)).await;
+    current.store(false, core::sync::atomic::Ordering::SeqCst);
+    let fourth = fs
+        .fetch_blob(plain_blob_request(&uri, vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(fourth.blob_digest, first.blob_digest);
+    let requests = requests.lock();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].contains("if-none-match: \"v1\""));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_revalidated_content_gone_from_the_cas_is_downloaded() -> Result<(), Status>
+{
+    let store_manager = make_store_manager().await?;
+    let fs = make_short_ttl_server(&store_manager);
+    let current = Arc::new(core::sync::atomic::AtomicBool::new(true));
+    let (uri, requests) = serve_validating(HELLO_WORLD.to_vec(), current).await;
+    let first = fs
+        .fetch_blob(plain_blob_request(&uri, vec![]))
+        .await?
+        .into_inner();
+    let digest = first.blob_digest.unwrap();
+
+    // The stale entry reads as a miss through the completeness-checking fetch
+    // store once its content is gone, so there is nothing to revalidate; the
+    // content comes back all the same.
+    tokio::time::sleep(core::time::Duration::from_millis(1200)).await;
+    evict(&store_manager, &digest).await;
+    let second = fs
+        .fetch_blob(plain_blob_request(&uri, vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(second.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(second.blob_digest, Some(digest.clone()));
+    assert_eq!(requests.lock().len(), 2);
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    assert!(
+        cas_store
+            .has(DigestInfo::try_from(&digest).unwrap())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_pinned_request_never_revalidates() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_short_ttl_server(&store_manager);
+    let current = Arc::new(core::sync::atomic::AtomicBool::new(true));
+    let (uri, requests) = serve_validating(HELLO_WORLD.to_vec(), current).await;
+    let qualifiers = vec![Qualifier {
+        name: "checksum.sri".to_string(),
+        value: sri_of(HELLO_WORLD),
+    }];
+    fs.fetch_blob(plain_blob_request(&uri, qualifiers.clone()))
+        .await?;
+    tokio::time::sleep(core::time::Duration::from_millis(1200)).await;
+
+    // Too old for the client, but pinned: downloaded again, with no
+    // conditional request, though the origin sent an ETag the first time.
+    let mut request = plain_blob_request(&uri, qualifiers);
+    request.get_mut().oldest_content_accepted = Some(now_timestamp());
+    let response = fs.fetch_blob(request).await?.into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    let requests = requests.lock();
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[1].contains("if-none-match"));
     Ok(())
 }

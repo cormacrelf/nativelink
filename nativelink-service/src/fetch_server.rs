@@ -24,7 +24,8 @@ use nativelink_config::cas_server::{FetchConfig, WithInstanceName};
 use nativelink_error::{Error, ResultExt, make_input_err};
 use nativelink_fetch::action_verifier::{QUALIFIER_CHECKSUM_ACTION_DIGEST, parse_action_digest};
 use nativelink_fetch::fetcher::{
-    DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchHeaders, Fetcher,
+    DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchHeaders, Fetcher, Revalidation,
+    Validators,
 };
 use nativelink_fetch::remote_asset_proto::{
     AssetKind, QUALIFIER_BAZEL_CANONICAL_ID, QUALIFIER_HTTP_HEADER_PREFIX,
@@ -42,6 +43,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::Digest;
 use nativelink_proto::google::rpc::bad_request::FieldViolation;
 use nativelink_proto::google::rpc::{BadRequest, ErrorInfo, Status as GoogleStatus};
 use nativelink_store::store_manager::StoreManager;
+use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasherFunc, make_ctx_for_hash_func};
 use nativelink_util::redact::{redact_uri, redact_uris_in_text};
 use nativelink_util::sri::{
@@ -270,26 +272,46 @@ fn is_current(
     }
 }
 
-/// Looks up the cached entry for `query` in `store`, returning it only if it
-/// may be served at `now`. Anything else (no entry, an unreadable store, an
-/// expired or too old entry) is a miss, not a reason to fail the request.
+/// What the cache has for a URI.
+enum Lookup {
+    /// An entry that may be served.
+    Hit(RemoteAssetEntry),
+    /// An entry that is expired or too old for the request but has validators,
+    /// so the origin can be asked whether its content is still current. Not a
+    /// hit: it is only ever passed on to the fetcher.
+    Stale(Revalidation),
+    /// Nothing usable.
+    Miss,
+}
+
+/// Looks up the cached entry for `query` in `store`. An entry that may be
+/// served at `now` is a [`Lookup::Hit`]. An expired or too old one is
+/// [`Lookup::Stale`] if it has validators, else a miss, as is anything else (no
+/// entry, an unreadable store): never a reason to fail the request. Whether a
+/// stale entry is used is up to the caller: only an unpinned request, one whose
+/// content is not fixed by a checksum, revalidates.
+///
+/// A too old entry is revalidated as well as an expired one: the request asks
+/// for content at least as new as `oldest_content_accepted`, and an origin that
+/// says nothing has changed since the entry was stored has shown it current as
+/// of now, which is as new as anything it could serve.
 async fn lookup_entry(
     store: &Store,
     query: &RemoteAssetQuery,
     digest_function: i32,
     oldest_content_accepted: Option<&Timestamp>,
     now: &Timestamp,
-) -> Option<RemoteAssetEntry> {
+) -> Lookup {
     let entry = match read_remote_asset_entry(store, query, digest_function).await {
         Ok(Some(entry)) => entry,
-        Ok(None) => return None,
+        Ok(None) => return Lookup::Miss,
         Err(err) => {
             warn!(
                 uri = %redact_uri(&query.uri),
                 ?err,
                 "Failed to read fetch asset metadata"
             );
-            return None;
+            return Lookup::Miss;
         }
     };
     if !is_current(
@@ -302,9 +324,28 @@ async fn lookup_entry(
             uri = %redact_uri(&query.uri),
             "Cached fetch asset is expired or too old"
         );
+        return match stale_revalidation(&entry) {
+            Some(revalidation) => Lookup::Stale(revalidation),
+            None => Lookup::Miss,
+        };
+    }
+    Lookup::Hit(entry)
+}
+
+/// What to revalidate the stale `entry` with, if it has validators.
+fn stale_revalidation(entry: &RemoteAssetEntry) -> Option<Revalidation> {
+    let validators = Validators {
+        etag: entry.etag.clone(),
+        last_modified: entry.last_modified.clone(),
+    };
+    if validators.is_empty() {
         return None;
     }
-    Some(entry)
+    Some(Revalidation {
+        uri: entry.query.uri.clone(),
+        digest: DigestInfo::try_from(&entry.digest).ok()?,
+        validators,
+    })
 }
 
 /// Returns the value of the qualifier named `name`, if present.
@@ -467,17 +508,26 @@ impl FetchServer {
             );
         }
         let now = now_timestamp();
+        let mut stale = Vec::new();
         for uri in &request.uris {
             let query =
                 RemoteAssetQuery::new(AssetKind::Blob, uri.clone(), request.qualifiers.clone());
-            let entry = lookup_entry(
+            let entry = match lookup_entry(
                 &store_info.store,
                 &query,
                 request.digest_function,
                 request.oldest_content_accepted.as_ref(),
                 &now,
             )
-            .await;
+            .await
+            {
+                Lookup::Hit(entry) => Some(entry),
+                Lookup::Stale(revalidation) => {
+                    stale.push(revalidation);
+                    None
+                }
+                Lookup::Miss => None,
+            };
             debug!(
                 uri = %redact_uri(uri),
                 hit = entry.is_some(),
@@ -526,14 +576,20 @@ impl FetchServer {
             let hasher_func = DigestHasherFunc::try_from(request.digest_function)
                 .err_tip(|| "In FetchServer::inner_fetch_blob")?;
             checksums.extend(sri_checksum(&request.qualifiers)?);
-            let job = FetchBlobTask {
+            let mut job = FetchBlobTask {
                 uris: request.uris.clone(),
                 qualifiers: qualifier_pairs(&request.qualifiers),
                 checksums,
                 hasher_func,
                 timeout: request_timeout(request.timeout.as_ref()),
                 headers,
+                revalidate: Vec::new(),
             };
+            // Only an unpinned request revalidates: a pinned one has its
+            // content fixed by its checksum.
+            if !job.is_pinned() {
+                job.revalidate = stale;
+            }
             // The fetcher (via MetadataCache) caches the asset metadata itself;
             // here we only shape the response.
             info!("Asset is not cached, fetching it");
@@ -544,7 +600,7 @@ impl FetchServer {
                         uri = %redact_uri(&outcome.uri),
                         digest = %proto_digest.hash,
                         size_bytes = proto_digest.size_bytes,
-                        source = "download",
+                        source = if outcome.revalidated { "revalidated" } else { "download" },
                         duration = ?start.elapsed(),
                         "Fetched asset"
                     );
@@ -625,20 +681,29 @@ impl FetchServer {
         }
         let now = now_timestamp();
 
+        let mut stale = Vec::new();
         for uri in &request.uris {
             let query = RemoteAssetQuery::new(
                 AssetKind::Directory,
                 uri.clone(),
                 request.qualifiers.clone(),
             );
-            let entry = lookup_entry(
+            let entry = match lookup_entry(
                 &store_info.store,
                 &query,
                 request.digest_function,
                 request.oldest_content_accepted.as_ref(),
                 &now,
             )
-            .await;
+            .await
+            {
+                Lookup::Hit(entry) => Some(entry),
+                Lookup::Stale(revalidation) => {
+                    stale.push(revalidation);
+                    None
+                }
+                Lookup::Miss => None,
+            };
             debug!(
                 uri = %redact_uri(uri),
                 hit = entry.is_some(),
@@ -702,7 +767,7 @@ impl FetchServer {
         let hasher_func = DigestHasherFunc::try_from(request.digest_function)
             .err_tip(|| "In FetchServer::inner_fetch_directory")?;
         checksums.extend(sri_checksum(&request.qualifiers)?.map(DirectoryChecksum::Bytes));
-        let job = FetchDirectoryJob {
+        let mut job = FetchDirectoryJob {
             verified_by_action: false,
             uris: request.uris.clone(),
             qualifiers: qualifier_pairs(&request.qualifiers),
@@ -710,7 +775,12 @@ impl FetchServer {
             hasher_func,
             timeout: request_timeout(request.timeout.as_ref()),
             headers,
+            revalidate: Vec::new(),
         };
+        // Only an unpinned request revalidates, as for a blob.
+        if !job.is_pinned() {
+            job.revalidate = stale;
+        }
         // The fetcher (via MetadataCache) caches the directory metadata
         // itself; here we only shape the response.
         info!("Directory is not cached, fetching it");
@@ -721,7 +791,7 @@ impl FetchServer {
                     uri = %redact_uri(&outcome.uri),
                     digest = %proto_digest.hash,
                     size_bytes = proto_digest.size_bytes,
-                    source = "download",
+                    source = if outcome.revalidated { "revalidated" } else { "download" },
                     duration = ?start.elapsed(),
                     "Fetched directory"
                 );

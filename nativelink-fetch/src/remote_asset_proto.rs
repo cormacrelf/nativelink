@@ -150,6 +150,17 @@ pub struct RemoteAssetMetadata {
     /// kept here so that serving a hit needs no read of the `Tree` from the CAS.
     #[prost(message, optional, tag = "5")]
     pub root_directory_digest: Option<Digest>,
+
+    /// The `ETag` of the response the content came from, empty when it had
+    /// none. Sent back as `If-None-Match` to revalidate the entry once it is
+    /// stale. Entries written before this field existed decode with it empty.
+    #[prost(string, tag = "6")]
+    pub etag: String,
+
+    /// The `Last-Modified` of the response the content came from, empty when it
+    /// had none. Sent back as `If-Modified-Since` to revalidate the entry.
+    #[prost(string, tag = "7")]
+    pub last_modified: String,
 }
 
 /// The identity of an asset: its kind, URI and qualifiers. HTTP header
@@ -234,6 +245,11 @@ pub struct RemoteAssetEntry {
     /// `Tree` in the CAS. Ignored on write, which builds and uploads the `Tree`
     /// itself.
     pub tree_digest: Option<Digest>,
+    /// The `ETag` the origin gave the content, if any: what a stale unpinned
+    /// entry is revalidated with. Only entries the `url` fetcher wrote have it.
+    pub etag: Option<String>,
+    /// The `Last-Modified` the origin gave the content, if any.
+    pub last_modified: Option<String>,
 }
 
 /// The digests of the subdirectories of `directory` that are not in `seen`,
@@ -348,6 +364,8 @@ pub async fn write_remote_asset_entry(
         expire_at: entry.expire_at,
         digest_function: hasher_func.proto_digest_func().into(),
         root_directory_digest,
+        etag: entry.etag.clone().unwrap_or_default(),
+        last_modified: entry.last_modified.clone().unwrap_or_default(),
     };
     let action_result = ActionResult {
         output_files,
@@ -430,5 +448,7 @@ fn entry_from_action_result(
         stored_at: execution_metadata.worker_start_timestamp,
         digest_function: metadata.digest_function,
         tree_digest,
+        etag: Some(metadata.etag).filter(|etag| !etag.is_empty()),
+        last_modified: Some(metadata.last_modified).filter(|value| !value.is_empty()),
     })
 }

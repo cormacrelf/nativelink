@@ -162,6 +162,49 @@ impl FetchHeaders {
     }
 }
 
+/// The validators an origin gave a response, which let it be revalidated
+/// later with a conditional request instead of downloaded again. Opaque
+/// strings, stored and sent back as the origin gave them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Validators {
+    /// The `ETag`, sent back as `If-None-Match`.
+    pub etag: Option<String>,
+    /// The `Last-Modified`, sent back as `If-Modified-Since`.
+    pub last_modified: Option<String>,
+}
+
+impl Validators {
+    /// Whether there is nothing to revalidate with.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none()
+    }
+}
+
+/// A stale cached answer for one URI of an unpinned request, offered to the
+/// fetcher so that it can ask the origin whether the content is still current
+/// (`If-None-Match` / `If-Modified-Since`) rather than download it again. If
+/// the origin says it is (`304 Not Modified`) and the content is still
+/// complete in the CAS, the fetch returns `digest` without downloading;
+/// otherwise it proceeds as if there were no cached answer.
+///
+/// Like [`FetchHeaders`] it is a parameter of the request, not part of its
+/// identity: it is excluded from `Hash`/`Eq`, so it cannot make identical
+/// requests stop sharing an in-flight fetch. Which of two concurrent callers'
+/// stale entries the shared fetch revalidates is immaterial: both name the
+/// same URI, and a `304` or a `200` answers both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revalidation {
+    /// The URI the stale answer was stored for; the fetcher uses it only for
+    /// that URI.
+    pub uri: String,
+    /// The CAS digest of the stale answer: of the blob, or of the root
+    /// `Directory`.
+    pub digest: DigestInfo,
+    /// What to revalidate with. Never empty.
+    pub validators: Validators,
+}
+
 /// A request to fetch a single blob from one of `uris`.
 ///
 /// `Hash`/`Eq` (implemented manually) define the in-flight deduplication
@@ -196,6 +239,9 @@ pub struct FetchBlobTask {
     /// HTTP headers to send to the origin. Not part of the deduplication
     /// identity.
     pub headers: FetchHeaders,
+    /// Stale cached answers to revalidate, for an unpinned request. Not part of
+    /// the deduplication identity.
+    pub revalidate: Vec<Revalidation>,
 }
 
 /// A request to fetch a directory (a zip, tar or tar.gz archive) from one of
@@ -229,6 +275,9 @@ pub struct FetchDirectoryJob {
     /// HTTP headers to send to the origin. Not part of the deduplication
     /// identity.
     pub headers: FetchHeaders,
+    /// Stale cached answers to revalidate, for an unpinned request. Not part of
+    /// the deduplication identity.
+    pub revalidate: Vec<Revalidation>,
 }
 
 /// Returns `qualifiers` sorted by `(name, value)`, the canonical order used for
@@ -320,10 +369,16 @@ pub struct FetchOutcome {
     /// [`crate::metadata_cache::MetadataCache`]. `None` for content that does
     /// not expire.
     pub expire_at: Option<Timestamp>,
+    /// The `ETag` and `Last-Modified` of the final response, stored so a stale
+    /// entry can be revalidated. Empty for a pushed or pinned answer.
+    pub validators: Validators,
+    /// Whether the origin confirmed the content a [`Revalidation`] offered
+    /// still current, so nothing was downloaded.
+    pub revalidated: bool,
 }
 
 impl FetchOutcome {
-    /// An outcome with no freshness information and no expiry.
+    /// An outcome with no freshness information, validators or expiry.
     #[must_use]
     pub const fn new(uri: String, digest: DigestInfo) -> Self {
         Self {
@@ -331,6 +386,11 @@ impl FetchOutcome {
             digest,
             freshness: None,
             expire_at: None,
+            validators: Validators {
+                etag: None,
+                last_modified: None,
+            },
+            revalidated: false,
         }
     }
 }

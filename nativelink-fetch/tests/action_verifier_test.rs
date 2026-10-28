@@ -311,6 +311,7 @@ fn job(uris: &[&str], checksums: Vec<DirectoryChecksum>) -> FetchDirectoryJob {
         hasher_func: HASHER,
         timeout: None,
         headers: FetchHeaders::default(),
+        revalidate: vec![],
     }
 }
 

@@ -27,6 +27,7 @@
 
 use core::future::Future;
 use core::time::Duration;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
@@ -39,7 +40,11 @@ use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::fs;
 use nativelink_util::redact::{redact_uri, redact_uris_in_text};
 use nativelink_util::sri::{ByteChecksum, ChecksumVerifier};
-use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
+use nativelink_util::store_trait::{Store, StoreKey, StoreLike, UploadSizeInfo};
+use reqwest::StatusCode;
+use reqwest::header::{
+    ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
+};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::StreamReader;
 use tonic::{Code, async_trait};
@@ -48,8 +53,12 @@ use tracing::{debug, info};
 use crate::archive_expander::{
     ArchiveLimits, ArchiveOptions, DEFAULT_INLINE_THRESHOLD, extract_archive,
 };
-use crate::fetcher::{DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher};
+use crate::fetcher::{
+    DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher, Revalidation,
+    Validators,
+};
 use crate::http_cache::freshness_lifetime;
+use crate::remote_asset_proto::build_tree;
 use crate::tree_hash::{TreeHashContext, TreeHashFailure, TreeHashSet};
 
 /// Default connect timeout applied to all origin fetches. Guards against
@@ -167,14 +176,71 @@ fn check_size_limit(uri: &str, size: u64, max_size_bytes: Option<u64>) -> Result
     }
 }
 
+/// What the headers of the final response (after any redirects) say about the
+/// content: how long it stays fresh, and the validators to revalidate it with.
+#[derive(Debug, Default)]
+struct ResponseMeta {
+    freshness: Option<Duration>,
+    validators: Validators,
+}
+
+impl ResponseMeta {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let text = |name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        Self {
+            freshness: freshness_lifetime(headers, SystemTime::now()),
+            validators: Validators {
+                etag: text(ETAG),
+                last_modified: text(LAST_MODIFIED),
+            },
+        }
+    }
+}
+
+/// A request to an origin, and whether it is conditional (carries
+/// `If-None-Match` and/or `If-Modified-Since`), which decides what a `304`
+/// means.
+struct OriginRequest {
+    builder: reqwest::RequestBuilder,
+    conditional: bool,
+}
+
+/// What a `304 Not Modified` response amounts to: `NotModified` for a
+/// conditional request, where it is the answer asked for, and a failure for an
+/// unconditional one, where it is a server error that must not be mistaken for
+/// an empty body.
+fn not_modified_attempt(
+    response: &reqwest::Response,
+    uri: &str,
+    conditional: bool,
+) -> FetchAttempt {
+    if conditional {
+        FetchAttempt::NotModified(ResponseMeta::from_headers(response.headers()))
+    } else {
+        FetchAttempt::DownloadFailed(make_err!(
+            Code::NotFound,
+            "'{uri}' answered 304 Not Modified to a request that was not conditional"
+        ))
+    }
+}
+
 /// The outcome of attempting to download and hash a single URI.
 enum FetchAttempt {
     /// The content was downloaded and its checksum (if any) verified. For a
     /// blob it was streamed to the temp file and its CAS digest computed; for a
     /// directory it was expanded into the CAS. Carries the CAS digest (of the
-    /// blob, or of the root `Directory`) and the freshness lifetime the final
-    /// response's headers gave (see [`freshness_lifetime`]).
-    Verified(DigestInfo, Option<Duration>),
+    /// blob, or of the root `Directory`) and what the final response's headers
+    /// said about it.
+    Verified(DigestInfo, ResponseMeta),
+    /// The origin answered a conditional request with `304 Not Modified`: the
+    /// content offered by a [`Revalidation`] is still current. Nothing was
+    /// downloaded.
+    NotModified(ResponseMeta),
     /// The downloaded content did not match the expected checksum. Like a
     /// download failure this is retried against the remaining URIs (a different
     /// mirror may serve correct content).
@@ -244,7 +310,7 @@ fn verify_all(verifiers: &mut [ChecksumVerifier]) -> Result<(), Error> {
 /// `Verified` the file is left flushed and rewound to the start, ready to hand
 /// to `update_with_whole_file`.
 async fn stream_uri_to_file(
-    req: reqwest::RequestBuilder,
+    req: OriginRequest,
     uri: &str,
     max_size_bytes: Option<u64>,
     verifiers: &mut [ChecksumVerifier],
@@ -257,11 +323,15 @@ async fn stream_uri_to_file(
     }
     reset_verifiers(verifiers);
 
-    let response = match send_awaiting_headers(req, uri).await {
+    let conditional = req.conditional;
+    let response = match send_awaiting_headers(req.builder, uri).await {
         Ok(response) => response,
         Err(err) => return FetchAttempt::DownloadFailed(err),
     };
-    let freshness = freshness_lifetime(response.headers(), SystemTime::now());
+    if response.status() == StatusCode::NOT_MODIFIED {
+        return not_modified_attempt(&response, uri, conditional);
+    }
+    let meta = ResponseMeta::from_headers(response.headers());
     if let Err(err) = check_size_limit(uri, response.content_length().unwrap_or(0), max_size_bytes)
     {
         return FetchAttempt::DownloadFailed(err);
@@ -320,7 +390,30 @@ async fn stream_uri_to_file(
         return FetchAttempt::DownloadFailed(err);
     }
 
-    FetchAttempt::Verified(digest, freshness)
+    FetchAttempt::Verified(digest, meta)
+}
+
+/// The outcome of a revalidation that found `stale` still current. The `304`
+/// updates what the origin says about freshness; validators it did not repeat
+/// are kept.
+fn revalidated_outcome(uri: &str, stale: &Revalidation, meta: &ResponseMeta) -> FetchOutcome {
+    FetchOutcome {
+        freshness: meta.freshness,
+        validators: Validators {
+            etag: meta
+                .validators
+                .etag
+                .clone()
+                .or_else(|| stale.validators.etag.clone()),
+            last_modified: meta
+                .validators
+                .last_modified
+                .clone()
+                .or_else(|| stale.validators.last_modified.clone()),
+        },
+        revalidated: true,
+        ..FetchOutcome::new(uri.to_owned(), stale.digest)
+    }
 }
 
 /// An explicit HTTP forward proxy for a [`UrlFetcher`] to send its requests
@@ -579,6 +672,63 @@ impl UrlFetcher {
         })
     }
 
+    /// The request for `uri` (`uris[idx]` of the job), carrying the job's
+    /// headers and, when `revalidation` is given, its validators.
+    fn origin_request(
+        &self,
+        uri: &str,
+        headers: HeaderMap,
+        revalidation: Option<&Revalidation>,
+    ) -> OriginRequest {
+        let mut headers = headers;
+        let mut conditional = false;
+        if let Some(revalidation) = revalidation {
+            let validators = [
+                (IF_NONE_MATCH, &revalidation.validators.etag),
+                (IF_MODIFIED_SINCE, &revalidation.validators.last_modified),
+            ];
+            for (name, value) in validators {
+                if let Some(value) = value.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+                    headers.insert(name, value);
+                    conditional = true;
+                }
+            }
+        }
+        OriginRequest {
+            builder: self.client.get(uri).headers(headers),
+            conditional,
+        }
+    }
+
+    /// Whether the blob `digest` is still in the CAS.
+    async fn blob_is_in_cas(&self, digest: DigestInfo) -> bool {
+        matches!(self.cas_store.has(digest).await, Ok(Some(_)))
+    }
+
+    /// Whether the directory rooted at `root` is still complete in the CAS: all
+    /// of its `Directory` blobs and every file in them.
+    async fn directory_is_in_cas(&self, root: DigestInfo) -> bool {
+        let Ok(tree) = build_tree(&self.cas_store, root).await else {
+            return false;
+        };
+        let mut files = HashSet::new();
+        for directory in tree.root.iter().chain(&tree.children) {
+            for file in &directory.files {
+                match file.digest.as_ref().map(DigestInfo::try_from) {
+                    Some(Ok(digest)) => {
+                        files.insert(digest);
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        let keys: Vec<StoreKey<'_>> = files.into_iter().map(StoreKey::from).collect();
+        match self.cas_store.has_many(&keys).await {
+            Ok(found) => found.iter().all(Option::is_some),
+            Err(_) => false,
+        }
+    }
+
     /// Streams the archive at `uri` through the archive expander, which uploads its
     /// files to the CAS as they are read. Every byte of the response is counted
     /// against `max_size_bytes` and fed to `verifiers` on its way
@@ -590,7 +740,7 @@ impl UrlFetcher {
     /// retries against multiple URIs.
     async fn stream_uri_to_directory(
         &self,
-        req: reqwest::RequestBuilder,
+        req: OriginRequest,
         uri: &str,
         verifiers: &mut [ChecksumVerifier],
         checksums: &[DirectoryChecksum],
@@ -599,11 +749,15 @@ impl UrlFetcher {
         let max_size_bytes = self.max_size_bytes;
         reset_verifiers(verifiers);
 
-        let response = match send_awaiting_headers(req, uri).await {
+        let conditional = req.conditional;
+        let response = match send_awaiting_headers(req.builder, uri).await {
             Ok(response) => response,
             Err(err) => return FetchAttempt::DownloadFailed(err),
         };
-        let freshness = freshness_lifetime(response.headers(), SystemTime::now());
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return not_modified_attempt(&response, uri, conditional);
+        }
+        let meta = ResponseMeta::from_headers(response.headers());
         if let Err(err) =
             check_size_limit(uri, response.content_length().unwrap_or(0), max_size_bytes)
         {
@@ -676,7 +830,7 @@ impl UrlFetcher {
             return FetchAttempt::ChecksumMismatch(err);
         }
         match tree_hashes.finish(&tree.listing).await {
-            Ok(()) => FetchAttempt::Verified(tree.root_digest, freshness),
+            Ok(()) => FetchAttempt::Verified(tree.root_digest, meta),
             Err(TreeHashFailure::Mismatch(err)) => FetchAttempt::ChecksumMismatch(err),
             Err(TreeHashFailure::Unverifiable(err)) => FetchAttempt::Unverifiable(err),
             Err(TreeHashFailure::Failed(err)) => {
@@ -753,17 +907,44 @@ impl UrlFetcher {
         let mut last_err: Option<Error> = None;
         for (idx, uri) in job.uris.iter().enumerate() {
             debug!(uri = %redact_uri(uri), idx, "Downloading fetch asset");
-            let req = self.client.get(uri).headers(job.headers.for_uri(idx));
-            match stream_uri_to_file(
-                req,
-                uri,
-                self.max_size_bytes,
-                &mut verifiers,
-                job.hasher_func,
-                &mut file,
-            )
-            .await
-            {
+            // A stale answer for this URI is revalidated, once: if the origin
+            // says it is current but its content is gone from the CAS, the
+            // download is repeated unconditionally.
+            let mut revalidation = job.revalidate.iter().find(|r| r.uri == *uri);
+            let attempt = loop {
+                let req = self.origin_request(uri, job.headers.for_uri(idx), revalidation);
+                let attempt = stream_uri_to_file(
+                    req,
+                    uri,
+                    self.max_size_bytes,
+                    &mut verifiers,
+                    job.hasher_func,
+                    &mut file,
+                )
+                .await;
+                let (FetchAttempt::NotModified(meta), Some(stale)) = (&attempt, revalidation)
+                else {
+                    break attempt;
+                };
+                if self.blob_is_in_cas(stale.digest).await {
+                    debug!(uri = %redact_uri(uri), digest = %stale.digest, "Cached fetch asset revalidated");
+                    return Ok(revalidated_outcome(uri, stale, meta));
+                }
+                info!(
+                    uri = %redact_uri(uri),
+                    digest = %stale.digest,
+                    "Cached fetch asset is current but no longer in the CAS, downloading it again"
+                );
+                revalidation = None;
+            };
+            match attempt {
+                FetchAttempt::NotModified(_) => {
+                    last_err = Some(make_err!(
+                        Code::NotFound,
+                        "'{}' answered 304 Not Modified without a cached answer to revalidate",
+                        redact_uri(uri)
+                    ));
+                }
                 FetchAttempt::DownloadFailed(err) => {
                     info!(
                         uri = %redact_uri(uri),
@@ -785,7 +966,7 @@ impl UrlFetcher {
                     );
                     last_err = Some(err);
                 }
-                FetchAttempt::Verified(digest, freshness) => {
+                FetchAttempt::Verified(digest, meta) => {
                     self.cas_store
                         .update_with_whole_file(
                             digest,
@@ -801,7 +982,8 @@ impl UrlFetcher {
                         "Downloaded fetch asset into the CAS"
                     );
                     return Ok(FetchOutcome {
-                        freshness,
+                        freshness: meta.freshness,
+                        validators: meta.validators,
                         ..FetchOutcome::new(uri.clone(), digest)
                     });
                 }
@@ -843,14 +1025,40 @@ impl UrlFetcher {
         let mut last_unverifiable: Option<Error> = None;
         for (idx, uri) in job.uris.iter().enumerate() {
             debug!(uri = %redact_uri(uri), idx, "Downloading fetch directory archive");
-            let req = self.client.get(uri).headers(job.headers.for_uri(idx));
-            match self
-                .stream_uri_to_directory(req, uri, &mut verifiers, &job.checksums, &options)
-                .await
-            {
-                FetchAttempt::Verified(digest, freshness) => {
+            // Revalidated once, as for a blob.
+            let mut revalidation = job.revalidate.iter().find(|r| r.uri == *uri);
+            let attempt = loop {
+                let req = self.origin_request(uri, job.headers.for_uri(idx), revalidation);
+                let attempt = self
+                    .stream_uri_to_directory(req, uri, &mut verifiers, &job.checksums, &options)
+                    .await;
+                let (FetchAttempt::NotModified(meta), Some(stale)) = (&attempt, revalidation)
+                else {
+                    break attempt;
+                };
+                if self.directory_is_in_cas(stale.digest).await {
+                    debug!(uri = %redact_uri(uri), digest = %stale.digest, "Cached fetch directory revalidated");
+                    return Ok(revalidated_outcome(uri, stale, meta));
+                }
+                info!(
+                    uri = %redact_uri(uri),
+                    digest = %stale.digest,
+                    "Cached fetch directory is current but no longer complete in the CAS, downloading it again"
+                );
+                revalidation = None;
+            };
+            match attempt {
+                FetchAttempt::NotModified(_) => {
+                    last_err = Some(make_err!(
+                        Code::NotFound,
+                        "'{}' answered 304 Not Modified without a cached answer to revalidate",
+                        redact_uri(uri)
+                    ));
+                }
+                FetchAttempt::Verified(digest, meta) => {
                     return Ok(FetchOutcome {
-                        freshness,
+                        freshness: meta.freshness,
+                        validators: meta.validators,
                         ..FetchOutcome::new(uri.clone(), digest)
                     });
                 }

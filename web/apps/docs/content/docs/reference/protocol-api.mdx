@@ -199,6 +199,38 @@ newer content than an entry holds with `oldest_content_accepted`.
 <SourceLink file="nativelink-fetch/src/http_cache.rs" symbol="freshness_lifetime" />
 <SourceLink file="nativelink-fetch/src/metadata_cache.rs" symbol="MetadataCache" />
 
+### Checking a stale entry with the origin [#fetch-revalidation]
+
+When an unpinned entry is stale and the origin gave it an `ETag` or a
+`Last-Modified` (the `url` fetcher stores both with the entry), the `Fetch`
+service does not download the content again. It passes the stale entry
+down the fetcher chain, and the `url` fetcher sends the request with
+`If-None-Match` and `If-Modified-Since`:
+
+- **`304 Not Modified`**: nothing is downloaded. The fetcher checks that the
+  stored blob, or for a directory the whole tree and every file in it, is still
+  in the CAS, and if so answers with the old digest. The `metadata_cache`
+  fetcher stores the entry again with a new `stored_at` and an `expire_at`
+  taken from the `304`'s own caching headers, so it is fresh again. If the
+  content has left the CAS the request is repeated without the conditional headers
+  and downloaded in full.
+- **`200`**: the new content goes through the usual path, checksum-free like any
+  unpinned request, and replaces the entry.
+
+An entry is checked this way whether it expired or the client's
+`oldest_content_accepted` rules it out: an origin that confirms nothing has
+changed has shown the content is current as of now, which is as new as anything
+it could serve. A pinned request is never checked this way, and an entry with neither
+`ETag` nor `Last-Modified` (one that was pushed, or whose origin sent neither
+header) is downloaded again as before.
+
+The stale entry travels on the fetch job as a request parameter, outside its
+identity, so it does not stop identical concurrent requests from sharing one
+in-flight fetch.
+
+<SourceLink file="nativelink-fetch/src/fetcher.rs" symbol="Revalidation" />
+<SourceLink file="nativelink-fetch/src/url_fetcher.rs" symbol="UrlFetcher" />
+
 ## Related [#related]
 
 - [Architecture deep dive](/explanations/architecture-deep-dive): where each

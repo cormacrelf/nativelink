@@ -237,6 +237,12 @@ const fn default_unpinned_max_ttl_s() -> u64 {
 /// `private` make the entry stale at once: it is still written, since its
 /// content is in the CAS, but a later `Fetch` goes back to the origin. A
 /// client's `oldest_content_accepted` applies as well as the expiry.
+///
+/// When an unpinned entry is stale and the origin gave an `ETag` or
+/// `Last-Modified` with it, the `Fetch` service asks the origin whether the
+/// content is still current (`If-None-Match`, `If-Modified-Since`) instead of
+/// downloading it again. On `304 Not Modified` the entry is stored again with a
+/// new expiry and no download happens.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]

@@ -24,6 +24,11 @@
 //! pointer was never written, leaving the asset undiscoverable by future Fetch
 //! calls.
 //!
+//! When the origin confirms a stale entry still current (a `304` to a
+//! revalidation, see [`crate::fetcher::Revalidation`]) the outcome carries the
+//! old digest, and the entry is written again like any other: with a new
+//! `stored_at` and `expire_at`, and the validators the origin last gave.
+//!
 //! Only the *write* lives here. The metadata *read* (cache lookup) stays in the
 //! `FetchServer`, where a hit is served verbatim from the stored entry and
 //! never has to spawn a background task.
@@ -165,6 +170,9 @@ impl MetadataCache {
             stored_at: Some(Timestamp::from(started)),
             digest_function: hasher_func.proto_digest_func().into(),
             tree_digest: None,
+            // Validators only matter to an entry that can go stale.
+            etag: outcome.validators.etag.clone().filter(|_| !pinned),
+            last_modified: outcome.validators.last_modified.clone().filter(|_| !pinned),
         };
         write_remote_asset_entry(&self.ac_store, Some(&self.cas_store), &entry)
             .await
@@ -172,6 +180,7 @@ impl MetadataCache {
         debug!(
             uri = %redact_uri(&outcome.uri),
             digest = %digest.hash,
+            revalidated = outcome.revalidated,
             "Cached fetched asset metadata"
         );
         Ok(())

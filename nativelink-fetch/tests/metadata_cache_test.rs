@@ -20,10 +20,12 @@ use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_error::{Code, Error, make_err};
 use nativelink_fetch::fetcher::{
     DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchHeaders, FetchOutcome, Fetcher,
+    Validators,
 };
 use nativelink_fetch::metadata_cache::{MetadataCache, MetadataCacheOptions};
 use nativelink_fetch::remote_asset_proto::{
-    AssetKind, RemoteAssetMetadata, RemoteAssetQuery, read_remote_asset_entry, timestamp_is_before,
+    AssetKind, RemoteAssetEntry, RemoteAssetMetadata, RemoteAssetQuery, read_remote_asset_entry,
+    timestamp_is_before,
 };
 use nativelink_fetch::tree_hash::TreeChecksum;
 use nativelink_fetch::tree_hash::h1::H1;
@@ -31,8 +33,8 @@ use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
 use nativelink_proto::build::bazel::remote::execution::v2::command::EnvironmentVariable;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    Action, ActionResult, Command, Digest, Directory, DirectoryNode, FileNode, OutputFile, Tree,
-    digest_function,
+    Action, ActionResult, Command, Digest, Directory, DirectoryNode, ExecutedActionMetadata,
+    FileNode, OutputFile, Tree, digest_function,
 };
 use nativelink_store::ac_utils::{get_and_decode_digest, serialize_and_upload_message};
 use nativelink_store::default_store_factory::store_factory;
@@ -106,6 +108,7 @@ fn blob_job(uri: &str, qualifiers: Vec<(String, String)>) -> FetchBlobTask {
         hasher_func: DigestHasherFunc::Sha256,
         timeout: None,
         headers: FetchHeaders::default(),
+        revalidate: vec![],
     }
 }
 
@@ -120,6 +123,7 @@ fn directory_job(uri: &str) -> FetchDirectoryJob {
         hasher_func: DigestHasherFunc::Sha256,
         timeout: None,
         headers: FetchHeaders::default(),
+        revalidate: vec![],
     }
 }
 
@@ -522,6 +526,7 @@ async fn does_not_persist_or_key_on_header_qualifiers() {
 struct HeaderFetcher {
     digest: DigestInfo,
     freshness: Option<Duration>,
+    validators: Validators,
 }
 
 #[async_trait]
@@ -529,6 +534,7 @@ impl Fetcher for HeaderFetcher {
     async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
         Ok(FetchOutcome {
             freshness: self.freshness,
+            validators: self.validators.clone(),
             ..FetchOutcome::new(job.uris[0].clone(), self.digest)
         })
     }
@@ -552,7 +558,11 @@ async fn lifetime_of(
     let ac_store = memory_store().await;
     let cas_store = memory_store().await;
     let digest = sha256_digest_of(b"payload");
-    let inner: Arc<dyn Fetcher> = Arc::new(HeaderFetcher { digest, freshness });
+    let inner: Arc<dyn Fetcher> = Arc::new(HeaderFetcher {
+        digest,
+        freshness,
+        validators: Validators::default(),
+    });
     let mc = MetadataCache::with_options(inner, ac_store.clone(), cas_store, options);
     let mut job = blob_job("http://example/blob", qualifiers());
     job.checksums = checksums;
@@ -674,4 +684,174 @@ async fn pinned_directory_never_expires_and_unpinned_directory_does() {
             "pinned: {pinned}"
         );
     }
+}
+
+fn validators() -> Validators {
+    Validators {
+        etag: Some("\"v1\"".to_string()),
+        last_modified: Some("Sun, 06 Nov 1994 08:49:37 GMT".to_string()),
+    }
+}
+
+/// Fetches through a `MetadataCache` over an origin that gave `validators`, and
+/// reads the entry back.
+async fn entry_after_fetch(checksums: Vec<ByteChecksum>) -> RemoteAssetEntry {
+    let ac_store = memory_store().await;
+    let digest = sha256_digest_of(b"payload");
+    let inner: Arc<dyn Fetcher> = Arc::new(HeaderFetcher {
+        digest,
+        freshness: None,
+        validators: validators(),
+    });
+    let mc = MetadataCache::new(inner, ac_store.clone(), memory_store().await);
+    let mut job = blob_job("http://example/blob", qualifiers());
+    job.checksums = checksums;
+    mc.fetch_blob(&job).await.unwrap();
+    read_remote_asset_entry(
+        &ac_store,
+        &RemoteAssetQuery::new(
+            AssetKind::Blob,
+            "http://example/blob".to_string(),
+            proto_qualifiers(),
+        ),
+        digest_function::Value::Sha256.into(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+#[nativelink_test]
+async fn unpinned_entry_stores_the_validators() {
+    let entry = entry_after_fetch(vec![]).await;
+    assert_eq!(entry.etag, validators().etag);
+    assert_eq!(entry.last_modified, validators().last_modified);
+}
+
+#[nativelink_test]
+async fn pinned_entry_stores_no_validators() {
+    let checksum = ByteChecksum::from_qualifier(
+        "checksum.sha256",
+        &sha256_digest_of(b"payload").packed_hash().to_string(),
+    )
+    .unwrap();
+    let entry = entry_after_fetch(vec![checksum]).await;
+    assert_eq!(entry.etag, None);
+    assert_eq!(entry.last_modified, None);
+}
+
+#[nativelink_test]
+async fn a_revalidated_outcome_rewrites_the_entry_with_new_times() {
+    let ac_store = memory_store().await;
+    let digest = sha256_digest_of(b"payload");
+    let inner: Arc<dyn Fetcher> = Arc::new(RevalidatedFetcher { digest });
+    let mc = MetadataCache::new(inner, ac_store.clone(), memory_store().await);
+
+    let outcome = mc
+        .fetch_blob(&blob_job("http://example/blob", qualifiers()))
+        .await
+        .unwrap();
+
+    assert!(outcome.revalidated);
+    let key = key_of(AssetKind::Blob, "http://example/blob", proto_qualifiers());
+    let action_result = stored_action_result(&ac_store, key).await;
+    let stored_at = action_result
+        .execution_metadata
+        .as_ref()
+        .unwrap()
+        .worker_start_timestamp
+        .unwrap();
+    let metadata = stored_metadata(&action_result);
+    // Freshness from the 304: ten minutes.
+    assert_eq!(metadata.expire_at.unwrap().seconds - stored_at.seconds, 600);
+    assert_eq!(metadata.etag, "\"v1\"");
+}
+
+/// An inner `Fetcher` that reports the content its caller offered as still
+/// current.
+#[derive(Debug)]
+struct RevalidatedFetcher {
+    digest: DigestInfo,
+}
+
+#[async_trait]
+impl Fetcher for RevalidatedFetcher {
+    async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
+        Ok(FetchOutcome {
+            freshness: Some(Duration::from_mins(10)),
+            validators: validators(),
+            revalidated: true,
+            ..FetchOutcome::new(job.uris[0].clone(), self.digest)
+        })
+    }
+    async fn fetch_directory(&self, _job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+        Err(make_err!(Code::Unimplemented, "not used"))
+    }
+}
+
+/// The Action Cache value of an entry written before validators were stored
+/// has a `RemoteAssetMetadata` without them.
+#[derive(Clone, PartialEq, prost::Message)]
+struct LegacyMetadata {
+    #[prost(string, tag = "1")]
+    uri: String,
+    #[prost(message, repeated, tag = "2")]
+    qualifiers: Vec<Qualifier>,
+    #[prost(message, optional, tag = "3")]
+    expire_at: Option<Timestamp>,
+    #[prost(int32, tag = "4")]
+    digest_function: i32,
+    #[prost(message, optional, tag = "5")]
+    root_directory_digest: Option<Digest>,
+}
+
+#[nativelink_test]
+async fn an_entry_without_validators_still_decodes() {
+    let ac_store = memory_store().await;
+    let digest = sha256_digest_of(b"payload");
+    let legacy = LegacyMetadata {
+        uri: "http://example/blob".to_string(),
+        qualifiers: proto_qualifiers(),
+        expire_at: None,
+        digest_function: digest_function::Value::Sha256.into(),
+        root_directory_digest: None,
+    };
+    let action_result = ActionResult {
+        output_files: vec![OutputFile {
+            path: "out".to_string(),
+            digest: Some(digest.into()),
+            ..Default::default()
+        }],
+        execution_metadata: Some(ExecutedActionMetadata {
+            worker: "nativelink-remote-asset".to_string(),
+            auxiliary_metadata: vec![prost_types::Any {
+                type_url: "type.googleapis.com/nativelink.RemoteAssetMetadata".to_string(),
+                value: legacy.encode_to_vec(),
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let key = key_of(AssetKind::Blob, "http://example/blob", proto_qualifiers());
+    ac_store
+        .update_oneshot(key, action_result.encode_to_vec().into())
+        .await
+        .unwrap();
+
+    let entry = read_remote_asset_entry(
+        &ac_store,
+        &RemoteAssetQuery::new(
+            AssetKind::Blob,
+            "http://example/blob".to_string(),
+            proto_qualifiers(),
+        ),
+        digest_function::Value::Sha256.into(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(entry.digest, Digest::from(digest));
+    assert_eq!(entry.etag, None);
+    assert_eq!(entry.last_modified, None);
 }

@@ -126,6 +126,7 @@ fn blob_job(uri: &str, timeout: Option<Duration>) -> FetchBlobTask {
         hasher_func: DigestHasherFunc::Sha256,
         timeout,
         headers: FetchHeaders::default(),
+        revalidate: vec![],
     }
 }
 
@@ -303,4 +304,31 @@ async fn clamps_total_timeout() {
             None,
         ]
     );
+}
+
+#[nativelink_test]
+async fn revalidation_input_is_not_part_of_the_dedup_identity() {
+    use core::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+
+    use nativelink_fetch::fetcher::{Revalidation, Validators};
+
+    let plain = blob_job("http://example/blob", None);
+    let mut revalidating = plain.clone();
+    revalidating.revalidate = vec![Revalidation {
+        uri: "http://example/blob".to_string(),
+        digest: DigestInfo::try_new(&"0".repeat(64), 1).unwrap(),
+        validators: Validators {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+        },
+    }];
+
+    assert_eq!(plain, revalidating);
+    let hash = |job: &FetchBlobTask| {
+        let mut hasher = DefaultHasher::new();
+        job.hash(&mut hasher);
+        hasher.finish()
+    };
+    assert_eq!(hash(&plain), hash(&revalidating));
 }

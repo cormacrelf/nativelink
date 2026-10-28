@@ -129,6 +129,8 @@ impl PushServer {
                 stored_at: Some(stored_at),
                 digest_function: request.digest_function,
                 tree_digest: None,
+                etag: None,
+                last_modified: None,
             };
             write_remote_asset_entry(&store_info.store, None, &entry)
                 .await
@@ -190,6 +192,8 @@ impl PushServer {
                 stored_at: Some(stored_at),
                 digest_function: request.digest_function,
                 tree_digest: None,
+                etag: None,
+                last_modified: None,
             };
             // Fails if any `Directory` of the tree is missing from the CAS.
             write_remote_asset_entry(&store_info.store, Some(cas_store), &entry)
