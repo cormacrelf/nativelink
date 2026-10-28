@@ -45,6 +45,7 @@ rust_test_suite(
     srcs = [
         "tests/background_fetcher_test.rs",
         "tests/metadata_cache_test.rs",
+        "tests/url_fetcher_test.rs",
     ],
     proc_macro_deps = [
         "//nativelink-macro",

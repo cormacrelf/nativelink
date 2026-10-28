@@ -47,6 +47,57 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// than total transfer time.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Most redirects followed for a single request. This is reqwest's own default,
+/// stated here so the policy does not change under a dependency update.
+pub const MAX_REDIRECTS: usize = 10;
+
+/// Decides whether to follow a redirect to `next` after the hops in `previous`
+/// (the requested URL first, the URL being redirected from last). Refuses
+/// after [`MAX_REDIRECTS`] hops and refuses to leave https for http: a request
+/// for a pinned or private asset must not be silently downgraded to a channel
+/// anyone on the path can read or rewrite. Hosts are named in the message,
+/// never full URLs, which may carry credentials in their query.
+fn check_redirect(previous: &[reqwest::Url], next: &reqwest::Url) -> Result<(), String> {
+    if previous.len() > MAX_REDIRECTS {
+        return Err(format!("too many redirects (more than {MAX_REDIRECTS})"));
+    }
+    if let Some(from) = previous.last()
+        && from.scheme() == "https"
+        && next.scheme() != "https"
+    {
+        return Err(format!(
+            "refusing to follow a redirect from https://{} to insecure {}://{}",
+            from.host_str().unwrap_or(""),
+            next.scheme(),
+            next.host_str().unwrap_or(""),
+        ));
+    }
+    Ok(())
+}
+
+/// The redirect policy of the HTTP client: follow up to [`MAX_REDIRECTS`]
+/// redirects, but never from https to http. As with reqwest's default,
+/// credentials (`Authorization`, `Cookie`, ...) are stripped when a redirect
+/// goes to another origin: that happens in reqwest whatever the policy.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        match check_redirect(attempt.previous(), attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(message) => attempt.error(message),
+        }
+    })
+}
+
+/// Describes a reqwest error. A redirect refused by our policy only names the
+/// reason in its source, which `Display` leaves out, so it is appended.
+fn describe_error(e: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    match e.source() {
+        Some(source) if e.is_redirect() => format!("{e}: {source}"),
+        _ => e.to_string(),
+    }
+}
+
 /// Default cap on the total duration of one fetch: all URI attempts, the
 /// download, verification and the CAS upload. A request's `timeout` can only
 /// shorten it.
@@ -74,7 +125,13 @@ async fn send_awaiting_headers(
     req.send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| make_err!(download_error_code(&e), "Failed to fetch '{uri}': {e}"))
+        .map_err(|e| {
+            make_err!(
+                download_error_code(&e),
+                "Failed to fetch '{uri}': {}",
+                describe_error(&e)
+            )
+        })
 }
 
 /// Fails if `size` bytes exceed `max_size_bytes`. Called with the advertised
@@ -405,6 +462,7 @@ impl UrlFetcher {
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(connect_timeout)
+            .redirect(redirect_policy())
             .read_timeout(read_timeout);
         if let Some(proxy) = &proxy {
             builder = builder.proxy(proxy.to_reqwest()?);
@@ -573,5 +631,47 @@ impl Fetcher for UrlFetcher {
             self.fetch_blob_unbounded(job),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn https_to_http_redirect_is_refused_with_a_clear_message() {
+        let err = check_redirect(
+            &[url("https://a.example/x?token=s3cret")],
+            &url("http://b.example/y"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "refusing to follow a redirect from https://a.example to insecure http://b.example"
+        );
+    }
+
+    #[test]
+    fn upgrades_and_same_scheme_redirects_are_allowed() {
+        assert!(check_redirect(&[url("http://a.example/")], &url("https://a.example/")).is_ok());
+        assert!(check_redirect(&[url("http://a.example/")], &url("http://b.example/")).is_ok());
+        assert!(check_redirect(&[url("https://a.example/")], &url("https://b.example/")).is_ok());
+    }
+
+    #[test]
+    fn redirect_chain_is_bounded() {
+        let hop = url("http://a.example/");
+        let ok = vec![hop.clone(); MAX_REDIRECTS];
+        assert!(check_redirect(&ok, &hop).is_ok());
+        let too_many = vec![hop.clone(); MAX_REDIRECTS + 1];
+        assert!(
+            check_redirect(&too_many, &hop)
+                .unwrap_err()
+                .contains("too many redirects")
+        );
     }
 }
