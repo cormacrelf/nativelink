@@ -629,10 +629,7 @@ impl UrlFetcher {
                         %digest,
                         "Downloaded fetch asset into the CAS"
                     );
-                    return Ok(FetchOutcome {
-                        uri: uri.clone(),
-                        digest,
-                    });
+                    return Ok(FetchOutcome::new(uri.clone(), digest));
                 }
             }
         }

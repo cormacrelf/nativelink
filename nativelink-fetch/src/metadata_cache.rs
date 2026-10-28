@@ -24,11 +24,17 @@
 //! pointer was never written, leaving the asset undiscoverable by future Fetch
 //! calls.
 //!
+//! Only a pinned request is recorded: one whose checksums fix the content, so
+//! the entry can never go out of date and never expires. An unpinned request
+//! takes whatever the origin serves now, so its answer is never reused: it is
+//! returned to the caller and not written down.
+//!
 //! Only the *write* lives here. The metadata *read* (cache lookup) stays in the
 //! `FetchServer`, where a hit is served verbatim from the stored entry and
 //! never has to spawn a background task.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use nativelink_error::{Error, ResultExt};
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
@@ -42,10 +48,11 @@ use tracing::debug;
 
 use crate::fetcher::{FetchBlobTask, FetchOutcome, Fetcher};
 use crate::remote_asset_proto::{
-    AssetKind, RemoteAssetEntry, RemoteAssetQuery, now_timestamp, write_remote_asset_entry,
+    AssetKind, RemoteAssetEntry, RemoteAssetQuery, write_remote_asset_entry,
 };
 
-/// A [`Fetcher`] decorator that caches fetched-asset metadata on success.
+/// A [`Fetcher`] decorator that records the metadata of pinned fetches on
+/// success.
 #[derive(Debug)]
 pub struct MetadataCache {
     inner: Arc<dyn Fetcher>,
@@ -55,21 +62,22 @@ pub struct MetadataCache {
 }
 
 impl MetadataCache {
-    /// Wraps `inner`, writing fetched-asset metadata into `ac_store`.
+    /// Wraps `inner`, writing the metadata of pinned fetches into `ac_store`.
     pub fn new(inner: Arc<dyn Fetcher>, ac_store: Store) -> Arc<Self> {
         Arc::new(Self { inner, ac_store })
     }
 
-    /// Writes the metadata for a successful fetch. The hash-function context
-    /// of the request reaches here through the background task's propagated
-    /// context, as it does for the content upload.
+    /// Writes the metadata for a successful pinned fetch. The hash-function
+    /// context of the request reaches here through the background task's
+    /// propagated context, as it does for the content upload. The entry never
+    /// expires.
     async fn write(
         &self,
         kind: AssetKind,
         outcome: &FetchOutcome,
         qualifiers: &[(String, String)],
         hasher_func: DigestHasherFunc,
-        stored_at: Timestamp,
+        started: SystemTime,
     ) -> Result<(), Error> {
         let qualifiers = qualifiers
             .iter()
@@ -85,7 +93,7 @@ impl MetadataCache {
             query: RemoteAssetQuery::new(kind, outcome.uri.clone(), qualifiers),
             digest: digest.clone(),
             expire_at: None,
-            stored_at: Some(stored_at),
+            stored_at: Some(Timestamp::from(started)),
             digest_function: hasher_func.proto_digest_func().into(),
         };
         write_remote_asset_entry(&self.ac_store, &entry)
@@ -104,16 +112,18 @@ impl MetadataCache {
 impl Fetcher for MetadataCache {
     async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
         // The spec measures content age from when retrieval started.
-        let stored_at = now_timestamp();
+        let started = SystemTime::now();
         let outcome = self.inner.fetch_blob(job).await?;
-        self.write(
-            AssetKind::Blob,
-            &outcome,
-            &job.qualifiers,
-            job.hasher_func,
-            stored_at,
-        )
-        .await?;
+        if job.is_pinned() {
+            self.write(
+                AssetKind::Blob,
+                &outcome,
+                &job.qualifiers,
+                job.hasher_func,
+                started,
+            )
+            .await?;
+        }
         Ok(outcome)
     }
 }

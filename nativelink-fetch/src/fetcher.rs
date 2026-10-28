@@ -193,6 +193,16 @@ impl Hash for FetchBlobTask {
     }
 }
 
+impl FetchBlobTask {
+    /// Whether the request is pinned: it carries a checksum, so the content it
+    /// can accept is fixed and a cached answer can never go out of date. An
+    /// unpinned request takes whatever the origin serves, which changes.
+    #[must_use]
+    pub const fn is_pinned(&self) -> bool {
+        !self.checksums.is_empty()
+    }
+}
+
 /// The result of a successful fetch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchOutcome {
@@ -200,6 +210,14 @@ pub struct FetchOutcome {
     pub uri: String,
     /// CAS digest of the fetched blob.
     pub digest: DigestInfo,
+}
+
+impl FetchOutcome {
+    /// An outcome for `digest`, fetched from `uri`.
+    #[must_use]
+    pub const fn new(uri: String, digest: DigestInfo) -> Self {
+        Self { uri, digest }
+    }
 }
 
 /// Fetches blobs from URIs into a CAS.

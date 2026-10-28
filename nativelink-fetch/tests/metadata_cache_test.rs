@@ -31,6 +31,7 @@ use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+use nativelink_util::sri::ByteChecksum;
 use nativelink_util::store_trait::{Store, StoreLike};
 use prost::Message;
 use tonic::async_trait;
@@ -45,10 +46,7 @@ struct OkFetcher {
 #[async_trait]
 impl Fetcher for OkFetcher {
     async fn fetch_blob(&self, _job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
-        Ok(FetchOutcome {
-            uri: self.uri.clone(),
-            digest: self.digest,
-        })
+        Ok(FetchOutcome::new(self.uri.clone(), self.digest))
     }
 }
 
@@ -85,11 +83,13 @@ fn proto_qualifiers() -> Vec<Qualifier> {
         .collect()
 }
 
+/// A pinned blob request: only those are recorded. `MetadataCache` does not
+/// check the checksum, the inner fetcher does.
 fn blob_job(uri: &str, qualifiers: Vec<(String, String)>) -> FetchBlobTask {
     FetchBlobTask {
         uris: vec![uri.to_string()],
         qualifiers,
-        checksums: vec![],
+        checksums: vec![ByteChecksum::from_qualifier("checksum.sha256", &"ab".repeat(32)).unwrap()],
         hasher_func: DigestHasherFunc::Sha256,
         timeout: None,
         headers: FetchHeaders::default(),
@@ -122,6 +122,28 @@ fn key_of(kind: AssetKind, uri: &str, qualifiers: Vec<Qualifier>) -> DigestInfo 
     RemoteAssetQuery::new(kind, uri.to_string(), qualifiers)
         .key(DigestHasherFunc::Sha256)
         .unwrap()
+}
+
+#[nativelink_test]
+async fn an_unpinned_blob_is_not_recorded() {
+    let ac_store = memory_store().await;
+    let digest = DigestInfo::try_new(&"ab".repeat(32), 11).unwrap();
+    let inner: Arc<dyn Fetcher> = Arc::new(OkFetcher {
+        uri: "http://example/blob".to_string(),
+        digest,
+    });
+    let mc = MetadataCache::new(inner, ac_store.clone());
+
+    let mut job = blob_job("http://example/blob", qualifiers());
+    job.checksums.clear();
+    let outcome = mc.fetch_blob(&job).await.unwrap();
+    assert_eq!(outcome.digest, digest);
+
+    let key = key_of(AssetKind::Blob, "http://example/blob", proto_qualifiers());
+    assert!(
+        ac_store.has(key).await.unwrap().is_none(),
+        "an unpinned fetch must not be recorded"
+    );
 }
 
 #[nativelink_test]

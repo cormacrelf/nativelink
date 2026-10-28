@@ -1436,8 +1436,10 @@ async fn test_fetch_blob_oldest_content_accepted() -> Result<(), Status> {
     Ok(())
 }
 
+/// An entry too old for the request is downloaded again. The download is
+/// unpinned, so it is not recorded, and the next such request downloads too.
 #[nativelink_test]
-async fn test_fetch_blob_too_old_entry_is_refetched_and_restamped() -> Result<(), Status> {
+async fn test_fetch_blob_too_old_entry_is_refetched_and_not_recorded() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
     let fs = make_fetch_server_with_cas(&store_manager);
     let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
@@ -1451,13 +1453,30 @@ async fn test_fetch_blob_too_old_entry_is_refetched_and_restamped() -> Result<()
     assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
     assert_eq!(requests.lock().len(), 1);
 
-    // The refetch refreshed `stored_at`, so the same request now hits.
     let response = fs
         .fetch_blob(blob_request_oldest(&uri, oldest))
         .await?
         .into_inner();
     assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
-    assert_eq!(requests.lock().len(), 1);
+    assert_eq!(requests.lock().len(), 2);
+    Ok(())
+}
+
+/// An unpinned fetch is never recorded, so each one downloads.
+#[nativelink_test]
+async fn test_fetch_blob_unpinned_is_downloaded_every_time() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+
+    for expected in 1..=3 {
+        let response = fs
+            .fetch_blob(blob_request(vec![uri.clone()], vec![]))
+            .await?
+            .into_inner();
+        assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+        assert_eq!(requests.lock().len(), expected);
+    }
     Ok(())
 }
 

@@ -166,6 +166,34 @@ are never offered to another host. Any other header you set is forwarded.
 
 <SourceLink file="nativelink-fetch/src/url_fetcher.rs" symbol="redirect_policy" />
 
+### What a fetch records [#fetch-freshness]
+
+What a fetch stores is the asset's URI and qualifiers mapped to a digest, and
+whether it stores anything depends on whether the request is *pinned*. A
+request is pinned when it carries a checksum: `checksum.sri` or a hex
+`checksum.sha*`. The server decides this from the checksums parsed off the
+request, not from a list of qualifier names, so a newly supported checksum is
+covered without a change here.
+
+- **A pinned fetch is recorded, and never expires.** The content has to match
+  the checksum, so it cannot legitimately change, and the origin's caching
+  headers are ignored.
+- **An unpinned fetch is not recorded.** Without a checksum the request accepts
+  whatever the origin serves now, so a saved answer could only ever be older
+  than what it asked for. Bazel says as much: with no checksum it sets
+  `oldest_content_accepted` an hour into the future, so that no saved answer
+  qualifies. Each unpinned request downloads, whatever the origin's caching
+  headers say, and its content lands in the CAS all the same. Not recording it
+  also means a response fetched with one client's `http_header:` qualifiers,
+  credentials among them, is never handed to another.
+
+An asset recorded by `Push` is found by a later `Fetch` whether or not it is
+pinned, and expires at the `expire_at` the push gave it, which `Fetch`
+reports in `expires_at`. A client can always ask for newer content than an
+entry holds with `oldest_content_accepted`.
+
+<SourceLink file="nativelink-fetch/src/metadata_cache.rs" symbol="MetadataCache" />
+
 ## Related [#related]
 
 - [Architecture deep dive](/explanations/architecture-deep-dive): where each
