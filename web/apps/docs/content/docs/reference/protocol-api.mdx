@@ -149,6 +149,23 @@ Clients that only inspect the gRPC status will misread it.
 **`server_logs` is never populated.** The field exists; the worker does not
 fill it.
 
+## Remote Asset `Fetch` behaviour [#remote-asset-fetch]
+
+These are the behaviours of the `url` fetcher and the `metadata_cache` decorator
+behind the `Fetch` service that the Remote Asset protocol leaves to the server.
+
+### Redirects [#fetch-redirects]
+
+The `url` fetcher follows at most 10 redirects per URI. It refuses a redirect
+from `https` to `http`, for every request, and the URI then counts as failed
+(the next one is tried; if none succeeds the request reports `NOT_FOUND` with
+the reason in its message). When a redirect leaves the origin the request went
+to, the `Authorization`, `Cookie`, `Proxy-Authorization` and `WWW-Authenticate`
+headers sent with `http_header:` qualifiers are dropped, so those credentials
+are never offered to another host. Any other header you set is forwarded.
+
+<SourceLink file="nativelink-fetch/src/url_fetcher.rs" symbol="redirect_policy" />
+
 ## Related [#related]
 
 - [Architecture deep dive](/explanations/architecture-deep-dive): where each
