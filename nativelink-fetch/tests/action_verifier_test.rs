@@ -174,7 +174,9 @@ impl Fetcher for Served {
 }
 
 /// A scheduler whose worker runs `check <path>...`: exit code 0 if every
-/// path is in the input root, else 1 with the missing ones on stderr.
+/// path is in the input root, else 1 with the missing ones on stderr. It
+/// also runs `crash <code>`, a checker that exits with `code` whatever the
+/// input root holds.
 #[derive(Debug)]
 struct CheckingScheduler {
     cas: Store,
@@ -201,6 +203,14 @@ impl ClientStateManager for CheckingScheduler {
         self.actions.lock().push(action_info.clone());
         let command: Command =
             get_and_decode_digest(&self.cas, action_info.command_digest.into()).await?;
+        if command.arguments.first().map(String::as_str) == Some("crash") {
+            let result = ActionResult {
+                exit_code: command.arguments[1].parse().unwrap(),
+                stderr_digest: put_bytes(&self.cas, b"sh: check-tool: not found").await,
+                ..Default::default()
+            };
+            return Ok(done(result));
+        }
         assert_eq!(command.arguments.first().map(String::as_str), Some("check"));
         let mut missing = Vec::new();
         for path in &command.arguments[1..] {
@@ -213,12 +223,7 @@ impl ClientStateManager for CheckingScheduler {
             stderr_digest: put_bytes(&self.cas, format!("missing: {missing:?}").as_bytes()).await,
             ..Default::default()
         };
-        Ok(Box::new(Done(Arc::new(ActionState {
-            stage: ActionStage::Completed(result),
-            last_transition_timestamp: SystemTime::now(),
-            client_operation_id: OperationId::default(),
-            action_digest: DigestInfo::zero_digest(),
-        }))))
+        Ok(done(result))
     }
 
     async fn filter_operations(
@@ -227,6 +232,15 @@ impl ClientStateManager for CheckingScheduler {
     ) -> Result<ActionStateResultStream, Error> {
         Err(make_err!(Code::Unimplemented, "not part of this fixture"))
     }
+}
+
+fn done(result: ActionResult) -> Box<dyn ActionStateResult> {
+    Box::new(Done(Arc::new(ActionState {
+        stage: ActionStage::Completed(result),
+        last_transition_timestamp: SystemTime::now(),
+        client_operation_id: OperationId::default(),
+        action_digest: DigestInfo::zero_digest(),
+    })))
 }
 
 struct Done(Arc<ActionState>);
@@ -441,6 +455,63 @@ async fn every_uri_failing_verification_is_aborted() -> Result<(), Error> {
     );
     assert!(message.contains("https://b"), "{message}");
     assert_eq!(fixture.runs(), 2);
+    Ok(())
+}
+
+/// Exit code 1 is the checker's "no": the next URI is tried.
+#[nativelink_test]
+async fn exit_code_1_is_a_mismatch_and_the_next_uri_is_tried() -> Result<(), Error> {
+    let cas = new_cas();
+    let a = put_dir(&cas, &[("a.txt", b"alpha")], &[]).await;
+    let b = put_dir(&cas, &[("b.txt", b"beta")], &[]).await;
+    let empty = put_dir(&cas, &[], &[]).await;
+    let template = put_template(&cas, &["crash", "1"], &[], empty).await;
+    let fixture = Fixture::new(cas, &[("https://a", a), ("https://b", b)]);
+
+    let err = fixture
+        .verifier
+        .fetch_directory(&job(
+            &["https://a", "https://b"],
+            vec![DirectoryChecksum::Action(template)],
+        ))
+        .await
+        .expect_err("every URI is rejected");
+    assert_eq!(err.code, Code::Aborted);
+    assert_eq!(fixture.calls(), 2, "both URIs were tried");
+    assert_eq!(fixture.runs(), 2);
+    Ok(())
+}
+
+/// Any other exit code means the checker is broken: the request fails at
+/// once, with the exit code and stderr, without fetching more URIs.
+#[nativelink_test]
+async fn any_other_exit_code_fails_the_request_without_trying_more_uris() -> Result<(), Error> {
+    for code in [2, 127, 137, -1] {
+        let cas = new_cas();
+        let a = put_dir(&cas, &[("a.txt", b"alpha")], &[]).await;
+        let b = put_dir(&cas, &[("b.txt", b"beta")], &[]).await;
+        let empty = put_dir(&cas, &[], &[]).await;
+        let template = put_template(&cas, &["crash", &code.to_string()], &[], empty).await;
+        let fixture = Fixture::new(cas, &[("https://a", a), ("https://b", b)]);
+
+        let err = fixture
+            .verifier
+            .fetch_directory(&job(
+                &["https://a", "https://b"],
+                vec![DirectoryChecksum::Action(template)],
+            ))
+            .await
+            .expect_err("the checker is broken");
+        assert_eq!(err.code, Code::Internal, "exit {code}: {err:?}");
+        let message = err.message_string();
+        assert!(
+            message.contains(&format!("exited with {code}")),
+            "{message}"
+        );
+        assert!(message.contains("check-tool: not found"), "{message}");
+        assert_eq!(fixture.calls(), 1, "exit {code}: only the first URI");
+        assert_eq!(fixture.runs(), 1, "exit {code}");
+    }
     Ok(())
 }
 

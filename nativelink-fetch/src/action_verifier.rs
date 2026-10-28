@@ -22,10 +22,22 @@
 //! command: at the relative path in its [`FETCHED_DIRECTORY_ENV`] environment
 //! variable, which the command can also read to find it, or, without that
 //! variable, as the whole input root, which must then be empty in the
-//! template. Exit code 0 means the tree is verified. Any other exit code is a
-//! checksum mismatch: the URI served the wrong content, and the next one is
-//! tried. A template that is missing from the CAS or malformed fails the
-//! request before anything is downloaded.
+//! template.
+//!
+//! The command's exit code is the contract between it and the server:
+//!
+//! - [`EXIT_VERIFIED`] (0): the tree is verified.
+//! - [`EXIT_MISMATCH`] (1): the content does not match what the command
+//!   expects. The URI served the wrong content, so the next one is tried; if
+//!   none verifies, the request fails with `Aborted`.
+//! - Any other exit code (a shell's 127 for a missing tool, 2 for misuse, a
+//!   crash, an out-of-memory kill, death by signal): the checker itself failed,
+//!   so it says nothing about the content. The request fails at once with
+//!   `Internal`, without trying the remaining URIs, and the error carries the
+//!   exit code and the start of the command's stderr.
+//!
+//! A template that is missing from the CAS or malformed fails the request
+//! before anything is downloaded.
 //!
 //! The server knows nothing about the format being checked; the expected
 //! value is part of the command. Since the qualifier is part of the asset's
@@ -62,6 +74,14 @@ pub const QUALIFIER_CHECKSUM_ACTION_DIGEST: &str = "checksum.action_digest";
 /// The environment variable of the template's `Command` that says where in
 /// the input root the fetched tree goes, as a relative path.
 pub const FETCHED_DIRECTORY_ENV: &str = "NATIVELINK_FETCHED_DIRECTORY";
+
+/// The verification command's exit code for a verified tree.
+pub const EXIT_VERIFIED: i32 = 0;
+
+/// The verification command's exit code for content that does not match. Any
+/// exit code other than this and [`EXIT_VERIFIED`] means the command itself
+/// failed.
+pub const EXIT_MISMATCH: i32 = 1;
 
 /// How much of a failed action's stderr goes into the mismatch error.
 const MAX_STDERR_IN_ERROR: u64 = 4096;
@@ -272,7 +292,8 @@ impl ActionVerifier {
 
     /// Runs `template` on the fetched tree `fetched`. `Ok(None)` means it is
     /// verified, `Ok(Some(err))` that it is not (`Aborted`). `Err` is a
-    /// failure to run the action at all.
+    /// failure to run the action, or of the command itself (see
+    /// [`Self::verdict`]).
     async fn verify(
         &self,
         template: &Template,
@@ -329,18 +350,18 @@ impl ActionVerifier {
                             .clone()
                             .append(format!("Running verification action {}", template.digest)));
                     }
-                    return Ok(self
+                    return self
                         .verdict(template, result.exit_code, Some(result.stderr_digest))
-                        .await);
+                        .await;
                 }
                 ActionStage::CompletedFromCache(result) => {
                     let stderr_digest = result
                         .stderr_digest
                         .clone()
                         .and_then(|digest| DigestInfo::try_from(digest).ok());
-                    return Ok(self
+                    return self
                         .verdict(template, result.exit_code, stderr_digest)
-                        .await);
+                        .await;
                 }
                 _ => {}
             }
@@ -352,24 +373,42 @@ impl ActionVerifier {
         }
     }
 
-    /// `None` if `exit_code` says the directory is verified, otherwise the
-    /// mismatch, with the start of the action's stderr.
+    /// `Ok(None)` if `exit_code` says the directory is verified, `Ok(Some)`
+    /// with the mismatch if it says the content is wrong, and `Err` if it
+    /// says the command failed, in each case with the start of the action's
+    /// stderr.
+    ///
+    /// A failed command is `Internal`: it is a fault in the verification
+    /// machinery (a broken or missing tool, a crash, a resource limit), not in
+    /// the client's request (`InvalidArgument`, `FailedPrecondition`), not a
+    /// verdict on the content (`Aborted`), and not known to be transient
+    /// (`Unavailable`), so retrying the same request is not expected to help.
     async fn verdict(
         &self,
         template: &Template,
         exit_code: i32,
         stderr_digest: Option<DigestInfo>,
-    ) -> Option<Error> {
-        if exit_code == 0 {
-            return None;
+    ) -> Result<Option<Error>, Error> {
+        if exit_code == EXIT_VERIFIED {
+            return Ok(None);
         }
         let stderr = match stderr_digest {
             Some(digest) => self.stderr(digest).await,
             None => String::new(),
         };
-        Some(make_err!(
-            Code::Aborted,
-            "Verification action {} exited with {exit_code}: {stderr}",
+        if exit_code == EXIT_MISMATCH {
+            return Ok(Some(make_err!(
+                Code::Aborted,
+                "Verification action {} exited with {exit_code}, so the content does not match: \
+                 {stderr}",
+                template.digest
+            )));
+        }
+        Err(make_err!(
+            Code::Internal,
+            "Verification action {} failed: it exited with {exit_code}, not \
+             {EXIT_VERIFIED} (verified) or {EXIT_MISMATCH} (mismatch), so the checker itself is \
+             broken and no more URIs are tried: {stderr}",
             template.digest
         ))
     }

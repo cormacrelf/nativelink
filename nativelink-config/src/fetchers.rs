@@ -280,8 +280,15 @@ pub struct BackgroundSpec {
 /// directory in its input root: at the relative path given by the command's
 /// `NATIVELINK_FETCHED_DIRECTORY` environment variable, or as the whole input
 /// root when the variable is not set, in which case the uploaded input root
-/// must be empty. Exit code 0 means the directory is verified; any other exit
-/// code is a checksum mismatch, and the next URI is tried.
+/// must be empty.
+///
+/// The command's exit code says what happened. Exit code 0 means the
+/// directory is verified. Exit code 1 means its content does not match: the
+/// next URI is tried, and the request fails with `ABORTED` if none verifies.
+/// Any other exit code (127 for a missing tool, a crash, an out-of-memory kill,
+/// death by signal) means the checker itself failed: the request fails at once
+/// with `INTERNAL`, with the exit code and the start of stderr in the message,
+/// and no further URI is tried.
 ///
 /// Requests without the qualifier pass straight through. A request with it
 /// that reaches a `url` fetcher without passing an `action_verify` fails.
