@@ -164,10 +164,9 @@ impl Fetcher for Served {
         job.uris
             .iter()
             .find_map(|uri| {
-                self.roots.get(uri).map(|&digest| FetchOutcome {
-                    uri: uri.clone(),
-                    digest,
-                })
+                self.roots
+                    .get(uri)
+                    .map(|&digest| FetchOutcome::new(uri.clone(), digest))
             })
             .ok_or_else(|| make_err!(Code::NotFound, "no URI served anything"))
     }

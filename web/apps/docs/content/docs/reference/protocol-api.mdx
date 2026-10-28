@@ -166,6 +166,39 @@ are never offered to another host. Any other header you set is forwarded.
 
 <SourceLink file="nativelink-fetch/src/url_fetcher.rs" symbol="redirect_policy" />
 
+### How long a fetched asset stays cached [#fetch-freshness]
+
+What a fetch stores is the asset's URI and qualifiers mapped to a digest, and
+how long that mapping is served depends on whether the request is *pinned*. A
+request is pinned when it carries a checksum: `checksum.sri`, a hex
+`checksum.sha*`, `checksum.action_digest`, or a tree checksum such as
+`checksum.nar`, `checksum.git_tree` or `checksum.h1`. The server decides this
+from the checksums parsed off the request, not from a list of qualifier names,
+so a newly supported checksum is covered without a change here.
+
+- **A pinned entry never expires.** The content has to match the checksum, so it
+  cannot legitimately change, and the origin's caching headers are ignored.
+- **An unpinned entry expires.** Without a checksum the first answer for a URL
+  would otherwise be served forever. The `url` fetcher reads the freshness of
+  the *final* response, after any redirects, as a shared cache would (RFC 9111):
+  `Cache-Control: s-maxage`, else `max-age`, else `Expires` less `Date`, less
+  `Age`. `no-store`, `no-cache` and `private` make the entry stale at once, and
+  so does `max-age=0` or an `Expires` that is not a valid date. Heuristic
+  freshness is not used: a response with no such header gets the configured
+  default. The result is limited to between `unpinned_min_ttl_s` and
+  `unpinned_max_ttl_s` (a response that must not be reused is not raised to the
+  minimum), and the entry is written with that expiry, which `Fetch` reports in
+  `expires_at`. A stale entry is a miss: the next request goes back
+  to the origin.
+
+The three fields are on the
+[`metadata_cache` fetcher](/reference/nativelink-config/main#metadatacachespec),
+defaulting to one day, five minutes and 30 days. A client can always ask for
+newer content than an entry holds with `oldest_content_accepted`.
+
+<SourceLink file="nativelink-fetch/src/http_cache.rs" symbol="freshness_lifetime" />
+<SourceLink file="nativelink-fetch/src/metadata_cache.rs" symbol="MetadataCache" />
+
 ## Related [#related]
 
 - [Architecture deep dive](/explanations/architecture-deep-dive): where each

@@ -33,6 +33,7 @@ use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::sri::ByteChecksum;
+use prost_types::Timestamp;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use tonic::async_trait;
 
@@ -279,6 +280,26 @@ impl Hash for FetchDirectoryJob {
     }
 }
 
+impl FetchBlobTask {
+    /// Whether the request is pinned: it carries a checksum, so the content it
+    /// can accept is fixed and a cached answer can never go out of date. An
+    /// unpinned request takes whatever the origin serves, which changes.
+    #[must_use]
+    pub const fn is_pinned(&self) -> bool {
+        !self.checksums.is_empty()
+    }
+}
+
+impl FetchDirectoryJob {
+    /// Whether the request is pinned: it carries a checksum of any kind (of the
+    /// archive bytes, of the expanded tree or an action to check it), so the
+    /// content it can accept is fixed. See [`FetchBlobTask::is_pinned`].
+    #[must_use]
+    pub const fn is_pinned(&self) -> bool {
+        !self.checksums.is_empty()
+    }
+}
+
 /// The result of a successful fetch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchOutcome {
@@ -287,6 +308,31 @@ pub struct FetchOutcome {
     /// CAS digest of the fetched blob, or of the root `Directory` for a
     /// directory fetch.
     pub digest: DigestInfo,
+    /// How long the origin said the content stays fresh, from the headers of
+    /// the final response (see [`crate::http_cache::freshness_lifetime`]).
+    /// `None` when the headers said nothing; `Some(Duration::ZERO)` when they
+    /// said it must not be reused without checking (`no-store`, `no-cache`,
+    /// `private`, or already expired). Only
+    /// [`crate::metadata_cache::MetadataCache`] reads it, and only for
+    /// unpinned requests.
+    pub freshness: Option<Duration>,
+    /// When the stored metadata for this outcome expires, set by
+    /// [`crate::metadata_cache::MetadataCache`]. `None` for content that does
+    /// not expire.
+    pub expire_at: Option<Timestamp>,
+}
+
+impl FetchOutcome {
+    /// An outcome with no freshness information and no expiry.
+    #[must_use]
+    pub const fn new(uri: String, digest: DigestInfo) -> Self {
+        Self {
+            uri,
+            digest,
+            freshness: None,
+            expire_at: None,
+        }
+    }
 }
 
 /// Fetches blobs and directories from URIs into a CAS.

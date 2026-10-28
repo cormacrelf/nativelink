@@ -17,9 +17,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::serde_utils::{
-    convert_boolean_with_shellexpand, convert_optional_numeric_with_shellexpand,
-    convert_optional_string_with_shellexpand, convert_string_with_shellexpand,
-    convert_vec_string_with_shellexpand,
+    convert_boolean_with_shellexpand, convert_numeric_with_shellexpand,
+    convert_optional_numeric_with_shellexpand, convert_optional_string_with_shellexpand,
+    convert_string_with_shellexpand, convert_vec_string_with_shellexpand,
 };
 use crate::stores::StoreRefName;
 
@@ -207,7 +207,36 @@ pub struct UrlFetcherSpec {
     pub require_checksum: bool,
 }
 
+/// Default for [`MetadataCacheSpec::unpinned_default_ttl_s`]: one day.
+const fn default_unpinned_default_ttl_s() -> u64 {
+    24 * 60 * 60
+}
+
+/// Default for [`MetadataCacheSpec::unpinned_min_ttl_s`]: five minutes.
+const fn default_unpinned_min_ttl_s() -> u64 {
+    5 * 60
+}
+
+/// Default for [`MetadataCacheSpec::unpinned_max_ttl_s`]: 30 days.
+const fn default_unpinned_max_ttl_s() -> u64 {
+    30 * 24 * 60 * 60
+}
+
 /// A decorator that caches fetched-asset metadata.
+///
+/// An entry for a *pinned* request, one with any checksum qualifier
+/// (`checksum.sri`, `checksum.sha256`, `checksum.action_digest`, a tree
+/// checksum such as `checksum.nar` or `checksum.git_tree`, ...), never
+/// expires: its content cannot legitimately change. An entry for an
+/// *unpinned* request, one with no checksum, takes whatever the origin served,
+/// which can change, so it expires. Its lifetime is what the origin's HTTP
+/// caching headers say, as a shared cache reads them (`s-maxage`, else
+/// `max-age`, else `Expires` less `Date`, less `Age`), or
+/// `unpinned_default_ttl_s` when they say nothing, then limited to between
+/// `unpinned_min_ttl_s` and `unpinned_max_ttl_s`. `no-store`, `no-cache` and
+/// `private` make the entry stale at once: it is still written, since its
+/// content is in the CAS, but a later `Fetch` goes back to the origin. A
+/// client's `oldest_content_accepted` applies as well as the expiry.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
@@ -230,6 +259,42 @@ pub struct MetadataCacheSpec {
     /// The inner fetcher (from the `fetchers` list) this decorates.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub fetcher: FetcherRefName,
+
+    /// Seconds an unpinned entry stays fresh when the origin's response says
+    /// nothing about caching (no `Cache-Control` freshness directive and no
+    /// `Expires`). Limited to `unpinned_min_ttl_s` and `unpinned_max_ttl_s`.
+    /// Pinned entries do not expire and ignore this.
+    ///
+    /// Default: 86400 (one day)
+    #[serde(
+        default = "default_unpinned_default_ttl_s",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub unpinned_default_ttl_s: u64,
+
+    /// Shortest freshness, in seconds, given to an unpinned entry. An origin
+    /// that says `max-age=10` gets this much instead, so a busy asset is not
+    /// fetched again and again. It does not apply to a response that must not be
+    /// reused (`no-store`, `no-cache`, `private`, or `max-age=0`), which is
+    /// stale at once. Must not be more than `unpinned_max_ttl_s`.
+    ///
+    /// Default: 300 (five minutes)
+    #[serde(
+        default = "default_unpinned_min_ttl_s",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub unpinned_min_ttl_s: u64,
+
+    /// Longest freshness, in seconds, given to an unpinned entry. An origin
+    /// that says `max-age=31536000` gets this much instead, so a URL whose
+    /// content changes is looked at again within this time whatever it claims.
+    ///
+    /// Default: 2592000 (30 days)
+    #[serde(
+        default = "default_unpinned_max_ttl_s",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub unpinned_max_ttl_s: u64,
 }
 
 /// A decorator providing in-flight deduplication and background continuation.

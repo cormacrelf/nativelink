@@ -15,11 +15,12 @@
 //! Tests of [`UrlFetcher`] against scriptable local HTTP servers.
 
 use core::fmt::Write as _;
+use core::time::Duration;
 use std::sync::Arc;
 
 use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_error::Code;
-use nativelink_fetch::fetcher::{FetchBlobTask, FetchHeaders, Fetcher};
+use nativelink_fetch::fetcher::{FetchBlobTask, FetchDirectoryJob, FetchHeaders, Fetcher};
 use nativelink_fetch::url_fetcher::{UrlFetcher, UrlFetcherOptions};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
@@ -32,6 +33,8 @@ use nativelink_util::store_trait::{Store, StoreLike};
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+mod support;
 
 const BODY: &[u8] = b"Hello, world!";
 
@@ -57,6 +60,11 @@ impl Reply {
             headers: vec![],
             body: body.to_vec(),
         }
+    }
+
+    fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
     }
 
     fn redirect(location: &str) -> Self {
@@ -220,4 +228,68 @@ async fn a_redirect_loop_fails_with_a_clear_error() {
     );
     // The first request plus ten redirects followed.
     assert_eq!(seen.lock().len(), 11);
+}
+
+#[nativelink_test]
+async fn freshness_comes_from_the_final_response_after_a_redirect() {
+    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+
+    // The redirect says no-store, the content says ten minutes.
+    let (target, _) = serve(|_| Reply::ok(BODY).with_header("Cache-Control", "max-age=600")).await;
+    let final_url = format!("{target}/final");
+    let (origin, _) =
+        serve(move |_| Reply::redirect(&final_url).with_header("Cache-Control", "no-store")).await;
+    let outcome = fetcher
+        .fetch_blob(&job(&format!("{origin}/start"), FetchHeaders::default()))
+        .await
+        .unwrap();
+    assert_eq!(outcome.freshness, Some(Duration::from_mins(10)));
+
+    // And the other way round.
+    let (target, _) = serve(|_| Reply::ok(BODY).with_header("Cache-Control", "no-store")).await;
+    let final_url = format!("{target}/final");
+    let (origin, _) =
+        serve(move |_| Reply::redirect(&final_url).with_header("Cache-Control", "max-age=600"))
+            .await;
+    let outcome = fetcher
+        .fetch_blob(&job(&format!("{origin}/start"), FetchHeaders::default()))
+        .await
+        .unwrap();
+    assert_eq!(outcome.freshness, Some(Duration::ZERO));
+}
+
+#[nativelink_test]
+async fn freshness_is_none_when_the_response_says_nothing() {
+    let (origin, _) = serve(|_| Reply::ok(BODY)).await;
+    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let outcome = fetcher
+        .fetch_blob(&job(&format!("{origin}/x"), FetchHeaders::default()))
+        .await
+        .unwrap();
+    assert_eq!(outcome.freshness, None);
+}
+
+#[nativelink_test]
+async fn a_directory_fetch_reports_freshness_too() {
+    let archive = support::tar(&[support::TarEntry::File("a.txt", b"alpha", 0o644)]);
+    let (origin, _) = serve(move |_| {
+        Reply::ok(&archive).with_header("Cache-Control", "public, s-maxage=120, max-age=5")
+    })
+    .await;
+    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+
+    let outcome = fetcher
+        .fetch_directory(&FetchDirectoryJob {
+            uris: vec![format!("{origin}/archive.tar")],
+            qualifiers: vec![],
+            checksums: vec![],
+            hasher_func: DigestHasherFunc::Sha256,
+            verified_by_action: false,
+            timeout: None,
+            headers: FetchHeaders::default(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.freshness, Some(Duration::from_mins(2)));
 }

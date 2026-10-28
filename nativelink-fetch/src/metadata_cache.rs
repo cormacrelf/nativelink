@@ -28,7 +28,9 @@
 //! `FetchServer`, where a hit is served verbatim from the stored entry and
 //! never has to spawn a background task.
 
+use core::time::Duration;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use nativelink_error::{Error, ResultExt};
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
@@ -42,8 +44,50 @@ use tracing::debug;
 
 use crate::fetcher::{FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher};
 use crate::remote_asset_proto::{
-    AssetKind, RemoteAssetEntry, RemoteAssetQuery, now_timestamp, write_remote_asset_entry,
+    AssetKind, RemoteAssetEntry, RemoteAssetQuery, write_remote_asset_entry,
 };
+
+/// How long entries for unpinned requests (those with no checksum) stay fresh.
+/// Entries for pinned requests never expire. Built from the
+/// `unpinned_*_ttl_s` fields of
+/// [`MetadataCacheSpec`](nativelink_config::fetchers::MetadataCacheSpec).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataCacheOptions {
+    /// Lifetime when the origin's headers say nothing.
+    pub unpinned_default_ttl: Duration,
+    /// Shortest lifetime given when the headers do give one. A lifetime of
+    /// zero (the response must not be reused) is kept as zero.
+    pub unpinned_min_ttl: Duration,
+    /// Longest lifetime given.
+    pub unpinned_max_ttl: Duration,
+}
+
+impl Default for MetadataCacheOptions {
+    fn default() -> Self {
+        Self {
+            unpinned_default_ttl: Duration::from_hours(24),
+            unpinned_min_ttl: Duration::from_mins(5),
+            unpinned_max_ttl: Duration::from_hours(720),
+        }
+    }
+}
+
+impl MetadataCacheOptions {
+    /// The lifetime of an unpinned entry whose fetch reported `freshness`
+    /// (see [`FetchOutcome::freshness`]).
+    fn unpinned_ttl(&self, freshness: Option<Duration>) -> Duration {
+        match freshness {
+            Some(Duration::ZERO) => Duration::ZERO,
+            Some(ttl) => self.clamp(ttl),
+            None => self.clamp(self.unpinned_default_ttl),
+        }
+    }
+
+    fn clamp(&self, ttl: Duration) -> Duration {
+        // Not `Duration::clamp`, which panics when `min > max`.
+        ttl.max(self.unpinned_min_ttl).min(self.unpinned_max_ttl)
+    }
+}
 
 /// A [`Fetcher`] decorator that caches fetched-asset metadata on success.
 #[derive(Debug)]
@@ -55,29 +99,55 @@ pub struct MetadataCache {
     /// The CAS the fetched content lives in, used to build the `Tree` of a
     /// directory.
     cas_store: Store,
+    options: MetadataCacheOptions,
 }
 
 impl MetadataCache {
-    /// Wraps `inner`, writing fetched-asset metadata into `ac_store`.
+    /// Wraps `inner`, writing fetched-asset metadata into `ac_store`, with the
+    /// default [`MetadataCacheOptions`].
     pub fn new(inner: Arc<dyn Fetcher>, ac_store: Store, cas_store: Store) -> Arc<Self> {
+        Self::with_options(inner, ac_store, cas_store, MetadataCacheOptions::default())
+    }
+
+    /// Like [`Self::new`], with the given freshness options.
+    pub fn with_options(
+        inner: Arc<dyn Fetcher>,
+        ac_store: Store,
+        cas_store: Store,
+        options: MetadataCacheOptions,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
             ac_store,
             cas_store,
+            options,
         })
     }
 
     /// Writes the metadata for a successful fetch. The hash-function context
     /// of the request reaches here through the background task's propagated
     /// context, as it does for the content upload.
+    ///
+    /// A pinned request's entry never expires. An unpinned one expires
+    /// `stored_at` plus the lifetime the origin's headers gave
+    /// (`outcome.freshness`), within the configured limits. The expiry is
+    /// recorded on `outcome` too, for the `Fetch` response.
     async fn write(
         &self,
         kind: AssetKind,
-        outcome: &FetchOutcome,
+        outcome: &mut FetchOutcome,
         qualifiers: &[(String, String)],
         hasher_func: DigestHasherFunc,
-        stored_at: Timestamp,
+        pinned: bool,
+        started: SystemTime,
     ) -> Result<(), Error> {
+        let expire_at = if pinned {
+            None
+        } else {
+            let ttl = self.options.unpinned_ttl(outcome.freshness);
+            started.checked_add(ttl).map(Timestamp::from)
+        };
+        outcome.expire_at = expire_at;
         let qualifiers = qualifiers
             .iter()
             .map(|(name, value)| Qualifier {
@@ -91,8 +161,8 @@ impl MetadataCache {
             // safeguard: they are often credentials and must never be persisted.
             query: RemoteAssetQuery::new(kind, outcome.uri.clone(), qualifiers),
             digest: digest.clone(),
-            expire_at: None,
-            stored_at: Some(stored_at),
+            expire_at,
+            stored_at: Some(Timestamp::from(started)),
             digest_function: hasher_func.proto_digest_func().into(),
             tree_digest: None,
         };
@@ -112,28 +182,30 @@ impl MetadataCache {
 impl Fetcher for MetadataCache {
     async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
         // The spec measures content age from when retrieval started.
-        let stored_at = now_timestamp();
-        let outcome = self.inner.fetch_blob(job).await?;
+        let started = SystemTime::now();
+        let mut outcome = self.inner.fetch_blob(job).await?;
         self.write(
             AssetKind::Blob,
-            &outcome,
+            &mut outcome,
             &job.qualifiers,
             job.hasher_func,
-            stored_at,
+            job.is_pinned(),
+            started,
         )
         .await?;
         Ok(outcome)
     }
 
     async fn fetch_directory(&self, job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
-        let stored_at = now_timestamp();
-        let outcome = self.inner.fetch_directory(job).await?;
+        let started = SystemTime::now();
+        let mut outcome = self.inner.fetch_directory(job).await?;
         self.write(
             AssetKind::Directory,
-            &outcome,
+            &mut outcome,
             &job.qualifiers,
             job.hasher_func,
-            stored_at,
+            job.is_pinned(),
+            started,
         )
         .await?;
         Ok(outcome)

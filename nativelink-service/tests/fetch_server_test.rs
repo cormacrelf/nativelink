@@ -138,6 +138,15 @@ async fn serve_once(body: Vec<u8>) -> String {
 /// each raw request (lowercased, so header names compare case-insensitively).
 /// Returns the URL and the recorded requests.
 async fn serve_recording(body: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
+    serve_recording_with_headers(body, "").await
+}
+
+/// Like [`serve_recording`], with `extra_headers` (zero or more complete
+/// `Name: value\r\n` lines) added to every response.
+async fn serve_recording_with_headers(
+    body: Vec<u8>,
+    extra_headers: &'static str,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -158,7 +167,7 @@ async fn serve_recording(body: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
                 .lock()
                 .push(String::from_utf8_lossy(&request).to_lowercase());
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n",
                 body.len()
             );
             socket.write_all(header.as_bytes()).await.unwrap();
@@ -402,11 +411,43 @@ fn make_fetch_server_with_url_spec(
     make_fetch_server_with_clamps(store_manager, url_spec, None, None)
 }
 
+/// The metadata cache's default
+/// `(unpinned_default_ttl_s, unpinned_min_ttl_s, unpinned_max_ttl_s)`.
+const DEFAULT_TTLS: (u64, u64, u64) = (24 * 60 * 60, 5 * 60, 30 * 24 * 60 * 60);
+
 /// Like [`make_fetch_server_with_url_spec`], with the background fetcher's
 /// `min_timeout_s` and `max_timeout_s` set.
 fn make_fetch_server_with_clamps(
     store_manager: &StoreManager,
     url_spec: UrlFetcherSpec,
+    min_timeout_s: Option<u64>,
+    max_timeout_s: Option<u64>,
+) -> FetchServer {
+    make_fetch_server_with_options(
+        store_manager,
+        url_spec,
+        DEFAULT_TTLS,
+        min_timeout_s,
+        max_timeout_s,
+    )
+}
+
+/// Like [`make_fetch_server_with_url_spec`], with the metadata cache's
+/// `(unpinned_default_ttl_s, unpinned_min_ttl_s, unpinned_max_ttl_s)`.
+fn make_fetch_server_with_ttls(
+    store_manager: &StoreManager,
+    url_spec: UrlFetcherSpec,
+    ttls: (u64, u64, u64),
+) -> FetchServer {
+    make_fetch_server_with_options(store_manager, url_spec, ttls, None, None)
+}
+
+/// Like [`make_fetch_server_with_url_spec`], with the metadata cache's TTLs and
+/// the background fetcher's timeout clamps set.
+fn make_fetch_server_with_options(
+    store_manager: &StoreManager,
+    url_spec: UrlFetcherSpec,
+    (default_ttl_s, min_ttl_s, max_ttl_s): (u64, u64, u64),
     min_timeout_s: Option<u64>,
     max_timeout_s: Option<u64>,
 ) -> FetchServer {
@@ -426,6 +467,9 @@ fn make_fetch_server_with_clamps(
             fetch_store: String::from("test_fetch_store"),
             cas_store: String::from("test_cas_store"),
             fetcher: String::from("URL"),
+            unpinned_default_ttl_s: default_ttl_s,
+            unpinned_min_ttl_s: min_ttl_s,
+            unpinned_max_ttl_s: max_ttl_s,
         }),
         store_manager,
         &schedulers,
@@ -4330,5 +4374,123 @@ async fn test_fetch_directory_missing_template_blobs_are_a_precondition_failure(
         "{status:?}"
     );
     assert_eq!(missing_subjects(status), vec![blob_subject(&subdirectory)]);
+    Ok(())
+}
+
+/// A `FetchBlob` request for one URI, with `qualifiers`.
+fn plain_blob_request(uri: &str, qualifiers: Vec<Qualifier>) -> Request<FetchBlobRequest> {
+    Request::new(FetchBlobRequest {
+        instance_name: "foo_instance_name".to_string(),
+        timeout: None,
+        oldest_content_accepted: None,
+        uris: vec![uri.to_string()],
+        qualifiers,
+        digest_function: 0,
+    })
+}
+
+/// A server whose metadata cache lets a one second `max-age` through.
+fn make_short_ttl_server(store_manager: &StoreManager) -> FetchServer {
+    make_fetch_server_with_ttls(
+        store_manager,
+        UrlFetcherSpec {
+            cas_store: String::from("test_cas_store"),
+            temp_path: None,
+            max_size_bytes: None,
+            archive_entry_inline_threshold_bytes: None,
+            max_archive_entries: None,
+            max_archive_uncompressed_bytes: None,
+            ..Default::default()
+        },
+        (60, 0, 60),
+    )
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_unpinned_entry_expires_by_the_origins_max_age() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_short_ttl_server(&store_manager);
+    let (uri, requests) =
+        serve_recording_with_headers(HELLO_WORLD.to_vec(), "Cache-Control: max-age=1\r\n").await;
+
+    let first = fs
+        .fetch_blob(plain_blob_request(&uri, vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(first.status.as_ref().map(|s| s.code), Some(0));
+    let expires_at = first.expires_at.expect("an unpinned fetch should expire");
+    let now = now_timestamp();
+    let remaining = expires_at.seconds - now.seconds;
+    assert!((0..=1).contains(&remaining), "expires in {remaining}s");
+
+    // Fresh: served from the cache.
+    fs.fetch_blob(plain_blob_request(&uri, vec![])).await?;
+    assert_eq!(requests.lock().len(), 1);
+
+    // Past it: fetched again, and given a new expiry.
+    tokio::time::sleep(core::time::Duration::from_millis(1200)).await;
+    let third = fs
+        .fetch_blob(plain_blob_request(&uri, vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(third.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(requests.lock().len(), 2);
+    assert!(third.expires_at.unwrap().seconds > expires_at.seconds);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_unpinned_no_store_is_refetched_every_time() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) =
+        serve_recording_with_headers(HELLO_WORLD.to_vec(), "Cache-Control: no-store\r\n").await;
+
+    for expected in 1..=3 {
+        let response = fs
+            .fetch_blob(plain_blob_request(&uri, vec![]))
+            .await?
+            .into_inner();
+        assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+        assert_eq!(requests.lock().len(), expected);
+    }
+    // The content is in the CAS all the same.
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    assert!(
+        cas_store
+            .has(sha256_digest_of(HELLO_WORLD))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_pinned_entry_ignores_the_origins_max_age() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_short_ttl_server(&store_manager);
+    let (uri, requests) =
+        serve_recording_with_headers(HELLO_WORLD.to_vec(), "Cache-Control: max-age=1\r\n").await;
+    let qualifiers = vec![Qualifier {
+        name: "checksum.sri".to_string(),
+        value: sri_of(HELLO_WORLD),
+    }];
+
+    let first = fs
+        .fetch_blob(plain_blob_request(&uri, qualifiers.clone()))
+        .await?
+        .into_inner();
+    assert_eq!(first.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(first.expires_at, None);
+
+    tokio::time::sleep(core::time::Duration::from_millis(1200)).await;
+    let second = fs
+        .fetch_blob(plain_blob_request(&uri, qualifiers))
+        .await?
+        .into_inner();
+    assert_eq!(second.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(second.expires_at, None);
+    assert_eq!(requests.lock().len(), 1, "a pinned entry never expires");
     Ok(())
 }

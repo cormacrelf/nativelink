@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ use nativelink_error::{Code, Error, make_err};
 use nativelink_fetch::fetcher::{
     DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchHeaders, FetchOutcome, Fetcher,
 };
-use nativelink_fetch::metadata_cache::MetadataCache;
+use nativelink_fetch::metadata_cache::{MetadataCache, MetadataCacheOptions};
 use nativelink_fetch::remote_asset_proto::{
     AssetKind, RemoteAssetMetadata, RemoteAssetQuery, read_remote_asset_entry, timestamp_is_before,
 };
@@ -38,8 +39,10 @@ use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+use nativelink_util::sri::ByteChecksum;
 use nativelink_util::store_trait::{Store, StoreLike};
 use prost::Message;
+use prost_types::Timestamp;
 use tonic::async_trait;
 
 /// An inner `Fetcher` that always succeeds with a fixed outcome.
@@ -52,16 +55,10 @@ struct OkFetcher {
 #[async_trait]
 impl Fetcher for OkFetcher {
     async fn fetch_blob(&self, _job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
-        Ok(FetchOutcome {
-            uri: self.uri.clone(),
-            digest: self.digest,
-        })
+        Ok(FetchOutcome::new(self.uri.clone(), self.digest))
     }
     async fn fetch_directory(&self, _job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
-        Ok(FetchOutcome {
-            uri: self.uri.clone(),
-            digest: self.digest,
-        })
+        Ok(FetchOutcome::new(self.uri.clone(), self.digest))
     }
 }
 
@@ -258,7 +255,15 @@ async fn writes_blob_metadata_as_an_action_result_on_success() {
     let metadata = stored_metadata(&action_result);
     assert_eq!(metadata.uri, "http://example/blob");
     assert_eq!(metadata.qualifiers, proto_qualifiers());
-    assert_eq!(metadata.expire_at, None);
+    // An unpinned request with no caching headers gets the default lifetime.
+    assert_eq!(
+        metadata.expire_at,
+        Some(Timestamp {
+            seconds: started.seconds + 24 * 60 * 60,
+            nanos: started.nanos
+        })
+    );
+    assert_eq!(outcome.expire_at, metadata.expire_at);
     assert_eq!(
         metadata.digest_function,
         i32::from(digest_function::Value::Sha256)
@@ -509,4 +514,164 @@ async fn does_not_persist_or_key_on_header_qualifiers() {
             .any(|window| window == b"secret"),
         "no header value should be stored anywhere in the entry"
     );
+}
+
+/// An inner `Fetcher` that succeeds with a fixed digest and the freshness the
+/// origin's headers are taken to have given.
+#[derive(Debug)]
+struct HeaderFetcher {
+    digest: DigestInfo,
+    freshness: Option<Duration>,
+}
+
+#[async_trait]
+impl Fetcher for HeaderFetcher {
+    async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
+        Ok(FetchOutcome {
+            freshness: self.freshness,
+            ..FetchOutcome::new(job.uris[0].clone(), self.digest)
+        })
+    }
+    async fn fetch_directory(&self, _job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+        Err(make_err!(Code::Unimplemented, "not used"))
+    }
+}
+
+const fn secs(n: u64) -> Duration {
+    Duration::from_secs(n)
+}
+
+/// Fetches an asset through a `MetadataCache` whose inner fetcher reports
+/// `freshness`, and returns how long after being stored the entry expires
+/// (`None`: never), as written to the Action Cache.
+async fn lifetime_of(
+    options: MetadataCacheOptions,
+    freshness: Option<Duration>,
+    checksums: Vec<ByteChecksum>,
+) -> Option<i64> {
+    let ac_store = memory_store().await;
+    let cas_store = memory_store().await;
+    let digest = sha256_digest_of(b"payload");
+    let inner: Arc<dyn Fetcher> = Arc::new(HeaderFetcher { digest, freshness });
+    let mc = MetadataCache::with_options(inner, ac_store.clone(), cas_store, options);
+    let mut job = blob_job("http://example/blob", qualifiers());
+    job.checksums = checksums;
+    mc.fetch_blob(&job).await.unwrap();
+
+    let key = key_of(AssetKind::Blob, "http://example/blob", proto_qualifiers());
+    let action_result = stored_action_result(&ac_store, key).await;
+    let stored_at = action_result
+        .execution_metadata
+        .as_ref()
+        .unwrap()
+        .worker_start_timestamp
+        .unwrap();
+    stored_metadata(&action_result)
+        .expire_at
+        .map(|expire_at| expire_at.seconds - stored_at.seconds)
+}
+
+const fn limits(default: u64, min: u64, max: u64) -> MetadataCacheOptions {
+    MetadataCacheOptions {
+        unpinned_default_ttl: secs(default),
+        unpinned_min_ttl: secs(min),
+        unpinned_max_ttl: secs(max),
+    }
+}
+
+#[nativelink_test]
+async fn unpinned_entry_without_headers_gets_the_default_lifetime() {
+    let options = limits(1000, 10, 5000);
+    assert_eq!(lifetime_of(options, None, vec![]).await, Some(1000));
+    // The default is limited like any other lifetime.
+    assert_eq!(
+        lifetime_of(limits(1, 10, 5000), None, vec![]).await,
+        Some(10)
+    );
+    assert_eq!(
+        lifetime_of(limits(9000, 10, 5000), None, vec![]).await,
+        Some(5000)
+    );
+}
+
+#[nativelink_test]
+async fn unpinned_entry_uses_the_origins_lifetime_within_the_limits() {
+    let options = limits(1000, 10, 5000);
+    assert_eq!(lifetime_of(options, Some(secs(60)), vec![]).await, Some(60));
+    assert_eq!(lifetime_of(options, Some(secs(3)), vec![]).await, Some(10));
+    assert_eq!(
+        lifetime_of(options, Some(secs(86_400)), vec![]).await,
+        Some(5000)
+    );
+}
+
+#[nativelink_test]
+async fn unpinned_entry_the_origin_forbids_reusing_is_stale_at_once() {
+    // Not lifted to the minimum.
+    assert_eq!(
+        lifetime_of(limits(1000, 10, 5000), Some(Duration::ZERO), vec![]).await,
+        Some(0)
+    );
+}
+
+#[nativelink_test]
+async fn pinned_entry_never_expires_whatever_the_headers_say() {
+    let checksum = ByteChecksum::from_qualifier(
+        "checksum.sha256",
+        &sha256_digest_of(b"payload").packed_hash().to_string(),
+    )
+    .unwrap();
+    let options = limits(1000, 10, 5000);
+    for freshness in [
+        None,
+        Some(secs(1)),
+        Some(Duration::ZERO),
+        Some(secs(99_999)),
+    ] {
+        assert_eq!(
+            lifetime_of(options, freshness, vec![checksum.clone()]).await,
+            None,
+            "{freshness:?}"
+        );
+    }
+}
+
+#[nativelink_test]
+async fn pinned_directory_never_expires_and_unpinned_directory_does() {
+    for (pinned, expected) in [(true, None), (false, Some(1000))] {
+        let ac_store = memory_store().await;
+        let cas_store = memory_store().await;
+        let root = upload_directory(&cas_store, &Directory::default()).await;
+        let inner: Arc<dyn Fetcher> = Arc::new(OkFetcher {
+            uri: "http://example/dir".to_string(),
+            digest: root,
+        });
+        let mc =
+            MetadataCache::with_options(inner, ac_store.clone(), cas_store, limits(1000, 10, 5000));
+        let mut job = directory_job("http://example/dir");
+        if !pinned {
+            job.checksums.clear();
+        }
+        mc.fetch_directory(&job).await.unwrap();
+
+        let key = key_of(
+            AssetKind::Directory,
+            "http://example/dir",
+            proto_qualifiers(),
+        );
+        let action_result = stored_action_result(&ac_store, key).await;
+        let stored_at = action_result
+            .execution_metadata
+            .as_ref()
+            .unwrap()
+            .worker_start_timestamp
+            .unwrap();
+        assert_eq!(
+            stored_metadata(&action_result)
+                .expire_at
+                .map(|expire_at| expire_at.seconds - stored_at.seconds),
+            expected,
+            "pinned: {pinned}"
+        );
+    }
 }

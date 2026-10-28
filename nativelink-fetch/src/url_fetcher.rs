@@ -30,6 +30,7 @@ use core::time::Duration;
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use futures::StreamExt;
 use nativelink_error::{Error, ResultExt, make_err, make_input_err};
@@ -48,6 +49,7 @@ use crate::archive_expander::{
     ArchiveLimits, ArchiveOptions, DEFAULT_INLINE_THRESHOLD, extract_archive,
 };
 use crate::fetcher::{DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher};
+use crate::http_cache::freshness_lifetime;
 use crate::tree_hash::{TreeHashContext, TreeHashFailure, TreeHashSet};
 
 /// Default connect timeout applied to all origin fetches. Guards against
@@ -170,8 +172,9 @@ enum FetchAttempt {
     /// The content was downloaded and its checksum (if any) verified. For a
     /// blob it was streamed to the temp file and its CAS digest computed; for a
     /// directory it was expanded into the CAS. Carries the CAS digest (of the
-    /// blob, or of the root `Directory`).
-    Verified(DigestInfo),
+    /// blob, or of the root `Directory`) and the freshness lifetime the final
+    /// response's headers gave (see [`freshness_lifetime`]).
+    Verified(DigestInfo, Option<Duration>),
     /// The downloaded content did not match the expected checksum. Like a
     /// download failure this is retried against the remaining URIs (a different
     /// mirror may serve correct content).
@@ -258,6 +261,7 @@ async fn stream_uri_to_file(
         Ok(response) => response,
         Err(err) => return FetchAttempt::DownloadFailed(err),
     };
+    let freshness = freshness_lifetime(response.headers(), SystemTime::now());
     if let Err(err) = check_size_limit(uri, response.content_length().unwrap_or(0), max_size_bytes)
     {
         return FetchAttempt::DownloadFailed(err);
@@ -316,7 +320,7 @@ async fn stream_uri_to_file(
         return FetchAttempt::DownloadFailed(err);
     }
 
-    FetchAttempt::Verified(digest)
+    FetchAttempt::Verified(digest, freshness)
 }
 
 /// An explicit HTTP forward proxy for a [`UrlFetcher`] to send its requests
@@ -599,6 +603,7 @@ impl UrlFetcher {
             Ok(response) => response,
             Err(err) => return FetchAttempt::DownloadFailed(err),
         };
+        let freshness = freshness_lifetime(response.headers(), SystemTime::now());
         if let Err(err) =
             check_size_limit(uri, response.content_length().unwrap_or(0), max_size_bytes)
         {
@@ -671,7 +676,7 @@ impl UrlFetcher {
             return FetchAttempt::ChecksumMismatch(err);
         }
         match tree_hashes.finish(&tree.listing).await {
-            Ok(()) => FetchAttempt::Verified(tree.root_digest),
+            Ok(()) => FetchAttempt::Verified(tree.root_digest, freshness),
             Err(TreeHashFailure::Mismatch(err)) => FetchAttempt::ChecksumMismatch(err),
             Err(TreeHashFailure::Unverifiable(err)) => FetchAttempt::Unverifiable(err),
             Err(TreeHashFailure::Failed(err)) => {
@@ -780,7 +785,7 @@ impl UrlFetcher {
                     );
                     last_err = Some(err);
                 }
-                FetchAttempt::Verified(digest) => {
+                FetchAttempt::Verified(digest, freshness) => {
                     self.cas_store
                         .update_with_whole_file(
                             digest,
@@ -796,8 +801,8 @@ impl UrlFetcher {
                         "Downloaded fetch asset into the CAS"
                     );
                     return Ok(FetchOutcome {
-                        uri: uri.clone(),
-                        digest,
+                        freshness,
+                        ..FetchOutcome::new(uri.clone(), digest)
                     });
                 }
             }
@@ -843,10 +848,10 @@ impl UrlFetcher {
                 .stream_uri_to_directory(req, uri, &mut verifiers, &job.checksums, &options)
                 .await
             {
-                FetchAttempt::Verified(digest) => {
+                FetchAttempt::Verified(digest, freshness) => {
                     return Ok(FetchOutcome {
-                        uri: uri.clone(),
-                        digest,
+                        freshness,
+                        ..FetchOutcome::new(uri.clone(), digest)
                     });
                 }
                 FetchAttempt::DownloadFailed(err) => {

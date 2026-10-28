@@ -104,10 +104,10 @@ impl Fetcher for MockFetcher {
         self.concurrent.fetch_sub(1, Ordering::SeqCst);
         self.completed.fetch_add(1, Ordering::SeqCst);
         let _ = self.done_tx.send(());
-        Ok(FetchOutcome {
-            uri: job.uris.first().cloned().unwrap_or_default(),
-            digest: DigestInfo::try_new(&"0".repeat(64), 1).unwrap(),
-        })
+        Ok(FetchOutcome::new(
+            job.uris.first().cloned().unwrap_or_default(),
+            DigestInfo::try_new(&"0".repeat(64), 1).unwrap(),
+        ))
     }
 
     async fn fetch_directory(&self, _job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {

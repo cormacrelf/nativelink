@@ -27,7 +27,7 @@ use nativelink_util::operation_state_manager::ClientStateManager;
 use crate::action_verifier::ActionVerifier;
 use crate::background_fetcher::{BackgroundFetcher, BackgroundFetcherOpts};
 use crate::fetcher::Fetcher;
-use crate::metadata_cache::MetadataCache;
+use crate::metadata_cache::{MetadataCache, MetadataCacheOptions};
 use crate::url_fetcher::{ProxySettings, UrlFetcher, UrlFetcherOptions};
 
 /// Builds a single fetcher from `spec`, resolving store references against
@@ -78,7 +78,21 @@ pub fn fetcher_factory<S: BuildHasher, T: BuildHasher>(
                 make_input_err!("'cas_store': '{}' does not exist", spec.cas_store)
             })?;
             let inner = resolve(&spec.fetcher, built)?;
-            Ok(MetadataCache::new(inner, store, cas_store))
+            let options = MetadataCacheOptions {
+                unpinned_default_ttl: Duration::from_secs(spec.unpinned_default_ttl_s),
+                unpinned_min_ttl: Duration::from_secs(spec.unpinned_min_ttl_s),
+                unpinned_max_ttl: Duration::from_secs(spec.unpinned_max_ttl_s),
+            };
+            if options.unpinned_min_ttl > options.unpinned_max_ttl {
+                return Err(make_input_err!(
+                    "'unpinned_min_ttl_s' ({}) must not be more than 'unpinned_max_ttl_s' ({})",
+                    spec.unpinned_min_ttl_s,
+                    spec.unpinned_max_ttl_s
+                ));
+            }
+            Ok(MetadataCache::with_options(
+                inner, store, cas_store, options,
+            ))
         }
         FetcherSpec::Background(spec) => {
             let inner = resolve(&spec.fetcher, built)?;

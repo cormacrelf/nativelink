@@ -556,7 +556,7 @@ impl FetchServer {
                         }),
                         uri: outcome.uri,
                         qualifiers: request.qualifiers.clone(),
-                        expires_at: None,
+                        expires_at: outcome.expire_at,
                         blob_digest: Some(proto_digest),
                         digest_function: hasher_func.proto_digest_func().into(),
                     }));
@@ -733,7 +733,7 @@ impl FetchServer {
                     }),
                     uri: outcome.uri,
                     qualifiers: request.qualifiers.clone(),
-                    expires_at: None,
+                    expires_at: outcome.expire_at,
                     root_directory_digest: Some(proto_digest),
                     digest_function: hasher_func.proto_digest_func().into(),
                 }))
