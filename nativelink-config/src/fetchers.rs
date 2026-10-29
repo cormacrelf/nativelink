@@ -213,6 +213,38 @@ pub struct UrlFetcherSpec {
     #[serde(default, deserialize_with = "convert_vec_string_with_shellexpand")]
     pub no_proxy: Vec<String>,
 
+    /// Non-public IP ranges this fetcher may connect to, in CIDR notation
+    /// (`"10.20.0.0/16"`, `"fd00:1234::/32"`) or as single addresses.
+    ///
+    /// Anyone who can call `Fetch` chooses the URL, and the content ends up in
+    /// the CAS where they can read it, so by default the fetcher refuses every
+    /// address that is not on the public internet: loopback, private networks
+    /// (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`),
+    /// link-local (`169.254.0.0/16`, where cloud metadata services answer, and
+    /// `fe80::/10`), shared address space (`100.64.0.0/10`), multicast, and
+    /// the reserved and documentation ranges. An IPv6 address that embeds an
+    /// IPv4 one (`::ffff:a.b.c.d`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) is
+    /// judged by the IPv4 address. Ranges listed here are let through.
+    /// `["0.0.0.0/0", "::/0"]` turns the check off.
+    ///
+    /// Host names are checked on the addresses they resolve to, at connection
+    /// time, so a name that resolves to a refused address is refused, however
+    /// it was reached (directly, by redirect, or after its DNS answer changed).
+    /// If a name resolves to some refused addresses and some allowed ones,
+    /// only the allowed ones are tried. URLs with an IP address as their host
+    /// are checked as given, including on every redirect. A refused fetch
+    /// fails that URI with `PERMISSION_DENIED`.
+    ///
+    /// With a proxy, origins reached through it are resolved and connected to
+    /// by the proxy, not by this server, so only IP-address URLs are checked
+    /// for them: the proxy has to enforce what may be reached. The proxy
+    /// itself is always allowed, whatever its address. Hosts in `no_proxy`
+    /// are connected to directly and checked as usual.
+    ///
+    /// Default: empty (no non-public address is allowed)
+    #[serde(default, deserialize_with = "convert_vec_string_with_shellexpand")]
+    pub allowed_ip_ranges: Vec<String>,
+
     /// Refuse to download content that the request gives no checksum for. A
     /// blob request needs a `checksum.sri` or a hex `checksum.sha*` qualifier. A
     /// directory request needs a checksum of any kind: those, a tree hash such

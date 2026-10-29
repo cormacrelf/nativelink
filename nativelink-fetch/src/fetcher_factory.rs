@@ -30,6 +30,7 @@ use nativelink_util::operation_state_manager::ClientStateManager;
 use crate::action_verifier::ActionVerifier;
 use crate::background_fetcher::{BackgroundFetcher, BackgroundFetcherOpts};
 use crate::fetcher::Fetcher;
+use crate::ip_filter::IpFilter;
 use crate::metadata_cache::{MetadataCache, MetadataCacheOptions};
 use crate::url_fetcher::{ProxySettings, UrlFetcher, UrlFetcherOptions};
 
@@ -65,6 +66,7 @@ pub fn fetcher_factory<S: BuildHasher, T: BuildHasher>(
                     spec.http_proxy_secret_file.as_deref(),
                     &spec.no_proxy,
                 )?,
+                ip_filter: IpFilter::new(&spec.allowed_ip_ranges)?,
                 ..UrlFetcherOptions::default()
             };
             let options = match spec.max_fetch_duration_s {

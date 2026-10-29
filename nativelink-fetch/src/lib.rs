@@ -18,6 +18,7 @@ pub mod background_fetcher;
 pub mod fetcher;
 pub mod fetcher_factory;
 pub mod http_cache;
+pub mod ip_filter;
 pub mod metadata_cache;
 pub mod remote_asset_proto;
 mod spill;

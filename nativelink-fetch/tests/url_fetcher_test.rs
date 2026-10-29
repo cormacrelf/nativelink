@@ -23,6 +23,7 @@ use nativelink_error::Code;
 use nativelink_fetch::fetcher::{
     FetchBlobTask, FetchDirectoryJob, FetchHeaders, Fetcher, Revalidation, Validators,
 };
+use nativelink_fetch::ip_filter::IpFilter;
 use nativelink_fetch::url_fetcher::{UrlFetcher, UrlFetcherOptions};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
@@ -165,6 +166,95 @@ fn job(uri: &str, headers: FetchHeaders) -> FetchBlobTask {
     }
 }
 
+/// Options letting the fetcher reach the test servers, which listen on
+/// `127.0.0.1`: by default it refuses loopback addresses.
+fn loopback_options() -> UrlFetcherOptions {
+    UrlFetcherOptions {
+        ip_filter: IpFilter::new(&["127.0.0.1/32".to_string()]).unwrap(),
+        ..UrlFetcherOptions::default()
+    }
+}
+
+#[nativelink_test]
+async fn loopback_is_refused_by_default() {
+    let (origin, seen) = serve(|_| Reply::ok(BODY)).await;
+    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+
+    let err = fetcher
+        .fetch_blob(&job(&format!("{origin}/x"), FetchHeaders::default()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, Code::PermissionDenied, "{err:?}");
+    assert!(
+        err.message_string().contains("allowed_ip_ranges"),
+        "{err:?}"
+    );
+    assert!(seen.lock().is_empty(), "nothing should have been sent");
+}
+
+#[nativelink_test]
+async fn a_host_name_resolving_to_a_refused_address_is_refused() {
+    let (origin, seen) = serve(|_| Reply::ok(BODY)).await;
+    let port = origin.rsplit(':').next().unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+
+    let err = fetcher
+        .fetch_blob(&job(
+            &format!("http://localhost:{port}/x"),
+            FetchHeaders::default(),
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, Code::PermissionDenied, "{err:?}");
+    assert!(seen.lock().is_empty(), "nothing should have been sent");
+}
+
+#[nativelink_test]
+async fn a_redirect_to_a_refused_address_is_not_followed() {
+    // 127.0.0.2 is loopback too, but only 127.0.0.1 is allowed.
+    let (origin, _) = serve(|_| Reply::redirect("http://127.0.0.2:1/metadata")).await;
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
+
+    let err = fetcher
+        .fetch_blob(&job(&format!("{origin}/start"), FetchHeaders::default()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, Code::PermissionDenied, "{err:?}");
+    assert!(err.message_string().contains("127.0.0.2"), "{err:?}");
+}
+
+#[nativelink_test]
+async fn a_refused_mirror_falls_through_to_the_next() {
+    let (origin, _) = serve(|_| Reply::ok(BODY)).await;
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
+
+    let mut task = job("http://169.254.169.254/latest", FetchHeaders::default());
+    task.uris.push(format!("{origin}/x"));
+    let outcome = fetcher.fetch_blob(&task).await.unwrap();
+
+    assert_eq!(outcome.digest, digest_of(BODY));
+    assert_eq!(outcome.uri, format!("{origin}/x"));
+}
+
+#[nativelink_test]
+async fn no_referer_is_sent_on_a_redirect() {
+    let (target, target_seen) = serve(|_| Reply::ok(BODY)).await;
+    let final_url = format!("{target}/final");
+    let (origin, _) = serve(move |_| Reply::redirect(&final_url)).await;
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
+
+    fetcher
+        .fetch_blob(&job(&format!("{origin}/start"), FetchHeaders::default()))
+        .await
+        .unwrap();
+
+    let requests = target_seen.lock().clone();
+    assert!(!requests[0].raw.contains("referer"), "{requests:?}");
+}
+
 fn authorization_header() -> FetchHeaders {
     FetchHeaders::from_qualifiers(
         &[Qualifier {
@@ -182,7 +272,7 @@ async fn a_redirect_is_followed() {
     let final_url = format!("{target}/final");
     let (origin, _) = serve(move |_| Reply::redirect(&final_url)).await;
     let cas = memory_store().await;
-    let fetcher = UrlFetcher::new(cas.clone(), UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(cas.clone(), loopback_options()).unwrap();
 
     let uri = format!("{origin}/start");
     let outcome = fetcher
@@ -200,7 +290,7 @@ async fn authorization_is_not_forwarded_on_a_cross_host_redirect() {
     let (target, target_seen) = serve(|_| Reply::ok(BODY)).await;
     let final_url = format!("{target}/final");
     let (origin, origin_seen) = serve(move |_| Reply::redirect(&final_url)).await;
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
 
     fetcher
         .fetch_blob(&job(&format!("{origin}/start"), authorization_header()))
@@ -227,7 +317,7 @@ async fn authorization_is_not_forwarded_on_a_cross_host_redirect() {
 async fn a_redirect_loop_fails_with_a_clear_error() {
     // Redirects to itself forever.
     let (origin, seen) = serve(|_| Reply::redirect("/again")).await;
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
 
     let err = fetcher
         .fetch_blob(&job(&format!("{origin}/start"), FetchHeaders::default()))
@@ -245,7 +335,7 @@ async fn a_redirect_loop_fails_with_a_clear_error() {
 
 #[nativelink_test]
 async fn freshness_comes_from_the_final_response_after_a_redirect() {
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
 
     // The redirect says no-store, the content says ten minutes.
     let (target, _) = serve(|_| Reply::ok(BODY).with_header("Cache-Control", "max-age=600")).await;
@@ -274,7 +364,7 @@ async fn freshness_comes_from_the_final_response_after_a_redirect() {
 #[nativelink_test]
 async fn freshness_is_none_when_the_response_says_nothing() {
     let (origin, _) = serve(|_| Reply::ok(BODY)).await;
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
     let outcome = fetcher
         .fetch_blob(&job(&format!("{origin}/x"), FetchHeaders::default()))
         .await
@@ -289,7 +379,7 @@ async fn a_directory_fetch_reports_freshness_too() {
         Reply::ok(&archive).with_header("Cache-Control", "public, s-maxage=120, max-age=5")
     })
     .await;
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
 
     let outcome = fetcher
         .fetch_directory(&FetchDirectoryJob {
@@ -349,7 +439,7 @@ fn both_validators() -> Validators {
 #[nativelink_test]
 async fn a_fetch_reports_the_validators_of_the_final_response() {
     let (origin, _) = serve_validating(BODY.to_vec()).await;
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
 
     let outcome = fetcher
         .fetch_blob(&job(&format!("{origin}/x"), FetchHeaders::default()))
@@ -364,7 +454,7 @@ async fn a_fetch_reports_the_validators_of_the_final_response() {
 async fn a_current_blob_is_revalidated_without_downloading_it() {
     let (origin, seen) = serve_validating(BODY.to_vec()).await;
     let cas = memory_store().await;
-    let fetcher = UrlFetcher::new(cas, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(cas, loopback_options()).unwrap();
     let uri = format!("{origin}/x");
     let first = fetcher
         .fetch_blob(&job(&uri, FetchHeaders::default()))
@@ -418,7 +508,7 @@ async fn a_changed_blob_is_downloaded_normally_when_revalidating() {
     })
     .await;
     let cas = memory_store().await;
-    let fetcher = UrlFetcher::new(cas.clone(), UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(cas.clone(), loopback_options()).unwrap();
     let uri = format!("{origin}/x");
 
     let mut revalidating = job(&uri, FetchHeaders::default());
@@ -437,7 +527,7 @@ async fn a_checksum_is_still_checked_on_a_changed_blob_that_was_revalidated() {
     // Revalidation is for unpinned requests, but the verifiers still run on
     // any 200 so a job that carries both cannot skip them.
     let (origin, _) = serve(|_| Reply::ok(b"not what the checksum says")).await;
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
     let uri = format!("{origin}/x");
     let mut revalidating = job(&uri, FetchHeaders::default());
     revalidating.checksums = vec![
@@ -460,7 +550,7 @@ async fn a_revalidated_blob_missing_from_the_cas_is_downloaded_again() {
     let uri = format!("{origin}/x");
     // A CAS that has never held the content the entry names.
     let cas = memory_store().await;
-    let fetcher = UrlFetcher::new(cas.clone(), UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(cas.clone(), loopback_options()).unwrap();
 
     let mut revalidating = job(&uri, FetchHeaders::default());
     revalidating.revalidate = vec![revalidation(&uri, digest_of(BODY), both_validators())];
@@ -480,7 +570,7 @@ async fn a_revalidated_blob_missing_from_the_cas_is_downloaded_again() {
 #[nativelink_test]
 async fn a_revalidation_for_another_uri_is_not_sent() {
     let (origin, seen) = serve_validating(BODY.to_vec()).await;
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
     let uri = format!("{origin}/x");
 
     let mut plain = job(&uri, FetchHeaders::default());
@@ -498,7 +588,7 @@ async fn a_revalidation_for_another_uri_is_not_sent() {
 #[nativelink_test]
 async fn a_304_to_an_unconditional_request_is_an_error() {
     let (origin, _) = serve(|_| Reply::not_modified()).await;
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
 
     let err = fetcher
         .fetch_blob(&job(&format!("{origin}/x"), FetchHeaders::default()))
@@ -532,7 +622,7 @@ async fn a_current_directory_is_revalidated_without_expanding_it() {
     let (origin, seen) = serve_validating(archive).await;
     let uri = format!("{origin}/archive.tar");
     let cas = memory_store().await;
-    let fetcher = UrlFetcher::new(cas.clone(), UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(cas.clone(), loopback_options()).unwrap();
     let first = fetcher.fetch_directory(&directory_job(&uri)).await.unwrap();
     assert_eq!(first.validators, both_validators());
 

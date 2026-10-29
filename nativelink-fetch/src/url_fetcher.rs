@@ -31,6 +31,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use futures::StreamExt;
@@ -61,6 +62,7 @@ use crate::fetcher::{
     SharedDeadline, Validators,
 };
 use crate::http_cache::freshness_lifetime;
+use crate::ip_filter::{FilteringResolver, IpFilter, is_blocked_address};
 use crate::remote_asset_proto::build_tree;
 use crate::tree_hash::{TreeHashContext, TreeHashFailure, TreeHashSet};
 
@@ -102,11 +104,16 @@ fn check_redirect(previous: &[reqwest::Url], next: &reqwest::Url) -> Result<(), 
 }
 
 /// The redirect policy of the HTTP client: follow up to [`MAX_REDIRECTS`]
-/// redirects, but never from https to http. As with reqwest's default,
-/// credentials (`Authorization`, `Cookie`, ...) are stripped when a redirect
-/// goes to another origin: that happens in reqwest whatever the policy.
-fn redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
+/// redirects, but never from https to http, nor to an IP address `ip_filter`
+/// refuses (a redirect to a host name has its addresses checked when it is
+/// resolved). As with reqwest's default, credentials (`Authorization`,
+/// `Cookie`, ...) are stripped when a redirect goes to another origin: that
+/// happens in reqwest whatever the policy.
+fn redirect_policy(ip_filter: Arc<IpFilter>) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if let Err(blocked) = ip_filter.check_url(attempt.url()) {
+            return attempt.error(blocked);
+        }
         match check_redirect(attempt.previous(), attempt.url()) {
             Ok(()) => attempt.follow(),
             Err(message) => attempt.error(message),
@@ -130,11 +137,15 @@ fn describe_error(e: &reqwest::Error) -> String {
 pub const DEFAULT_MAX_FETCH_DURATION: Duration = Duration::from_hours(1);
 
 /// Maps a reqwest error to the appropriate gRPC code: a timeout becomes
-/// `DeadlineExceeded` (per the Remote Asset API `timeout` semantics), anything
-/// else becomes `NotFound`.
+/// `DeadlineExceeded` (per the Remote Asset API `timeout` semantics), a
+/// connection the [`IpFilter`] refused becomes `PermissionDenied` (the Remote
+/// Asset API's code for "an asset from a disallowed origin"), anything else
+/// becomes `NotFound`.
 fn download_error_code(e: &reqwest::Error) -> Code {
     if e.is_timeout() {
         Code::DeadlineExceeded
+    } else if is_blocked_address(e) {
+        Code::PermissionDenied
     } else {
         Code::NotFound
     }
@@ -487,6 +498,16 @@ impl ProxySettings {
         }))
     }
 
+    /// The host of the proxy, which the client resolves and connects to
+    /// itself.
+    fn host(&self) -> Option<String> {
+        reqwest::Url::parse(&self.url).ok()?.host_str().map(|host| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_owned()
+        })
+    }
+
     /// The reqwest proxy that sends all traffic through the proxy, except to
     /// the `no_proxy` hosts.
     fn to_reqwest(&self) -> Result<reqwest::Proxy, Error> {
@@ -517,6 +538,9 @@ pub struct UrlFetcher {
     require_checksum: bool,
     /// Whether `client` sends requests through a proxy (the URL is not kept).
     proxy_configured: bool,
+    /// The addresses `client` may connect to. Also checked here, on IP-address
+    /// URLs, which `client` connects to without resolving.
+    ip_filter: Arc<IpFilter>,
     /// Cap on the total duration of any fetch, whatever the job asks for.
     max_fetch_duration: Duration,
     /// Largest download accepted from any single URI. `None` is unbounded.
@@ -550,6 +574,9 @@ pub struct UrlFetcherOptions {
     /// The forward proxy to fetch through. `None` connects directly. The
     /// `HTTP_PROXY`-style environment variables are never consulted.
     pub proxy: Option<ProxySettings>,
+    /// The addresses the fetcher may connect to. The default refuses every
+    /// address that is not on the public internet.
+    pub ip_filter: IpFilter,
     /// Cap on the total duration of a fetch. A job's `timeout` can only
     /// shorten it. Must not be zero.
     pub max_fetch_duration: Duration,
@@ -569,6 +596,7 @@ impl Default for UrlFetcherOptions {
             max_archive_uncompressed_bytes: Some(DEFAULT_MAX_ARCHIVE_UNCOMPRESSED_BYTES),
             require_checksum: false,
             proxy: None,
+            ip_filter: IpFilter::default(),
             max_fetch_duration: DEFAULT_MAX_FETCH_DURATION,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             read_timeout: DEFAULT_READ_TIMEOUT,
@@ -587,6 +615,7 @@ impl UrlFetcher {
             max_archive_uncompressed_bytes,
             require_checksum,
             proxy,
+            ip_filter,
             max_fetch_duration,
             connect_timeout,
             read_timeout,
@@ -607,13 +636,23 @@ impl UrlFetcher {
         // reqwest is built without a TLS provider, so install the ring one as
         // the process default (a no-op if one is already installed).
         drop(rustls::crypto::ring::default_provider().install_default());
+        let ip_filter = Arc::new(ip_filter);
+        let resolver = FilteringResolver::new(
+            ip_filter.clone(),
+            proxy.as_ref().and_then(ProxySettings::host).as_deref(),
+        );
         // `no_proxy()` first: it turns off reqwest's reading of the proxy
         // environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
         // `NO_PROXY`), so the only proxy is the configured one, if any.
+        // `referer(false)`: some origins (SourceForge among them) answer a
+        // download that arrives with a `Referer` with an HTML page instead,
+        // and reqwest sets one on every redirect by default.
         let mut builder = reqwest::Client::builder()
             .no_proxy()
+            .referer(false)
+            .dns_resolver(resolver)
             .connect_timeout(connect_timeout)
-            .redirect(redirect_policy())
+            .redirect(redirect_policy(ip_filter.clone()))
             .read_timeout(read_timeout);
         if let Some(proxy) = &proxy {
             builder = builder.proxy(proxy.to_reqwest()?);
@@ -631,6 +670,7 @@ impl UrlFetcher {
             client,
             require_checksum,
             proxy_configured: proxy.is_some(),
+            ip_filter,
             max_fetch_duration,
             max_size_bytes,
             archive_entry_inline_threshold: archive_entry_inline_threshold_bytes
@@ -678,13 +718,16 @@ impl UrlFetcher {
     }
 
     /// The request for `uri` (`uris[idx]` of the job), carrying the job's
-    /// headers and, when `revalidation` is given, its validators.
+    /// headers and, when `revalidation` is given, its validators. Fails with
+    /// `PermissionDenied` if `uri` names an IP address the fetcher may not
+    /// connect to.
     fn origin_request(
         &self,
         uri: &str,
         headers: HeaderMap,
         revalidation: Option<&Revalidation>,
-    ) -> OriginRequest {
+    ) -> Result<OriginRequest, Error> {
+        self.ip_filter.check_uri(uri)?;
         let mut headers = headers;
         let mut conditional = false;
         if let Some(revalidation) = revalidation {
@@ -699,10 +742,10 @@ impl UrlFetcher {
                 }
             }
         }
-        OriginRequest {
+        Ok(OriginRequest {
             builder: self.client.get(uri).headers(headers),
             conditional,
-        }
+        })
     }
 
     /// Whether the blob `digest` is still in the CAS.
@@ -891,6 +934,7 @@ impl core::fmt::Debug for UrlFetcher {
             .field("temp_path", &self.temp_path)
             .field("require_checksum", &self.require_checksum)
             .field("proxy_configured", &self.proxy_configured)
+            .field("ip_filter", &self.ip_filter)
             .field("max_fetch_duration", &self.max_fetch_duration)
             .field("max_size_bytes", &self.max_size_bytes)
             .field(
@@ -936,16 +980,21 @@ impl UrlFetcher {
             // download is repeated unconditionally.
             let mut revalidation = job.revalidate.iter().find(|r| r.uri == *uri);
             let attempt = loop {
-                let req = self.origin_request(uri, job.headers.for_uri(idx), revalidation);
-                let attempt = stream_uri_to_file(
-                    req,
-                    uri,
-                    self.max_size_bytes,
-                    &mut verifiers,
-                    job.hasher_func,
-                    &mut file,
-                )
-                .await;
+                let attempt = match self.origin_request(uri, job.headers.for_uri(idx), revalidation)
+                {
+                    Ok(req) => {
+                        stream_uri_to_file(
+                            req,
+                            uri,
+                            self.max_size_bytes,
+                            &mut verifiers,
+                            job.hasher_func,
+                            &mut file,
+                        )
+                        .await
+                    }
+                    Err(err) => FetchAttempt::DownloadFailed(err),
+                };
                 let (FetchAttempt::NotModified(meta), Some(stale)) = (&attempt, revalidation)
                 else {
                     break attempt;
@@ -1052,10 +1101,20 @@ impl UrlFetcher {
             // Revalidated once, as for a blob.
             let mut revalidation = job.revalidate.iter().find(|r| r.uri == *uri);
             let attempt = loop {
-                let req = self.origin_request(uri, job.headers.for_uri(idx), revalidation);
-                let attempt = self
-                    .stream_uri_to_directory(req, uri, &mut verifiers, &job.checksums, &options)
-                    .await;
+                let attempt = match self.origin_request(uri, job.headers.for_uri(idx), revalidation)
+                {
+                    Ok(req) => {
+                        self.stream_uri_to_directory(
+                            req,
+                            uri,
+                            &mut verifiers,
+                            &job.checksums,
+                            &options,
+                        )
+                        .await
+                    }
+                    Err(err) => FetchAttempt::DownloadFailed(err),
+                };
                 let (FetchAttempt::NotModified(meta), Some(stale)) = (&attempt, revalidation)
                 else {
                     break attempt;
