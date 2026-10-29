@@ -13,6 +13,7 @@ rust_library(
         "src/background_fetcher.rs",
         "src/fetcher.rs",
         "src/fetcher_factory.rs",
+        "src/ip_filter.rs",
         "src/lib.rs",
         "src/metadata_cache.rs",
         "src/remote_asset_proto.rs",

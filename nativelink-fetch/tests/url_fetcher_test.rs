@@ -20,6 +20,7 @@ use std::sync::Arc;
 use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_error::Code;
 use nativelink_fetch::fetcher::{FetchBlobTask, FetchHeaders, Fetcher};
+use nativelink_fetch::ip_filter::IpFilter;
 use nativelink_fetch::url_fetcher::{UrlFetcher, UrlFetcherOptions};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
@@ -154,6 +155,95 @@ fn job(uri: &str, headers: FetchHeaders) -> FetchBlobTask {
     }
 }
 
+/// Options letting the fetcher reach the test servers, which listen on
+/// `127.0.0.1`: by default it refuses loopback addresses.
+fn loopback_options() -> UrlFetcherOptions {
+    UrlFetcherOptions {
+        ip_filter: IpFilter::new(&["127.0.0.1/32".to_string()]).unwrap(),
+        ..UrlFetcherOptions::default()
+    }
+}
+
+#[nativelink_test]
+async fn loopback_is_refused_by_default() {
+    let (origin, seen) = serve(|_| Reply::ok(BODY)).await;
+    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+
+    let err = fetcher
+        .fetch_blob(&job(&format!("{origin}/x"), FetchHeaders::default()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, Code::PermissionDenied, "{err:?}");
+    assert!(
+        err.message_string().contains("allowed_ip_ranges"),
+        "{err:?}"
+    );
+    assert!(seen.lock().is_empty(), "nothing should have been sent");
+}
+
+#[nativelink_test]
+async fn a_host_name_resolving_to_a_refused_address_is_refused() {
+    let (origin, seen) = serve(|_| Reply::ok(BODY)).await;
+    let port = origin.rsplit(':').next().unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+
+    let err = fetcher
+        .fetch_blob(&job(
+            &format!("http://localhost:{port}/x"),
+            FetchHeaders::default(),
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, Code::PermissionDenied, "{err:?}");
+    assert!(seen.lock().is_empty(), "nothing should have been sent");
+}
+
+#[nativelink_test]
+async fn a_redirect_to_a_refused_address_is_not_followed() {
+    // 127.0.0.2 is loopback too, but only 127.0.0.1 is allowed.
+    let (origin, _) = serve(|_| Reply::redirect("http://127.0.0.2:1/metadata")).await;
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
+
+    let err = fetcher
+        .fetch_blob(&job(&format!("{origin}/start"), FetchHeaders::default()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, Code::PermissionDenied, "{err:?}");
+    assert!(err.message_string().contains("127.0.0.2"), "{err:?}");
+}
+
+#[nativelink_test]
+async fn a_refused_mirror_falls_through_to_the_next() {
+    let (origin, _) = serve(|_| Reply::ok(BODY)).await;
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
+
+    let mut task = job("http://169.254.169.254/latest", FetchHeaders::default());
+    task.uris.push(format!("{origin}/x"));
+    let outcome = fetcher.fetch_blob(&task).await.unwrap();
+
+    assert_eq!(outcome.digest, digest_of(BODY));
+    assert_eq!(outcome.uri, format!("{origin}/x"));
+}
+
+#[nativelink_test]
+async fn no_referer_is_sent_on_a_redirect() {
+    let (target, target_seen) = serve(|_| Reply::ok(BODY)).await;
+    let final_url = format!("{target}/final");
+    let (origin, _) = serve(move |_| Reply::redirect(&final_url)).await;
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
+
+    fetcher
+        .fetch_blob(&job(&format!("{origin}/start"), FetchHeaders::default()))
+        .await
+        .unwrap();
+
+    let requests = target_seen.lock().clone();
+    assert!(!requests[0].raw.contains("referer"), "{requests:?}");
+}
+
 fn authorization_header() -> FetchHeaders {
     FetchHeaders::from_qualifiers(
         &[Qualifier {
@@ -171,7 +261,7 @@ async fn a_redirect_is_followed() {
     let final_url = format!("{target}/final");
     let (origin, _) = serve(move |_| Reply::redirect(&final_url)).await;
     let cas = memory_store().await;
-    let fetcher = UrlFetcher::new(cas.clone(), UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(cas.clone(), loopback_options()).unwrap();
 
     let uri = format!("{origin}/start");
     let outcome = fetcher
@@ -189,7 +279,7 @@ async fn authorization_is_not_forwarded_on_a_cross_host_redirect() {
     let (target, target_seen) = serve(|_| Reply::ok(BODY)).await;
     let final_url = format!("{target}/final");
     let (origin, origin_seen) = serve(move |_| Reply::redirect(&final_url)).await;
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
 
     fetcher
         .fetch_blob(&job(&format!("{origin}/start"), authorization_header()))
@@ -216,7 +306,7 @@ async fn authorization_is_not_forwarded_on_a_cross_host_redirect() {
 async fn a_redirect_loop_fails_with_a_clear_error() {
     // Redirects to itself forever.
     let (origin, seen) = serve(|_| Reply::redirect("/again")).await;
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
 
     let err = fetcher
         .fetch_blob(&job(&format!("{origin}/start"), FetchHeaders::default()))
@@ -236,7 +326,7 @@ async fn a_redirect_loop_fails_with_a_clear_error() {
 /// through, and each would otherwise be taken for the content.
 #[nativelink_test]
 async fn a_status_other_than_200_is_an_error() {
-    let fetcher = UrlFetcher::new(memory_store().await, UrlFetcherOptions::default()).unwrap();
+    let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
     for status in [
         "202 Accepted",
         "204 No Content",

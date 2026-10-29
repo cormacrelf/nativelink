@@ -350,6 +350,7 @@ fn make_fetch_server_with_cas_and_limit(
             cas_store: String::from("test_cas_store"),
             temp_path: None,
             max_size_bytes,
+            allowed_ip_ranges: loopback_ranges(),
             ..Default::default()
         },
     )
@@ -1926,6 +1927,7 @@ async fn test_max_fetch_duration_caps_the_request_timeout() -> Result<(), Status
         UrlFetcherSpec {
             cas_store: String::from("test_cas_store"),
             max_fetch_duration_s: Some(1),
+            allowed_ip_ranges: loopback_ranges(),
             ..Default::default()
         },
     );
@@ -1975,6 +1977,7 @@ async fn test_background_clamps_apply_to_the_total_timeout() -> Result<(), Statu
         &store_manager,
         UrlFetcherSpec {
             cas_store: String::from("test_cas_store"),
+            allowed_ip_ranges: loopback_ranges(),
             ..Default::default()
         },
         None,
@@ -2264,6 +2267,7 @@ fn proxy_spec(
         http_proxy: http_proxy.map(str::to_owned),
         http_proxy_secret_file: http_proxy_secret_file.map(str::to_owned),
         no_proxy: no_proxy.iter().map(|host| (*host).to_owned()).collect(),
+        allowed_ip_ranges: loopback_ranges(),
         ..Default::default()
     }
 }
@@ -2274,6 +2278,12 @@ fn proxy_spec(
 async fn serve_proxy(body: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
     let (uri, requests) = serve_recording(body).await;
     (uri.trim_end_matches("/blob").to_owned(), requests)
+}
+
+/// `allowed_ip_ranges` letting a `url` fetcher reach the test servers, which
+/// listen on `127.0.0.1`: by default it refuses loopback addresses.
+fn loopback_ranges() -> Vec<String> {
+    vec!["127.0.0.1/32".to_owned()]
 }
 
 /// Builds the URL fetcher `spec` describes, the way the server does.
@@ -2485,6 +2495,7 @@ fn require_checksum_spec() -> UrlFetcherSpec {
     UrlFetcherSpec {
         cas_store: String::from("test_cas_store"),
         require_checksum: true,
+        allowed_ip_ranges: loopback_ranges(),
         ..Default::default()
     }
 }
