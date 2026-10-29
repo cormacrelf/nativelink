@@ -471,8 +471,9 @@ fn rpc_wait_deadline(metadata: &MetadataMap) -> Option<TokioInstant> {
 /// `timeout`.
 ///
 /// Giving up only drops this call's wait. With a `background` fetcher in the
-/// chain the fetch carries on and a retry of the same request joins it; without
-/// one the fetch is dropped along with the wait and a retry starts afresh.
+/// chain the fetch carries on and a retry of the same pinned request joins it;
+/// without one the fetch is dropped along with the wait and a retry starts
+/// afresh.
 async fn until_rpc_deadline<T>(
     deadline: Option<TokioInstant>,
     fetch: impl Future<Output = Result<T, Error>>,
@@ -484,8 +485,8 @@ async fn until_rpc_deadline<T>(
         Status::new(
             Code::DeadlineExceeded,
             "The fetch did not finish within the RPC deadline. A fetch run by a background \
-             fetcher continues, and retrying the same request joins it; retry for at least \
-             as long as the request's timeout",
+             fetcher continues, and retrying the same request joins it if the request carries \
+             a checksum; retry for at least as long as the request's timeout",
         )
     })
 }

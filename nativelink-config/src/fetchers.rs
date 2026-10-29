@@ -64,8 +64,8 @@ pub enum FetcherSpec {
     Url(UrlFetcherSpec),
     /// Writes fetched-asset metadata into an Action Cache store on success.
     MetadataCache(MetadataCacheSpec),
-    /// Joins identical in-flight fetches and keeps them running past a
-    /// client's RPC deadline.
+    /// Joins identical in-flight pinned fetches and keeps fetches running past
+    /// a client's RPC deadline.
     Background(BackgroundSpec),
     /// Verifies fetched directories by running the action a request names in
     /// its `checksum.action_digest` qualifier.
@@ -328,10 +328,12 @@ pub struct MetadataCacheSpec {
 
 /// A decorator providing in-flight deduplication and background continuation.
 ///
-/// Identical requests share one fetch. It runs until the latest of their
-/// timeouts (after `min_timeout_s` and `max_timeout_s`), each counted from when
-/// its request started or joined the fetch, so a request with a short timeout
-/// does not cut it short for one with a longer timeout. Each request still gets
+/// Identical pinned requests (ones that carry a checksum) share one fetch; an
+/// unpinned request always runs its own, since it accepts only what the origin
+/// serves now. A shared fetch runs until the latest of its requests' timeouts
+/// (after `min_timeout_s` and `max_timeout_s`), each counted from when its
+/// request started or joined the fetch, so a request with a short timeout does
+/// not cut it short for one with a longer timeout. Each request still gets
 /// `DEADLINE_EXCEEDED` once its own timeout has passed with the download under
 /// way. Time spent waiting for one of `max_concurrent_fetches` does not count
 /// against a timeout; only the RPC deadline bounds it.

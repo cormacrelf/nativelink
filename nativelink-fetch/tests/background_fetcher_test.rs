@@ -25,6 +25,7 @@ use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
+use nativelink_util::sri::ByteChecksum;
 use parking_lot::Mutex;
 use tokio::sync::{Semaphore, mpsc};
 use tonic::async_trait;
@@ -144,13 +145,21 @@ fn blob_job(uri: &str, timeout: Option<Duration>) -> FetchBlobTask {
     }
 }
 
+/// A [`blob_job`] that carries a checksum, so identical ones share a fetch.
+fn pinned_blob_job(uri: &str, timeout: Option<Duration>) -> FetchBlobTask {
+    let mut job = blob_job(uri, timeout);
+    job.checksums = vec![ByteChecksum::from_qualifier("checksum.sha256", &"0".repeat(64)).unwrap()];
+    assert!(job.is_pinned());
+    job
+}
+
 #[nativelink_test]
 async fn dedups_concurrent_identical_jobs() {
     let (mock, mut handles) = mock_fetcher(true);
     let bg = BackgroundFetcher::new(mock, BackgroundFetcherOpts::default());
 
     // Three concurrent requests for the same job.
-    let job = blob_job("http://example/blob", None);
+    let job = pinned_blob_job("http://example/blob", None);
     let awaiters: Vec<_> = (0..3)
         .map(|_| {
             let bg = bg.clone();
@@ -179,9 +188,9 @@ async fn dedups_despite_different_timeout_and_qualifier_order() {
     let bg = BackgroundFetcher::new(mock, BackgroundFetcherOpts::default());
 
     let qualifier = |name: &str, value: &str| (name.to_owned(), value.to_owned());
-    let mut first = blob_job("http://example/blob", Some(Duration::from_secs(5)));
+    let mut first = pinned_blob_job("http://example/blob", Some(Duration::from_secs(5)));
     first.qualifiers = vec![qualifier("a", "1"), qualifier("b", "2")];
-    let mut second = blob_job("http://example/blob", Some(Duration::from_mins(1)));
+    let mut second = pinned_blob_job("http://example/blob", Some(Duration::from_mins(1)));
     second.qualifiers = vec![qualifier("b", "2"), qualifier("a", "1")];
 
     let first_call = {
@@ -220,6 +229,42 @@ fn headers(qualifiers: &[(&str, &str)]) -> FetchHeaders {
 }
 
 #[nativelink_test]
+async fn concurrent_identical_unpinned_jobs_each_run_their_own_fetch() {
+    let (mock, mut handles) = mock_fetcher(true);
+    let bg = BackgroundFetcher::new(mock, BackgroundFetcherOpts::default());
+
+    // An unpinned request accepts only what the origin serves after it was
+    // made, so the second must not join the first's fetch.
+    let job = blob_job("http://example/blob", None);
+    assert!(!job.is_pinned());
+    let first = {
+        let bg = bg.clone();
+        let job = job.clone();
+        tokio::spawn(async move { bg.fetch_blob(&job).await })
+    };
+    handles
+        .start_rx
+        .recv()
+        .await
+        .expect("the first fetch starts");
+    let second = {
+        let bg = bg.clone();
+        tokio::spawn(async move { bg.fetch_blob(&job).await })
+    };
+    handles
+        .start_rx
+        .recv()
+        .await
+        .expect("the second fetch starts");
+
+    handles.gate.add_permits(2);
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert_eq!(handles.started.load(Ordering::SeqCst), 2);
+    assert_eq!(handles.completed.load(Ordering::SeqCst), 2);
+}
+
+#[nativelink_test]
 async fn jobs_with_different_headers_do_not_share_a_fetch() {
     let (mock, mut handles) = mock_fetcher(true);
     let bg = BackgroundFetcher::new(mock, BackgroundFetcherOpts::default());
@@ -227,12 +272,12 @@ async fn jobs_with_different_headers_do_not_share_a_fetch() {
     // Differing only in a global header, or only in a URI-specific one.
     let mut jobs = Vec::new();
     for token in ["Bearer a", "Bearer b"] {
-        let mut job = blob_job("http://example/blob", None);
+        let mut job = pinned_blob_job("http://example/blob", None);
         job.headers = headers(&[("http_header:Authorization", token)]);
         jobs.push(job);
     }
     for token in ["Bearer a", "Bearer b"] {
-        let mut job = blob_job("http://example/blob", None);
+        let mut job = pinned_blob_job("http://example/blob", None);
         job.headers = headers(&[("http_header_url:0:Authorization", token)]);
         jobs.push(job);
     }
@@ -260,14 +305,14 @@ async fn jobs_with_the_same_headers_in_another_order_share_a_fetch() {
     let (mock, mut handles) = mock_fetcher(true);
     let bg = BackgroundFetcher::new(mock, BackgroundFetcherOpts::default());
 
-    let mut first = blob_job("http://example/blob", None);
+    let mut first = pinned_blob_job("http://example/blob", None);
     first.headers = headers(&[
         ("http_header:Authorization", "Bearer a"),
         ("http_header:X-Other", "other"),
         ("http_header_url:0:X-Mirror", "0"),
         ("http_header_url:1:X-Mirror", "1"),
     ]);
-    let mut second = blob_job("http://example/blob", None);
+    let mut second = pinned_blob_job("http://example/blob", None);
     second.headers = headers(&[
         ("http_header_url:1:x-mirror", "1"),
         ("http_header:x-other", "other"),
@@ -349,14 +394,20 @@ async fn queued_caller_that_disconnects_leaves_no_fetch_behind() {
     // The first fetch takes the only slot.
     let running = {
         let bg = bg.clone();
-        tokio::spawn(async move { bg.fetch_blob(&blob_job("http://example/a", None)).await })
+        tokio::spawn(async move {
+            bg.fetch_blob(&pinned_blob_job("http://example/a", None))
+                .await
+        })
     };
     handles.start_rx.recv().await.expect("first fetch starts");
 
     // A second, distinct fetch queues for the slot; its caller then goes away.
     let queued = {
         let bg = bg.clone();
-        tokio::spawn(async move { bg.fetch_blob(&blob_job("http://example/b", None)).await })
+        tokio::spawn(async move {
+            bg.fetch_blob(&pinned_blob_job("http://example/b", None))
+                .await
+        })
     };
     tokio::time::sleep(Duration::from_millis(50)).await;
     queued.abort();
@@ -382,7 +433,10 @@ async fn identical_callers_queued_for_a_slot_share_one_fetch() {
 
     let running = {
         let bg = bg.clone();
-        tokio::spawn(async move { bg.fetch_blob(&blob_job("http://example/a", None)).await })
+        tokio::spawn(async move {
+            bg.fetch_blob(&pinned_blob_job("http://example/a", None))
+                .await
+        })
     };
     handles.start_rx.recv().await.expect("first fetch starts");
 
@@ -391,7 +445,10 @@ async fn identical_callers_queued_for_a_slot_share_one_fetch() {
     let mut queued: Vec<_> = (0..3)
         .map(|_| {
             let bg = bg.clone();
-            tokio::spawn(async move { bg.fetch_blob(&blob_job("http://example/b", None)).await })
+            tokio::spawn(async move {
+                bg.fetch_blob(&pinned_blob_job("http://example/b", None))
+                    .await
+            })
         })
         .collect();
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -413,13 +470,13 @@ async fn short_timeout_does_not_cut_short_a_longer_joined_one() {
 
     let short = {
         let bg = bg.clone();
-        let job = blob_job("http://example/blob", Some(Duration::from_millis(100)));
+        let job = pinned_blob_job("http://example/blob", Some(Duration::from_millis(100)));
         tokio::spawn(async move { bg.fetch_blob(&job).await })
     };
     handles.start_rx.recv().await.expect("a fetch should start");
     let long = {
         let bg = bg.clone();
-        let job = blob_job("http://example/blob", Some(Duration::from_mins(1)));
+        let job = pinned_blob_job("http://example/blob", Some(Duration::from_mins(1)));
         tokio::spawn(async move { bg.fetch_blob(&job).await })
     };
 

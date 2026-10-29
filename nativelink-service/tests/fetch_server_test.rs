@@ -3751,8 +3751,10 @@ async fn test_rpc_deadline_returns_deadline_exceeded_and_a_retry_joins_the_fetch
     let (uri, requests) =
         serve_trickling(HELLO_WORLD.to_vec(), 1, Duration::from_millis(100)).await;
 
-    // The client's RPC deadline is 300ms, far short of the fetch.
-    let mut request = blob_request(vec![uri.clone()], vec![]);
+    // The client's RPC deadline is 300ms, far short of the fetch. The request is
+    // pinned, since only a pinned request joins an in-flight fetch.
+    let pinned = || vec![header_qualifier("checksum.sri", HELLO_WORLD_SRI)];
+    let mut request = blob_request(vec![uri.clone()], pinned());
     request.set_timeout(Duration::from_millis(300));
     let started = Instant::now();
     let err = fs
@@ -3776,7 +3778,7 @@ async fn test_rpc_deadline_returns_deadline_exceeded_and_a_retry_joins_the_fetch
     // deadline joins it and gets the finished result without a second request
     // to the origin.
     let response = fs
-        .fetch_blob(blob_request(vec![uri], vec![]))
+        .fetch_blob(blob_request(vec![uri], pinned()))
         .await?
         .into_inner();
     assert_eq!(
@@ -3800,8 +3802,12 @@ async fn test_short_timeout_does_not_fail_a_longer_identical_request() -> Result
     let (uri, requests) =
         serve_trickling(HELLO_WORLD.to_vec(), 1, Duration::from_millis(100)).await;
 
+    // Pinned, so the long request joins the short one's fetch.
     let with_timeout = |timeout: prost_types::Duration| {
-        let mut request = blob_request(vec![uri.clone()], vec![]);
+        let mut request = blob_request(
+            vec![uri.clone()],
+            vec![header_qualifier("checksum.sri", HELLO_WORLD_SRI)],
+        );
         request.get_mut().timeout = Some(timeout);
         request
     };

@@ -178,20 +178,24 @@ malformed one fails the call with `INVALID_ARGUMENT`.
 
 The timeout does not bound the RPC. When the RPC deadline comes first the call
 fails with a `DEADLINE_EXCEEDED` RPC error, and a fetch run by a `background`
-fetcher carries on; retrying the same request joins it. Nor does it count time
-spent waiting for one of the `background` fetcher's `max_concurrent_fetches`
-slots, which retrieves nothing: only the RPC deadline bounds that wait, and a
-client that goes away while waiting leaves no work behind.
+fetcher carries on; retrying the same pinned request joins it. Nor does it count
+time spent waiting for one of the `background` fetcher's
+`max_concurrent_fetches` slots, which retrieves nothing: only the RPC deadline
+bounds that wait, and a client that goes away while waiting leaves no work
+behind.
 
-Identical concurrent requests share one fetch. Requests that send different
-`http_header:` or `http_header_url:` qualifiers are not identical: different
-credentials can get different answers from the origin, so each runs its own
-fetch. A shared fetch runs until the latest of its requests' timeouts, each
-counted from when its request arrived at the running fetch, so a request with a
-short timeout does not cut the fetch short for one with a longer timeout. Each
-request still gets `DEADLINE_EXCEEDED` once its own timeout has passed with the
-download under way. Time an `action_verify` fetcher spends running its action
-is not counted.
+Identical concurrent pinned requests, ones that carry a checksum, share one
+fetch. An unpinned request always runs its own: it accepts only what the origin
+serves now, and Bazel sets `oldest_content_accepted` to the time of the request,
+so joining a fetch that started earlier could hand it older content. Requests
+that send different `http_header:` or `http_header_url:` qualifiers are not
+identical: different credentials can get different answers from the origin, so
+each runs its own fetch. A shared fetch runs until the latest of its requests'
+timeouts, each counted from when its request arrived at the running fetch, so a
+request with a short timeout does not cut the fetch short for one with a longer
+timeout. Each request still gets `DEADLINE_EXCEEDED` once its own timeout has
+passed with the download under way. Time an `action_verify` fetcher spends
+running its action is not counted.
 
 <SourceLink file="nativelink-fetch/src/fetcher.rs" symbol="SharedDeadline" />
 
@@ -254,8 +258,8 @@ it could serve. A pinned request is never checked this way, and an entry with ne
 header) is downloaded again as before.
 
 The stale entry travels on the fetch job as a request parameter, outside its
-identity, so it does not stop identical concurrent requests from sharing one
-in-flight fetch.
+identity. Only unpinned requests carry one, and those never share an in-flight
+fetch, so each fetch checks its own request's entry.
 
 <SourceLink file="nativelink-fetch/src/fetcher.rs" symbol="Revalidation" />
 <SourceLink file="nativelink-fetch/src/url_fetcher.rs" symbol="UrlFetcher" />

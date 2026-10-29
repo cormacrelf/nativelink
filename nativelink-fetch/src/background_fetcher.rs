@@ -23,16 +23,18 @@
 //! [`tokio::sync::watch`] sender; callers merely *subscribe* to the result. If
 //! a client gives up on its RPC the subscriber is dropped, but the detached
 //! task -- and the watch sender it owns -- keeps running to completion. A
-//! concurrent or subsequent identical request finds the in-flight entry and
-//! subscribes to the same task instead of starting a new download.
+//! concurrent or subsequent identical pinned request (one that carries a
+//! checksum) finds the in-flight entry and subscribes to the same task instead
+//! of starting a new download. An unpinned request always runs its own fetch.
 //!
 //! A request's `timeout` is, in the API's words, "the timeout for the
 //! underlying fetch, if content needs to be retrieved from origin". It bounds
 //! the server's retrieval, not the RPC (the client's RPC deadline does that)
 //! and not time queued for a concurrency slot, which retrieves nothing: a
-//! queued caller is bounded by its RPC deadline alone. Identical requests share
-//! one fetch, which runs until the latest of their deadlines, while each
-//! request still gets `DEADLINE_EXCEEDED` at its own (see [`SharedDeadline`]).
+//! queued caller is bounded by its RPC deadline alone. Identical pinned
+//! requests share one fetch, which runs until the latest of their deadlines,
+//! while each request still gets `DEADLINE_EXCEEDED` at its own (see
+//! [`SharedDeadline`]).
 //!
 //! This mirrors the kernel of the scheduler's `MemoryAwaitedActionDb`
 //! (`HashMap<key, watch::Sender<..>>` + `subscribe()`), but with the opposite
@@ -154,6 +156,7 @@ impl<K: Eq + Hash> Drop for QueuedEntry<'_, K> {
 /// Subscribes to the fetch for `key`, or starts one by spawning a detached task
 /// running `run`, under a [`SharedDeadline`] that starts at `timeout`. Returns a
 /// receiver the caller can await; dropping it does not cancel a spawned task.
+/// When `share` is false the fetch neither joins nor can be joined.
 ///
 /// The concurrency permit (when configured) is taken here, by the caller,
 /// before anything is spawned. A caller queued for a slot holds nothing but its
@@ -166,6 +169,7 @@ async fn schedule_or_join<K, F, Fut>(
     map: &Arc<Mutex<HashMap<K, SharedResult>>>,
     permits: Option<&Arc<Semaphore>>,
     key: K,
+    share: bool,
     timeout: Option<Duration>,
     run: F,
 ) -> SharedResult
@@ -174,19 +178,16 @@ where
     F: FnOnce(SharedDeadline) -> Fut + Send + 'static,
     Fut: Future<Output = Result<FetchOutcome, Error>> + Send + 'static,
 {
-    let (tx, rx) = {
+    let key = share.then_some(key);
+    let (tx, rx) = watch::channel(FetchState::Queued);
+    if let Some(key) = &key {
         let mut guard = map.lock();
-        if let Some(rx) = guard.get(&key) {
-            return rx.clone();
+        if let Some(existing) = guard.get(key) {
+            return existing.clone();
         }
-        let (tx, rx) = watch::channel(FetchState::Queued);
         guard.insert(key.clone(), rx.clone());
-        (tx, rx)
-    };
-    let mut queued = QueuedEntry {
-        map,
-        key: Some(key),
-    };
+    }
+    let mut queued = QueuedEntry { map, key };
     let permit: Option<OwnedSemaphorePermit> = match permits {
         // `acquire_owned` only fails if the semaphore is closed, which we
         // never do.
@@ -199,7 +200,7 @@ where
         ),
         None => None,
     };
-    let key = queued.key.take().expect("set above");
+    let key = queued.key.take();
     // The deadline starts now, not when the request arrived: the timeout bounds
     // the retrieval from origin, and time queued for a slot is not part of it.
     let deadline = SharedDeadline::new(timeout);
@@ -212,7 +213,9 @@ where
         // Publish first so a late subscriber that joined just before removal
         // still sees the result, then drop the in-flight entry.
         tx.send_replace(FetchState::Done(Arc::new(result)));
-        map.lock().remove(&key);
+        if let Some(key) = key {
+            map.lock().remove(&key);
+        }
     });
     rx
 }
@@ -282,6 +285,9 @@ impl Fetcher for BackgroundFetcher {
                 &self.blob_in_flight,
                 self.permits.as_ref(),
                 job.clone(),
+                // An unpinned request accepts only what the origin serves now, so it
+                // must not take the result of a fetch that started before it.
+                job.is_pinned(),
                 job.timeout,
                 move |deadline| async move {
                     run_job.shared_deadline = Some(deadline);
@@ -305,6 +311,7 @@ impl Fetcher for BackgroundFetcher {
                 &self.dir_in_flight,
                 self.permits.as_ref(),
                 job.clone(),
+                job.is_pinned(),
                 job.timeout,
                 move |deadline| async move {
                     run_job.shared_deadline = Some(deadline);

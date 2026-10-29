@@ -228,10 +228,9 @@ impl Validators {
 /// otherwise it proceeds as if there were no cached answer.
 ///
 /// It is a parameter of the request, not part of its identity: it is excluded
-/// from `Hash`/`Eq`, so it cannot make identical requests stop sharing an
-/// in-flight fetch. Which of two concurrent callers' stale entries the shared
-/// fetch revalidates is immaterial: both name the same URI, and a `304` or a
-/// `200` answers both.
+/// from `Hash`/`Eq`. Only an unpinned request carries one, and an unpinned
+/// request never shares an in-flight fetch, so each fetch revalidates its own
+/// caller's stale entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Revalidation {
     /// The URI the stale answer was stored for; the fetcher uses it only for
@@ -244,7 +243,7 @@ pub struct Revalidation {
     pub validators: Validators,
 }
 
-/// The deadline of a fetch shared by identical requests, set on the job by
+/// The deadline of a fetch shared by identical pinned requests, set on the job by
 /// [`crate::background_fetcher::BackgroundFetcher`].
 ///
 /// A request's `timeout` bounds the retrieval from origin, so a fetch that
@@ -343,7 +342,8 @@ impl SharedDeadline {
 /// `headers` (see [`FetchHeaders`]). Other per-request parameters such as
 /// `timeout` are deliberately excluded, so a concurrent duplicate joins the
 /// in-flight fetch, which runs until the latest of the requesters' deadlines
-/// (see [`SharedDeadline`]).
+/// (see [`SharedDeadline`]). Only pinned jobs (see [`Self::is_pinned`]) are
+/// shared this way; an unpinned job always runs its own fetch.
 #[derive(Clone, Debug)]
 pub struct FetchBlobTask {
     /// Candidate URIs, tried in order until one serves valid content.
