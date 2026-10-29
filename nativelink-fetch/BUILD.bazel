@@ -17,6 +17,7 @@ rust_library(
         "src/lib.rs",
         "src/metadata_cache.rs",
         "src/remote_asset_proto.rs",
+        "src/route_fetcher.rs",
         "src/url_fetcher.rs",
     ],
     visibility = ["//visibility:public"],
@@ -46,6 +47,7 @@ rust_test_suite(
     srcs = [
         "tests/background_fetcher_test.rs",
         "tests/metadata_cache_test.rs",
+        "tests/route_fetcher_test.rs",
         "tests/url_fetcher_test.rs",
     ],
     proc_macro_deps = [

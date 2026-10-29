@@ -41,7 +41,9 @@ pub type FetcherRefName = String;
 /// ([`FetcherSpec::MetadataCache`], [`FetcherSpec::Background`]) wrap an inner
 /// fetcher referenced by name. A production config typically composes
 /// `Background -> MetadataCache -> Url` so that the metadata write happens
-/// inside the background unit of work that joins identical fetches.
+/// inside the background unit of work that joins identical fetches. `Route`,
+/// when used, goes inside `MetadataCache`, and picks between `Url` fetchers
+/// (or whole chains) by host, port and path.
 ///
 /// A fetcher can only name fetchers listed before it.
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -55,6 +57,9 @@ pub enum FetcherSpec {
     /// Joins identical in-flight pinned fetches and keeps fetches running past
     /// a client's RPC deadline.
     Background(BackgroundSpec),
+    /// Sends each URI to a fetcher chosen by its host, scheme, port and path.
+    /// Without `otherwise`, any other URI is refused: an allowlist.
+    Route(RouteSpec),
 }
 
 /// The leaf fetcher: performs the HTTP or HTTPS download and CAS upload.
@@ -269,4 +274,126 @@ pub struct BackgroundSpec {
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
     pub max_timeout_s: Option<u64>,
+}
+
+/// A fetcher that sends each URI to another fetcher, chosen by the URI's host
+/// and, optionally, its scheme, port and path and the request's qualifiers.
+/// Use it to send some hosts
+/// through a proxy and others directly, to let a `url` fetcher with internal
+/// `allowed_ip_ranges` reach only the internal hosts (and ports) it is meant
+/// for, or, leaving out `otherwise`, to fetch only from listed hosts or only
+/// from listed paths on them, such as one organization's repositories.
+///
+/// Each URI goes to the fetcher of the first route that matches it, and to
+/// `otherwise` if none does. Routes are tried in the order written, not by
+/// how specific they are, so put a narrower route before a broader one to
+/// the same host. When there is no `otherwise`, a URI that matches no route
+/// is not fetched, and a request whose URIs all match none fails with
+/// `PERMISSION_DENIED`, the Remote Asset API's code for an asset from a
+/// disallowed origin. Pushed assets and cached fetches are served whatever
+/// their URI: routing only decides what is downloaded.
+///
+/// A request lists mirrors of one asset. They are grouped by the fetcher they
+/// go to, and each group is fetched as a request of its own, with its URIs in
+/// their original order; the groups are tried in the order of their first
+/// URI, until one produces the asset. The request's `timeout` covers all of
+/// them. A request whose URIs all go to one fetcher, the usual case, is
+/// passed on unchanged.
+///
+/// Routing matches the URI as the request names it, before any redirect: a
+/// route to a `url` fetcher allows whatever that URI redirects to, on any
+/// host or path. Redirect targets are still subject to the `url` fetcher's
+/// `allowed_ip_ranges`, and are never followed from `https` to `http`.
+///
+/// Routes grant: a URI that a route misses goes to the next route or to
+/// `otherwise`. So use a route to send URIs to a fetcher that may do more,
+/// not to one that may do less, since a URI written to miss it (other case,
+/// other encoding) falls through to the rest. The same goes for
+/// `qualifiers`, which the client chooses: a route that requires one picks a
+/// fetcher for the requests that carry it, and keeps no client from adding it
+/// or leaving it out.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct RouteSpec {
+    /// The routes, tried in order: a URI goes to the first that matches it.
+    pub routes: Vec<FetchRouteSpec>,
+
+    /// The fetcher (from the `fetchers` list) for URIs that match no route.
+    /// When unset, those URIs are refused.
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub otherwise: Option<FetcherRefName>,
+}
+
+/// One route of a [`RouteSpec`]. A URI matches it when its host matches one
+/// of `hosts`, its scheme, port and path each match one entry of `schemes`,
+/// `ports` and `path_prefixes`, and its request carries every one of
+/// `qualifiers`. To match one combination or
+/// another, write two routes to the same fetcher.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct FetchRouteSpec {
+    /// The hosts this route takes. Each is a host name, matched exactly and
+    /// ignoring case (`"github.com"` matches `github.com` but not
+    /// `api.github.com`); `*.` and a host name, matching every subdomain of it
+    /// but not the name itself (`"*.githubusercontent.com"`); or an IP
+    /// address, matched exactly. No scheme, port or path. Must not be empty.
+    #[serde(deserialize_with = "convert_vec_string_with_shellexpand")]
+    pub hosts: Vec<String>,
+
+    /// The schemes this route takes: `"http"`, `"https"` or both.
+    /// Default: both.
+    #[serde(default, deserialize_with = "convert_vec_string_with_shellexpand")]
+    pub schemes: Vec<String>,
+
+    /// The ports this route takes. Without it, a route takes only the
+    /// scheme's own port (443 for `https`, 80 for `http`), so that a route to
+    /// a host does not also reach the other services on it. Listing ports
+    /// replaces that: `[443, 8443]` takes both, `[8443]` only `8443`.
+    /// Default: the scheme's own port.
+    #[serde(default)]
+    pub ports: Vec<u16>,
+
+    /// The paths this route takes, each a prefix matched by whole segments
+    /// and case-sensitively: `"/bazelbuild"` (or `"/bazelbuild/"`) matches
+    /// `/bazelbuild/rules_go/archive/v1.tar.gz` but not `/bazelbuild-evil/x`
+    /// or `/BazelBuild/x`. Write each as a URL has it, percent-encoded
+    /// (`"/my%20org"`), without dot segments, query or fragment. URIs are
+    /// matched after resolving dot segments, so `/bazelbuild/../evil` is
+    /// `/evil`, and a URI whose path a server could still resolve outside the
+    /// prefix matches none: one with an encoded `/` or `\` (`..%2F`), a dot
+    /// segment with a `;` parameter appended, or a double-encoded `%`.
+    /// Default: every path.
+    #[serde(default, deserialize_with = "convert_vec_string_with_shellexpand")]
+    pub path_prefixes: Vec<String>,
+
+    /// The qualifiers a request must carry for its URIs to take this route,
+    /// all of them. Each matches a qualifier of the request with its `name`,
+    /// and, when it has a `value`, only one with exactly that value:
+    /// `{ name: "bazel.canonical_id" }` takes any request that has a canonical
+    /// id, `{ name: "bazel.canonical_id", value: "rules_go" }` only that one.
+    /// HTTP header qualifiers (`http_header:*`, `http_header_url:*`) cannot be
+    /// matched. Default: any qualifiers.
+    #[serde(default)]
+    pub qualifiers: Vec<QualifierMatchSpec>,
+
+    /// The fetcher (from the `fetchers` list) this route sends its URIs to.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub fetcher: FetcherRefName,
+}
+
+/// A qualifier a [`FetchRouteSpec`] requires of a request.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct QualifierMatchSpec {
+    /// The qualifier's name, matched exactly, such as `"bazel.canonical_id"`.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub name: String,
+
+    /// The value the qualifier must have, matched exactly. When unset, any
+    /// value matches, so the qualifier need only be present.
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub value: Option<String>,
 }
