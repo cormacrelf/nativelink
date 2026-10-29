@@ -25,6 +25,7 @@ use core::time::Duration;
 use std::ffi::OsString;
 
 use futures::StreamExt;
+use nativelink_config::fetchers::DEFAULT_MAX_SIZE_BYTES;
 use nativelink_error::{Error, ResultExt, make_err, make_input_err};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
@@ -437,7 +438,7 @@ impl Default for UrlFetcherOptions {
     fn default() -> Self {
         Self {
             temp_path: None,
-            max_size_bytes: None,
+            max_size_bytes: Some(DEFAULT_MAX_SIZE_BYTES),
             require_checksum: false,
             proxy: None,
             max_fetch_duration: DEFAULT_MAX_FETCH_DURATION,

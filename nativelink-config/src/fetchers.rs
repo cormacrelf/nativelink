@@ -23,6 +23,14 @@ use crate::serde_utils::{
 };
 use crate::stores::StoreRefName;
 
+/// Default for [`UrlFetcherSpec::max_size_bytes`]: 256 GiB. Generous on
+/// purpose: it is there to stop an origin streaming forever, not to judge what
+/// a reasonable asset is.
+pub const DEFAULT_MAX_SIZE_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+
+/// Default for [`BackgroundSpec::max_concurrent_fetches`].
+pub const DEFAULT_MAX_CONCURRENT_FETCHES: usize = 64;
+
 /// Name of a fetcher. Used to reference a fetcher defined in the
 /// `CasConfig::fetchers` list, either from a `FetchConfig` or from another
 /// fetcher that wraps it (e.g. `Background` wrapping `Url`).
@@ -72,7 +80,9 @@ pub struct UrlFetcherSpec {
     /// one that streams more than this many bytes (including when the server
     /// omits or misreports `Content-Length`) is aborted. The URI is then treated
     /// as failed and the next one is tried; if none succeed the request fails
-    /// with `RESOURCE_EXHAUSTED`. When unset, downloads are unbounded.
+    /// with `RESOURCE_EXHAUSTED`. Set it to 0 for no limit.
+    ///
+    /// Default: 274877906944 (256 GiB)
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
@@ -183,8 +193,12 @@ pub struct BackgroundSpec {
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub fetcher: FetcherRefName,
 
-    /// Maximum number of inner fetches running at once. When unset, the number
-    /// of concurrent fetches is unbounded.
+    /// Maximum number of inner fetches running at once. A request that would
+    /// start another waits for a slot, and stops waiting if its client goes
+    /// away; only a fetch that has a slot carries on in the background. Set it
+    /// to 0 for no limit.
+    ///
+    /// Default: 64
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"

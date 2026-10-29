@@ -19,7 +19,9 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nativelink_config::fetchers::FetcherSpec;
+use nativelink_config::fetchers::{
+    DEFAULT_MAX_CONCURRENT_FETCHES, DEFAULT_MAX_SIZE_BYTES, FetcherSpec,
+};
 use nativelink_error::{Error, make_input_err};
 use nativelink_store::store_manager::StoreManager;
 
@@ -45,7 +47,7 @@ pub fn fetcher_factory<S: BuildHasher>(
             })?;
             let options = UrlFetcherOptions {
                 temp_path: spec.temp_path.clone(),
-                max_size_bytes: spec.max_size_bytes,
+                max_size_bytes: limit(spec.max_size_bytes, DEFAULT_MAX_SIZE_BYTES),
                 require_checksum: spec.require_checksum,
                 proxy: ProxySettings::from_config(
                     spec.http_proxy.as_deref(),
@@ -73,12 +75,25 @@ pub fn fetcher_factory<S: BuildHasher>(
         FetcherSpec::Background(spec) => {
             let inner = resolve(&spec.fetcher, built)?;
             let opts = BackgroundFetcherOpts {
-                max_concurrent_fetches: spec.max_concurrent_fetches,
+                max_concurrent_fetches: limit(
+                    spec.max_concurrent_fetches,
+                    DEFAULT_MAX_CONCURRENT_FETCHES,
+                ),
                 min_timeout: spec.min_timeout_s.map(Duration::from_secs),
                 max_timeout: spec.max_timeout_s.map(Duration::from_secs),
             };
             Ok(BackgroundFetcher::new(inner, opts))
         }
+    }
+}
+
+/// A configured resource limit: unset takes `default`, and 0 means no limit
+/// (a zero limit would refuse everything, so it is free to mean "off").
+fn limit<T: PartialEq + Default>(configured: Option<T>, default: T) -> Option<T> {
+    match configured {
+        None => Some(default),
+        Some(value) if value == T::default() => None,
+        Some(value) => Some(value),
     }
 }
 
@@ -90,4 +105,16 @@ fn resolve<S: BuildHasher>(
     built.get(name).cloned().ok_or_else(|| {
         make_input_err!("'fetcher': '{name}' does not exist (it must be defined earlier)")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unset_limit_takes_the_default_and_zero_turns_it_off() {
+        assert_eq!(limit(None, 64_usize), Some(64));
+        assert_eq!(limit(Some(0_usize), 64), None);
+        assert_eq!(limit(Some(8_usize), 64), Some(8));
+    }
 }
