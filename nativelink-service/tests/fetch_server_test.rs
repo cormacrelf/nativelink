@@ -963,6 +963,66 @@ async fn test_fetch_blob_headers_do_not_affect_cache_key_or_get_persisted() -> R
 }
 
 #[nativelink_test]
+async fn test_responses_never_echo_header_qualifiers() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let lookup_only = FetchServer::new(
+        &[WithInstanceName {
+            instance_name: "foo_instance_name".to_string(),
+            config: FetchConfig {
+                fetch_store: String::from("test_fetch_store"),
+                fetcher: None,
+            },
+        }],
+        &HashMap::new(),
+        &store_manager,
+    )
+    .expect("FetchServer config error");
+    let canonical_id = header_qualifier("bazel.canonical_id", "id");
+    let qualifiers = vec![
+        canonical_id.clone(),
+        header_qualifier("http_header:Authorization", SECRET_HEADER_VALUE),
+        header_qualifier("http_header_url:0:X-Other", SECRET_HEADER_VALUE),
+    ];
+    let expected = vec![
+        canonical_id,
+        header_qualifier("http_header:Authorization", "<REDACTED>"),
+        header_qualifier("http_header_url:0:X-Other", "<REDACTED>"),
+    ];
+
+    // Downloaded, failed, and not cached with no fetcher to fetch it.
+    let (uri, _requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+    let unreachable = unreachable_uri().await;
+    for (server, uri, code) in [
+        (&fs, uri, 0),
+        (&fs, unreachable.clone(), i32::from(Code::NotFound)),
+        (&lookup_only, unreachable.clone(), i32::from(Code::NotFound)),
+    ] {
+        let response = server
+            .fetch_blob(blob_request(vec![uri], qualifiers.clone()))
+            .await?
+            .into_inner();
+        assert_eq!(response.status.as_ref().map(|s| s.code), Some(code));
+        assert_eq!(response.qualifiers, expected, "{response:?}");
+    }
+
+    let (uri, _requests) = serve_recording(build_zip(&[("a.txt", b"alpha")])).await;
+    for (server, uri, code) in [
+        (&fs, uri, 0),
+        (&fs, unreachable.clone(), i32::from(Code::NotFound)),
+        (&lookup_only, unreachable, i32::from(Code::NotFound)),
+    ] {
+        let response = server
+            .fetch_directory(directory_request_with(vec![uri], qualifiers.clone()))
+            .await?
+            .into_inner();
+        assert_eq!(response.status.as_ref().map(|s| s.code), Some(code));
+        assert_eq!(response.qualifiers, expected, "{response:?}");
+    }
+    Ok(())
+}
+
+#[nativelink_test]
 async fn test_fetch_blob_malformed_header_qualifier_is_invalid_argument() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
     let fs = make_fetch_server_with_cas(&store_manager);

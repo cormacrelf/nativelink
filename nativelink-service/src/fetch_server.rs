@@ -367,6 +367,31 @@ fn qualifier_pairs(qualifiers: &[Qualifier]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// What replaces the value of an HTTP header qualifier in a response.
+const REDACTED_QUALIFIER_VALUE: &str = "<REDACTED>";
+
+/// The qualifiers a response echoes: the request's, with the value of each
+/// HTTP header qualifier replaced by a placeholder. Those values usually carry
+/// credentials, and a response can end up in logs or caches the request never
+/// did. The names stay, so the response still lists every qualifier the
+/// request sent. A cache hit's stored qualifiers have the headers stripped
+/// already.
+fn response_qualifiers(qualifiers: &[Qualifier]) -> Vec<Qualifier> {
+    qualifiers
+        .iter()
+        .map(|qualifier| {
+            if is_http_header_qualifier(&qualifier.name) {
+                Qualifier {
+                    name: qualifier.name.clone(),
+                    value: REDACTED_QUALIFIER_VALUE.to_string(),
+                }
+            } else {
+                qualifier.clone()
+            }
+        })
+        .collect()
+}
+
 /// Converts the request's `timeout` (a `google.protobuf.Duration`), the time
 /// budget for the whole fetch, into a `Duration`, treating unset/zero/negative
 /// values as "no explicit timeout".
@@ -549,7 +574,7 @@ impl FetchServer {
                         details: vec![],
                     }),
                     uri: entry.query.uri,
-                    qualifiers: entry.query.qualifiers,
+                    qualifiers: response_qualifiers(&entry.query.qualifiers),
                     expires_at: entry.expire_at,
                     blob_digest: Some(entry.digest),
                     digest_function: entry.digest_function,
@@ -612,7 +637,7 @@ impl FetchServer {
                             details: vec![],
                         }),
                         uri: outcome.uri,
-                        qualifiers: request.qualifiers.clone(),
+                        qualifiers: response_qualifiers(&request.qualifiers),
                         expires_at: outcome.expire_at,
                         blob_digest: Some(proto_digest),
                         digest_function: hasher_func.proto_digest_func().into(),
@@ -641,7 +666,7 @@ impl FetchServer {
                     return Ok(Response::new(FetchBlobResponse {
                         status: Some(fetch_failed_status(err)),
                         uri: request.uris.first().cloned().unwrap_or_default(),
-                        qualifiers: request.qualifiers.clone(),
+                        qualifiers: response_qualifiers(&request.qualifiers),
                         expires_at: None,
                         blob_digest: None,
                         digest_function: hasher_func.proto_digest_func().into(),
@@ -656,7 +681,7 @@ impl FetchServer {
                 "not cached, and this instance has no fetcher configured",
             )),
             uri: request.uris.first().cloned().unwrap_or_default(),
-            qualifiers: request.qualifiers,
+            qualifiers: response_qualifiers(&request.qualifiers),
             expires_at: None,
             blob_digest: None,
             digest_function: request.digest_function,
@@ -726,7 +751,7 @@ impl FetchServer {
                         details: vec![],
                     }),
                     uri: entry.query.uri,
-                    qualifiers: entry.query.qualifiers,
+                    qualifiers: response_qualifiers(&entry.query.qualifiers),
                     expires_at: entry.expire_at,
                     root_directory_digest: Some(entry.digest),
                     digest_function: entry.digest_function,
@@ -749,7 +774,7 @@ impl FetchServer {
                     "not cached, and this instance has no fetcher configured",
                 )),
                 uri: request.uris.first().cloned().unwrap_or_default(),
-                qualifiers: request.qualifiers,
+                qualifiers: response_qualifiers(&request.qualifiers),
                 expires_at: None,
                 root_directory_digest: None,
                 digest_function: request.digest_function,
@@ -804,7 +829,7 @@ impl FetchServer {
                         details: vec![],
                     }),
                     uri: outcome.uri,
-                    qualifiers: request.qualifiers.clone(),
+                    qualifiers: response_qualifiers(&request.qualifiers),
                     expires_at: outcome.expire_at,
                     root_directory_digest: Some(proto_digest),
                     digest_function: hasher_func.proto_digest_func().into(),
@@ -828,7 +853,7 @@ impl FetchServer {
                 Ok(Response::new(FetchDirectoryResponse {
                     status: Some(fetch_failed_status(err)),
                     uri: request.uris.first().cloned().unwrap_or_default(),
-                    qualifiers: request.qualifiers.clone(),
+                    qualifiers: response_qualifiers(&request.qualifiers),
                     expires_at: None,
                     root_directory_digest: None,
                     digest_function: hasher_func.proto_digest_func().into(),
@@ -841,8 +866,8 @@ impl FetchServer {
 #[tonic::async_trait]
 impl Fetch for FetchServer {
     #[allow(clippy::blocks_in_conditions)]
-    // The response echoes the request's qualifiers, header values included, so
-    // it is not logged either.
+    // The response is not logged either: it echoes the request's URI and
+    // qualifiers.
     #[instrument(
         err(level = Level::WARN),
         skip_all,
@@ -872,8 +897,8 @@ impl Fetch for FetchServer {
     }
 
     #[allow(clippy::blocks_in_conditions)]
-    // The response echoes the request's qualifiers, header values included, so
-    // it is not logged either.
+    // The response is not logged either: it echoes the request's URI and
+    // qualifiers.
     #[instrument(
         err(level = Level::WARN),
         skip_all,
