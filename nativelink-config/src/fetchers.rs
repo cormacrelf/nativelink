@@ -17,8 +17,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::serde_utils::{
-    convert_optional_numeric_with_shellexpand, convert_optional_string_with_shellexpand,
-    convert_string_with_shellexpand, convert_vec_string_with_shellexpand,
+    convert_boolean_with_shellexpand, convert_optional_numeric_with_shellexpand,
+    convert_optional_string_with_shellexpand, convert_string_with_shellexpand,
+    convert_vec_string_with_shellexpand,
 };
 use crate::stores::StoreRefName;
 
@@ -139,6 +140,19 @@ pub struct UrlFetcherSpec {
     /// configured. Defaults to empty, bypassing no host.
     #[serde(default, deserialize_with = "convert_vec_string_with_shellexpand")]
     pub no_proxy: Vec<String>,
+
+    /// Refuse to download content that the request gives no checksum for: a
+    /// blob request needs a `checksum.sri` qualifier. A request without one
+    /// fails with `INVALID_ARGUMENT` before any origin is contacted. Use it so
+    /// that nothing unverified is ever fetched into the CAS.
+    ///
+    /// The check is part of fetching, so it applies only when content would be
+    /// downloaded. A request that finds an asset already pushed with
+    /// `Push*`, or fetched earlier and recorded in the fetch store, is answered
+    /// from it whether or not the request has a checksum, because nothing is
+    /// downloaded. Defaults to false.
+    #[serde(default, deserialize_with = "convert_boolean_with_shellexpand")]
+    pub require_checksum: bool,
 }
 
 /// A decorator that caches fetched-asset metadata.

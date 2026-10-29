@@ -2079,3 +2079,111 @@ async fn test_proxy_credentials_are_not_in_debug_output() -> Result<(), Status> 
     assert!(!shown.contains("s3cret"), "{shown}");
     Ok(())
 }
+
+/// A URL fetcher spec that requires every fetch to carry a checksum.
+fn require_checksum_spec() -> UrlFetcherSpec {
+    UrlFetcherSpec {
+        cas_store: String::from("test_cas_store"),
+        require_checksum: true,
+        ..Default::default()
+    }
+}
+
+#[nativelink_test]
+async fn test_require_checksum_rejects_a_blob_without_one() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_url_spec(&store_manager, require_checksum_spec());
+    let (uri, origin_requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+
+    // Even a request carrying other qualifiers and headers has no checksum.
+    let err = fs
+        .fetch_blob(blob_request(
+            vec![uri],
+            vec![
+                header_qualifier("bazel.canonical_id", "id"),
+                header_qualifier("http_header:Authorization", "Bearer t"),
+            ],
+        ))
+        .await
+        .expect_err("a blob without a checksum is rejected");
+
+    // An RPC error, not a failed fetch in the response status, and no origin
+    // was contacted.
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("checksum"), "{}", err.message());
+    assert!(origin_requests.lock().is_empty());
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_require_checksum_downloads_when_there_is_one() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_url_spec(&store_manager, require_checksum_spec());
+
+    let (uri, origin_requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+    let response = fs
+        .fetch_blob(blob_request(
+            vec![uri],
+            vec![header_qualifier("checksum.sri", HELLO_WORLD_SRI)],
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(0),
+        "{response:?}"
+    );
+    assert_eq!(
+        response.blob_digest.expect("expected a blob digest").hash,
+        HELLO_WORLD_SHA256_HEX
+    );
+    assert_eq!(origin_requests.lock().len(), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_require_checksum_still_serves_a_pushed_asset_without_one() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_url_spec(&store_manager, require_checksum_spec());
+    let (uri, origin_requests) = serve_recording(b"not what was pushed".to_vec()).await;
+
+    // An asset pushed under this URI, with no checksum qualifier, and its
+    // content.
+    let digest = Digest {
+        hash: HELLO_WORLD_SHA256_HEX.to_owned(),
+        size_bytes: i64::try_from(HELLO_WORLD.len()).unwrap(),
+    };
+    store_manager
+        .get_store("test_cas_store")
+        .unwrap()
+        .update_oneshot(
+            DigestInfo::try_from(&digest).unwrap(),
+            HELLO_WORLD.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    write_entry(
+        &store_manager,
+        AssetKind::Blob,
+        &uri,
+        vec![],
+        digest.clone(),
+        None,
+        None,
+    )
+    .await;
+
+    // Nothing is downloaded, so there is nothing to require a checksum of.
+    let response = fs
+        .fetch_blob(blob_request(vec![uri], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(0),
+        "{response:?}"
+    );
+    assert_eq!(response.blob_digest, Some(digest));
+    assert!(origin_requests.lock().is_empty());
+    Ok(())
+}

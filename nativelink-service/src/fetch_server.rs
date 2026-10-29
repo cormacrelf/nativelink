@@ -107,7 +107,9 @@ fn not_cached_status(reason: &str, message: &str) -> GoogleStatus {
 }
 
 /// Converts a failed fetch into a response status that keeps the fetch error's
-/// code and message and marks it as a fetch failure.
+/// code and message and marks it as a fetch failure. An `InvalidArgument` is
+/// not one: it is the request that is at fault, so it is returned as an RPC
+/// error instead (see the callers).
 fn fetch_failed_status(err: Error) -> GoogleStatus {
     let mut status = GoogleStatus::from(err);
     status.details.push(error_info(REASON_FETCH_FAILED));
@@ -490,6 +492,16 @@ impl FetchServer {
                         blob_digest: Some(proto_digest),
                         digest_function: hasher_func.proto_digest_func().into(),
                     }));
+                }
+                // The request itself is invalid (such as lacking a checksum a
+                // fetcher requires), so, per the Remote Asset API, an
+                // `INVALID_ARGUMENT` RPC error rather than a response status.
+                Err(err) if err.code == Code::InvalidArgument => {
+                    warn!(
+                        message = %redact_uris_in_text(&err.message_string()),
+                        "Fetch request rejected by the fetcher"
+                    );
+                    return Err(err.into());
                 }
                 // Fetch failures (checksum mismatch, timeout, no URI served the
                 // content, ...) surface in the response status, not as a gRPC

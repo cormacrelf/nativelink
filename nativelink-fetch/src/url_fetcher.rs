@@ -325,6 +325,8 @@ pub struct UrlFetcher {
     /// time a whole fetch may take is bounded separately, by `max_fetch_duration`
     /// and each job's `timeout`.
     client: reqwest::Client,
+    /// Whether a job must carry a checksum for anything to be downloaded.
+    require_checksum: bool,
     /// Whether `client` sends requests through a proxy (the URL is not kept).
     proxy_configured: bool,
     /// Cap on the total duration of any fetch, whatever the job asks for.
@@ -341,6 +343,8 @@ pub struct UrlFetcherOptions {
     pub temp_path: Option<String>,
     /// Largest download accepted from any single URI. `None` is unbounded.
     pub max_size_bytes: Option<u64>,
+    /// Reject a job that has no checksum, before contacting any origin.
+    pub require_checksum: bool,
     /// The forward proxy to fetch through. `None` connects directly. The
     /// `HTTP_PROXY`-style environment variables are never consulted.
     pub proxy: Option<ProxySettings>,
@@ -358,6 +362,7 @@ impl Default for UrlFetcherOptions {
         Self {
             temp_path: None,
             max_size_bytes: None,
+            require_checksum: false,
             proxy: None,
             max_fetch_duration: DEFAULT_MAX_FETCH_DURATION,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -372,6 +377,7 @@ impl UrlFetcher {
         let UrlFetcherOptions {
             temp_path,
             max_size_bytes,
+            require_checksum,
             proxy,
             max_fetch_duration,
             connect_timeout,
@@ -414,10 +420,24 @@ impl UrlFetcher {
             cas_store,
             temp_path,
             client,
+            require_checksum,
             proxy_configured: proxy.is_some(),
             max_fetch_duration,
             max_size_bytes,
         })
+    }
+
+    /// Fails a blob job that has no checksum when `require_checksum` is set.
+    /// `InvalidArgument`: it is the request that is wrong, which the Remote
+    /// Asset API reports as an RPC error, not in the response status.
+    fn check_blob_checksum(&self, job: &FetchBlobTask) -> Result<(), Error> {
+        if self.require_checksum && job.checksums.is_empty() {
+            return Err(make_input_err!(
+                "This server only fetches content the request gives a checksum for, and the \
+                 request has none: set the checksum.sri qualifier"
+            ));
+        }
+        Ok(())
     }
 
     /// The time budget for a job with `job_timeout`: the smaller of it and the
@@ -452,6 +472,7 @@ impl core::fmt::Debug for UrlFetcher {
         f.debug_struct("UrlFetcher")
             .field("cas_store", &self.cas_store)
             .field("temp_path", &self.temp_path)
+            .field("require_checksum", &self.require_checksum)
             .field("proxy_configured", &self.proxy_configured)
             .field("max_fetch_duration", &self.max_fetch_duration)
             .field("max_size_bytes", &self.max_size_bytes)
@@ -545,6 +566,7 @@ impl UrlFetcher {
 #[async_trait]
 impl Fetcher for UrlFetcher {
     async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
+        self.check_blob_checksum(job)?;
         within_budget(
             self.budget(job.timeout),
             "blob",
