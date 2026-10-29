@@ -20,6 +20,7 @@ rust_library(
         "src/lib.rs",
         "src/metadata_cache.rs",
         "src/remote_asset_proto.rs",
+        "src/route_fetcher.rs",
         "src/spill.rs",
         "src/tree_hash/git_tree.rs",
         "src/tree_hash/h1.rs",
@@ -67,6 +68,7 @@ rust_test_suite(
         "tests/h1_test.rs",
         "tests/metadata_cache_test.rs",
         "tests/nar_test.rs",
+        "tests/route_fetcher_test.rs",
         "tests/url_fetcher_test.rs",
     ],
     proc_macro_deps = [

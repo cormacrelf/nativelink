@@ -21,6 +21,7 @@ pub mod http_cache;
 pub mod ip_filter;
 pub mod metadata_cache;
 pub mod remote_asset_proto;
+pub mod route_fetcher;
 mod spill;
 pub mod tree_hash;
 pub mod url_fetcher;

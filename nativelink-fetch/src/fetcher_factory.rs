@@ -15,6 +15,7 @@
 //! Builds a [`Fetcher`] chain from its [`FetcherSpec`] configuration.
 
 use core::hash::BuildHasher;
+use core::str::FromStr;
 use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,6 +33,7 @@ use crate::background_fetcher::{BackgroundFetcher, BackgroundFetcherOpts};
 use crate::fetcher::Fetcher;
 use crate::ip_filter::IpFilter;
 use crate::metadata_cache::{MetadataCache, MetadataCacheOptions};
+use crate::route_fetcher::{Route, RouteFetcher, RouteMatch};
 use crate::url_fetcher::{ProxySettings, UrlFetcher, UrlFetcherOptions};
 
 /// Builds a single fetcher from `spec`, resolving store references against
@@ -129,6 +131,47 @@ pub fn fetcher_factory<S: BuildHasher, T: BuildHasher>(
                 spec.instance_name.clone(),
             ))
         }
+        FetcherSpec::Route(spec) => {
+            if spec.routes.is_empty() && spec.otherwise.is_none() {
+                return Err(make_input_err!(
+                    "A 'route' fetcher needs 'routes' or 'otherwise': with neither it refuses \
+                     every URI"
+                ));
+            }
+            let routes = spec
+                .routes
+                .iter()
+                .map(|route| {
+                    if route.hosts.is_empty() {
+                        return Err(make_input_err!(
+                            "A route to '{}' has no 'hosts'",
+                            route.fetcher
+                        ));
+                    }
+                    if route.ports.contains(&0) {
+                        return Err(make_input_err!(
+                            "A route to '{}' lists port 0",
+                            route.fetcher
+                        ));
+                    }
+                    Ok(Route {
+                        matches: RouteMatch {
+                            hosts: parse_all(&route.hosts)?,
+                            schemes: parse_all(&route.schemes)?,
+                            ports: route.ports.clone(),
+                            path_prefixes: parse_all(&route.path_prefixes)?,
+                        },
+                        fetcher: resolve(&route.fetcher, built)?,
+                    })
+                })
+                .collect::<Result<_, Error>>()?;
+            let otherwise = spec
+                .otherwise
+                .as_deref()
+                .map(|name| resolve(name, built))
+                .transpose()?;
+            Ok(RouteFetcher::new(routes, otherwise))
+        }
     }
 }
 
@@ -140,6 +183,11 @@ fn limit<T: PartialEq + Default>(configured: Option<T>, default: T) -> Option<T>
         Some(value) if value == T::default() => None,
         Some(value) => Some(value),
     }
+}
+
+/// Parses each of `values`, failing on the first that does not parse.
+fn parse_all<T: FromStr<Err = Error>>(values: &[String]) -> Result<Vec<T>, Error> {
+    values.iter().map(|value| value.parse()).collect()
 }
 
 /// Looks up an already-built fetcher by name.

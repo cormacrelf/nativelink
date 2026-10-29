@@ -170,6 +170,21 @@ impl FetchHeaders {
                 .collect(),
         }
     }
+
+    /// The headers for `uris[indices[0]]`, `uris[indices[1]]`, ..., indexed
+    /// as `0`, `1`, ...: what a job holding only those URIs, in that order,
+    /// must carry.
+    #[must_use]
+    pub fn select(&self, indices: &[usize]) -> Self {
+        Self {
+            global: self.global.clone(),
+            per_uri: indices
+                .iter()
+                .enumerate()
+                .filter_map(|(new, old)| Some((new, self.per_uri.get(old)?.clone())))
+                .collect(),
+        }
+    }
 }
 
 impl PartialEq for FetchHeaders {
