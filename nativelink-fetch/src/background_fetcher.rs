@@ -26,6 +26,14 @@
 //! concurrent or subsequent identical request finds the in-flight entry and
 //! subscribes to the same task instead of starting a new download.
 //!
+//! A request's `timeout` is, in the API's words, "the timeout for the
+//! underlying fetch, if content needs to be retrieved from origin". It bounds
+//! the server's retrieval, not the RPC (the client's RPC deadline does that)
+//! and not time queued for a concurrency slot, which retrieves nothing: a
+//! queued caller is bounded by its RPC deadline alone. Identical requests share
+//! one fetch, which runs until the latest of their deadlines, while each
+//! request still gets `DEADLINE_EXCEEDED` at its own (see [`SharedDeadline`]).
+//!
 //! This mirrors the kernel of the scheduler's `MemoryAwaitedActionDb`
 //! (`HashMap<key, watch::Sender<..>>` + `subscribe()`), but with the opposite
 //! drop semantics: the action DB cancels an operation once its last client
@@ -42,9 +50,10 @@ use nativelink_error::{Error, make_err};
 use nativelink_util::background_spawn;
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::time::Instant;
 use tonic::{Code, async_trait};
 
-use crate::fetcher::{FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher};
+use crate::fetcher::{FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher, SharedDeadline};
 
 /// Where one fetch is. Once `Done`, every current and future subscriber
 /// observes the same `Arc`-wrapped result.
@@ -53,8 +62,8 @@ enum FetchState {
     /// Its first caller is waiting for a concurrency slot. Identical requests
     /// join it here rather than queueing a duplicate fetch.
     Queued,
-    /// The detached task is running it.
-    Running,
+    /// The detached task is running it, until this deadline.
+    Running(SharedDeadline),
     Done(Arc<Result<FetchOutcome, Error>>),
 }
 
@@ -143,8 +152,8 @@ impl<K: Eq + Hash> Drop for QueuedEntry<'_, K> {
 }
 
 /// Subscribes to the fetch for `key`, or starts one by spawning a detached task
-/// running `run`. Returns a receiver the caller can await; dropping it does not
-/// cancel a spawned task.
+/// running `run`, under a [`SharedDeadline`] that starts at `timeout`. Returns a
+/// receiver the caller can await; dropping it does not cancel a spawned task.
 ///
 /// The concurrency permit (when configured) is taken here, by the caller,
 /// before anything is spawned. A caller queued for a slot holds nothing but its
@@ -157,11 +166,12 @@ async fn schedule_or_join<K, F, Fut>(
     map: &Arc<Mutex<HashMap<K, SharedResult>>>,
     permits: Option<&Arc<Semaphore>>,
     key: K,
+    timeout: Option<Duration>,
     run: F,
 ) -> SharedResult
 where
     K: Clone + Eq + Hash + Send + 'static,
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(SharedDeadline) -> Fut + Send + 'static,
     Fut: Future<Output = Result<FetchOutcome, Error>> + Send + 'static,
 {
     let (tx, rx) = {
@@ -190,12 +200,15 @@ where
         None => None,
     };
     let key = queued.key.take().expect("set above");
-    tx.send_replace(FetchState::Running);
+    // The deadline starts now, not when the request arrived: the timeout bounds
+    // the retrieval from origin, and time queued for a slot is not part of it.
+    let deadline = SharedDeadline::new(timeout);
+    tx.send_replace(FetchState::Running(deadline.clone()));
 
     let map = map.clone();
     background_spawn!("background_fetch", async move {
         let _permit = permit;
-        let result = run().await;
+        let result = run(deadline).await;
         // Publish first so a late subscriber that joined just before removal
         // still sees the result, then drop the in-flight entry.
         tx.send_replace(FetchState::Done(Arc::new(result)));
@@ -204,27 +217,56 @@ where
     rx
 }
 
-/// Awaits a [`SharedResult`] and unwraps it into an owned result. `None` when
-/// the fetch was abandoned while queued for a slot, so the caller should
-/// schedule it again.
-async fn await_shared(mut rx: SharedResult) -> Option<Result<FetchOutcome, Error>> {
-    let done = rx
-        .wait_for(|state| matches!(state, FetchState::Done(_)))
+/// Awaits a [`SharedResult`] for a request with `timeout` and unwraps it into
+/// an owned result. `None` when the fetch was abandoned while queued for a
+/// slot, so the caller should schedule it again.
+///
+/// The request lengthens the shared deadline to its own `timeout`, and gives up
+/// with `DeadlineExceeded` once that has passed with the retrieval still under
+/// way, while the fetch carries on for any request that allowed it longer.
+async fn await_shared(
+    mut rx: SharedResult,
+    timeout: Option<Duration>,
+) -> Option<Result<FetchOutcome, Error>> {
+    let started = rx
+        .wait_for(|state| !matches!(state, FetchState::Queued))
         .await
         .map(|state| state.clone())
         .ok();
-    // The sender is gone: the last state says whether it was ever spawned.
-    let state = done.unwrap_or_else(|| rx.borrow().clone());
-    match state {
-        FetchState::Done(value) => Some(match &*value {
-            Ok(outcome) => Ok(outcome.clone()),
-            Err(err) => Err(err.clone()),
-        }),
-        FetchState::Queued => None,
-        FetchState::Running => Some(Err(make_err!(
-            Code::Internal,
-            "Background fetch task ended without publishing a result"
-        ))),
+    let deadline = match started.unwrap_or_else(|| rx.borrow().clone()) {
+        FetchState::Queued => return None,
+        FetchState::Done(value) => return Some(unwrap_shared(&value)),
+        FetchState::Running(deadline) => deadline,
+    };
+    deadline.extend(timeout);
+    let own_deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+    let done = async {
+        let done = rx
+            .wait_for(|state| matches!(state, FetchState::Done(_)))
+            .await
+            .map(|state| state.clone());
+        match done {
+            Ok(FetchState::Done(value)) => unwrap_shared(&value),
+            _ => Err(make_err!(
+                Code::Internal,
+                "Background fetch task ended without publishing a result"
+            )),
+        }
+    };
+    Some(tokio::select! {
+        result = done => result,
+        () = deadline.outlived(own_deadline) => Err(make_err!(
+            Code::DeadlineExceeded,
+            "The fetch did not finish within the request's timeout; it continues for an \
+             identical request that allowed longer"
+        )),
+    })
+}
+
+fn unwrap_shared(value: &Result<FetchOutcome, Error>) -> Result<FetchOutcome, Error> {
+    match value {
+        Ok(outcome) => Ok(outcome.clone()),
+        Err(err) => Err(err.clone()),
     }
 }
 
@@ -235,15 +277,19 @@ impl Fetcher for BackgroundFetcher {
         job.timeout = self.clamp(job.timeout);
         loop {
             let inner = self.inner.clone();
-            let run_job = job.clone();
+            let mut run_job = job.clone();
             let rx = schedule_or_join(
                 &self.blob_in_flight,
                 self.permits.as_ref(),
                 job.clone(),
-                move || async move { inner.fetch_blob(&run_job).await },
+                job.timeout,
+                move |deadline| async move {
+                    run_job.shared_deadline = Some(deadline);
+                    inner.fetch_blob(&run_job).await
+                },
             )
             .await;
-            if let Some(result) = await_shared(rx).await {
+            if let Some(result) = await_shared(rx, job.timeout).await {
                 return result;
             }
         }
@@ -254,15 +300,19 @@ impl Fetcher for BackgroundFetcher {
         job.timeout = self.clamp(job.timeout);
         loop {
             let inner = self.inner.clone();
-            let run_job = job.clone();
+            let mut run_job = job.clone();
             let rx = schedule_or_join(
                 &self.dir_in_flight,
                 self.permits.as_ref(),
                 job.clone(),
-                move || async move { inner.fetch_directory(&run_job).await },
+                job.timeout,
+                move |deadline| async move {
+                    run_job.shared_deadline = Some(deadline);
+                    inner.fetch_directory(&run_job).await
+                },
             )
             .await;
-            if let Some(result) = await_shared(rx).await {
+            if let Some(result) = await_shared(rx, job.timeout).await {
                 return result;
             }
         }

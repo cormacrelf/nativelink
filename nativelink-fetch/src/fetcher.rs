@@ -27,14 +27,18 @@
 use core::hash::{Hash, Hasher};
 use core::time::Duration;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use nativelink_error::{Error, make_input_err};
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::sri::ByteChecksum;
+use parking_lot::Mutex;
 use prost_types::Timestamp;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use tokio::sync::watch;
+use tokio::time::Instant;
 use tonic::async_trait;
 
 use crate::remote_asset_proto::{QUALIFIER_HTTP_HEADER_PREFIX, QUALIFIER_HTTP_HEADER_URL_PREFIX};
@@ -205,14 +209,106 @@ pub struct Revalidation {
     pub validators: Validators,
 }
 
+/// The deadline of a fetch shared by identical requests, set on the job by
+/// [`crate::background_fetcher::BackgroundFetcher`].
+///
+/// A request's `timeout` bounds the retrieval from origin, so a fetch that
+/// several requests share runs until the latest of their deadlines, each
+/// counted from when the request started or joined it, and without one (but
+/// for the fetcher's own cap) once any request set no timeout. A request that
+/// joins later lengthens it. Each request's own `timeout` is held to by
+/// [`Self::outlived`], which is what its caller waits on.
+#[derive(Clone, Debug)]
+pub struct SharedDeadline(Arc<SharedDeadlineState>);
+
+#[derive(Debug)]
+struct SharedDeadlineState {
+    /// When the fetch must stop. `None` is no deadline.
+    until: Mutex<Option<Instant>>,
+    /// How many retrievals from origin are under way: the part of a fetch the
+    /// timeout bounds, as opposed to, say, an action verifying the result.
+    retrieving: watch::Sender<usize>,
+}
+
+/// Marks a retrieval from origin as under way until dropped. See
+/// [`SharedDeadline::retrieving`].
+#[derive(Debug)]
+pub struct Retrieving(SharedDeadline);
+
+impl Drop for Retrieving {
+    fn drop(&mut self) {
+        self.0.0.retrieving.send_modify(|count| *count -= 1);
+    }
+}
+
+impl SharedDeadline {
+    /// The deadline of a fetch starting now for a request with `timeout`.
+    #[must_use]
+    pub fn new(timeout: Option<Duration>) -> Self {
+        Self(Arc::new(SharedDeadlineState {
+            until: Mutex::new(timeout.and_then(|timeout| Instant::now().checked_add(timeout))),
+            retrieving: watch::Sender::new(0),
+        }))
+    }
+
+    /// Lets the fetch run at least `timeout` from now, for a request that
+    /// joins it. `None` takes the deadline away.
+    pub fn extend(&self, timeout: Option<Duration>) {
+        let mut until = self.0.until.lock();
+        *until = match (*until, timeout) {
+            (Some(until), Some(timeout)) => Instant::now()
+                .checked_add(timeout)
+                .map(|joined| until.max(joined)),
+            _ => None,
+        };
+    }
+
+    /// Resolves once the deadline has passed; never, if there is none.
+    pub async fn expired(&self) {
+        loop {
+            let Some(until) = *self.0.until.lock() else {
+                return core::future::pending().await;
+            };
+            if Instant::now() >= until {
+                return;
+            }
+            // The deadline only ever moves later, so check it again on waking.
+            tokio::time::sleep_until(until).await;
+        }
+    }
+
+    /// Marks a retrieval from origin as under way until the guard is dropped.
+    #[must_use]
+    pub fn retrieving(&self) -> Retrieving {
+        self.0.retrieving.send_modify(|count| *count += 1);
+        Retrieving(self.clone())
+    }
+
+    /// Resolves when a request whose own deadline is `deadline` has run out of
+    /// time: the deadline has passed and a retrieval is still, or again, under
+    /// way. Time the fetch spends on anything else, such as running an action
+    /// to verify the result, is not held against it. Never resolves for a
+    /// request without a deadline.
+    pub async fn outlived(&self, deadline: Option<Instant>) {
+        let Some(deadline) = deadline else {
+            return core::future::pending().await;
+        };
+        tokio::time::sleep_until(deadline).await;
+        let mut retrieving = self.0.retrieving.subscribe();
+        // `self` holds the sender, so this cannot fail.
+        drop(retrieving.wait_for(|count| *count > 0).await);
+    }
+}
+
 /// A request to fetch a single blob from one of `uris`.
 ///
 /// `Hash`/`Eq` (implemented manually) define the in-flight deduplication
 /// identity used by [`crate::background_fetcher::BackgroundFetcher`]: the URIs,
 /// the qualifiers (order-insensitive), the checksum and the hash function.
 /// Per-request parameters such as `timeout` are deliberately excluded, so a
-/// concurrent duplicate joins the in-flight fetch and runs with the first
-/// requester's parameters (`timeout` and `headers`).
+/// concurrent duplicate joins the in-flight fetch. It runs with the first
+/// requester's `headers`, and until the latest of the requesters' deadlines
+/// (see [`SharedDeadline`]).
 #[derive(Clone, Debug)]
 pub struct FetchBlobTask {
     /// Candidate URIs, tried in order until one serves valid content.
@@ -236,6 +332,10 @@ pub struct FetchBlobTask {
     /// leaves only the fetcher's own cap in effect. Not part of the
     /// deduplication identity.
     pub timeout: Option<Duration>,
+    /// Set by a [`crate::background_fetcher::BackgroundFetcher`] for a fetch
+    /// identical requests share; it then bounds the job in place of `timeout`.
+    /// Not part of the deduplication identity.
+    pub shared_deadline: Option<SharedDeadline>,
     /// HTTP headers to send to the origin. Not part of the deduplication
     /// identity.
     pub headers: FetchHeaders,
@@ -272,6 +372,8 @@ pub struct FetchDirectoryJob {
     /// archive expansion, verification and the CAS upload. Not part of the
     /// deduplication identity.
     pub timeout: Option<Duration>,
+    /// As for [`FetchBlobTask::shared_deadline`].
+    pub shared_deadline: Option<SharedDeadline>,
     /// HTTP headers to send to the origin. Not part of the deduplication
     /// identity.
     pub headers: FetchHeaders,

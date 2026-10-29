@@ -99,7 +99,20 @@ impl Fetcher for MockFetcher {
         self.seen_timeouts.lock().push(job.timeout);
         let _ = self.start_tx.send(());
         if self.block {
-            self.gate.acquire().await.expect("gate not closed").forget();
+            // Blocked as a download would be: under way, until the gate opens or
+            // the shared deadline passes.
+            let deadline = job
+                .shared_deadline
+                .clone()
+                .expect("set by BackgroundFetcher");
+            let _retrieving = deadline.retrieving();
+            tokio::select! {
+                permit = self.gate.acquire() => permit.expect("gate not closed").forget(),
+                () = deadline.expired() => {
+                    self.concurrent.fetch_sub(1, Ordering::SeqCst);
+                    return Err(make_err!(Code::DeadlineExceeded, "shared deadline passed"));
+                }
+            }
         }
         self.concurrent.fetch_sub(1, Ordering::SeqCst);
         self.completed.fetch_add(1, Ordering::SeqCst);
@@ -127,6 +140,7 @@ fn blob_job(uri: &str, timeout: Option<Duration>) -> FetchBlobTask {
         timeout,
         headers: FetchHeaders::default(),
         revalidate: vec![],
+        shared_deadline: None,
     }
 }
 
@@ -194,7 +208,8 @@ async fn dedups_despite_different_timeout_and_qualifier_order() {
     first_call.await.unwrap().unwrap();
     second_call.await.unwrap().unwrap();
     assert_eq!(handles.started.load(Ordering::SeqCst), 1);
-    // The duplicate joined the first requester's fetch and its timeout.
+    // The duplicate joined the first requester's fetch, which was started with
+    // that requester's timeout.
     assert_eq!(
         *handles.seen_timeouts.lock(),
         vec![Some(Duration::from_secs(5))]
@@ -311,6 +326,70 @@ async fn identical_callers_queued_for_a_slot_share_one_fetch() {
         call.await.unwrap().unwrap();
     }
     assert_eq!(handles.started.load(Ordering::SeqCst), 2);
+}
+
+#[nativelink_test]
+async fn short_timeout_does_not_cut_short_a_longer_joined_one() {
+    let (mock, mut handles) = mock_fetcher(true);
+    let bg = BackgroundFetcher::new(mock, BackgroundFetcherOpts::default());
+
+    let short = {
+        let bg = bg.clone();
+        let job = blob_job("http://example/blob", Some(Duration::from_millis(100)));
+        tokio::spawn(async move { bg.fetch_blob(&job).await })
+    };
+    handles.start_rx.recv().await.expect("a fetch should start");
+    let long = {
+        let bg = bg.clone();
+        let job = blob_job("http://example/blob", Some(Duration::from_mins(1)));
+        tokio::spawn(async move { bg.fetch_blob(&job).await })
+    };
+
+    // The short request gets DEADLINE_EXCEEDED at its own deadline...
+    let err = short
+        .await
+        .unwrap()
+        .expect_err("the short request times out");
+    assert_eq!(err.code, Code::DeadlineExceeded, "{err:?}");
+    // ...while the shared fetch carries on for the long one.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(handles.completed.load(Ordering::SeqCst), 0);
+    handles.gate.add_permits(1);
+    long.await
+        .unwrap()
+        .expect("the long request gets the result");
+    assert_eq!(handles.started.load(Ordering::SeqCst), 1);
+}
+
+/// Takes a while, but spends none of it retrieving from origin, as an action
+/// verifying a fetched directory would.
+#[derive(Debug)]
+struct SlowVerifier;
+
+#[async_trait]
+impl Fetcher for SlowVerifier {
+    async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        Ok(FetchOutcome::new(
+            job.uris[0].clone(),
+            DigestInfo::try_new(&"0".repeat(64), 1).unwrap(),
+        ))
+    }
+
+    async fn fetch_directory(&self, _job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+        Err(make_err!(Code::Unimplemented, "not exercised"))
+    }
+}
+
+#[nativelink_test]
+async fn timeout_bounds_only_the_retrieval() {
+    let bg = BackgroundFetcher::new(Arc::new(SlowVerifier), BackgroundFetcherOpts::default());
+    bg.fetch_blob(&blob_job(
+        "http://example/blob",
+        Some(Duration::from_millis(50)),
+    ))
+    .await
+    .expect("time spent outside a retrieval is not held against the timeout");
 }
 
 #[nativelink_test]

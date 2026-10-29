@@ -58,7 +58,7 @@ use crate::archive_expander::{
 };
 use crate::fetcher::{
     DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher, Revalidation,
-    Validators,
+    SharedDeadline, Validators,
 };
 use crate::http_cache::freshness_lifetime;
 use crate::remote_asset_proto::build_tree;
@@ -667,12 +667,14 @@ impl UrlFetcher {
         Ok(())
     }
 
-    /// The time budget for a job with `job_timeout`: the smaller of it and the
-    /// cap.
-    fn budget(&self, job_timeout: Option<Duration>) -> Duration {
-        job_timeout.map_or(self.max_fetch_duration, |timeout| {
-            timeout.min(self.max_fetch_duration)
-        })
+    /// The fixed time budget for a job with `job_timeout`: the smaller of it
+    /// and the cap. Only the cap when the job has a `shared` deadline, which
+    /// then stands in for its timeout.
+    fn budget(&self, job_timeout: Option<Duration>, shared: Option<&SharedDeadline>) -> Duration {
+        match job_timeout {
+            Some(timeout) if shared.is_none() => timeout.min(self.max_fetch_duration),
+            _ => self.max_fetch_duration,
+        }
     }
 
     /// The request for `uri` (`uris[idx]` of the job), carrying the job's
@@ -845,21 +847,40 @@ impl UrlFetcher {
     }
 }
 
-/// Runs `fetch` for at most `budget`, failing with `DeadlineExceeded` when it
-/// runs out. The future is dropped on expiry, which closes the connection and
-/// deletes the temp files (they are `TempPath`s, removed on drop).
+/// Runs `fetch` for at most `budget`, and until `shared` expires if given,
+/// failing with `DeadlineExceeded` when either runs out. The future is dropped
+/// on expiry, which closes the connection and deletes the temp files (they are
+/// `TempPath`s, removed on drop).
 async fn within_budget(
     budget: Duration,
+    shared: Option<&SharedDeadline>,
     what: &str,
     fetch: impl Future<Output = Result<FetchOutcome, Error>>,
 ) -> Result<FetchOutcome, Error> {
-    tokio::time::timeout(budget, fetch).await.map_err(|_| {
-        make_err!(
+    let Some(shared) = shared else {
+        return tokio::time::timeout(budget, fetch).await.map_err(|_| {
+            make_err!(
+                Code::DeadlineExceeded,
+                "Fetching the {what} did not finish within {budget:?}, the smaller of the \
+                 request's timeout and the fetcher's max_fetch_duration_s"
+            )
+        })?;
+    };
+    let _retrieving = shared.retrieving();
+    tokio::select! {
+        result = tokio::time::timeout(budget, fetch) => result.map_err(|_| {
+            make_err!(
+                Code::DeadlineExceeded,
+                "Fetching the {what} did not finish within {budget:?}, the fetcher's \
+                 max_fetch_duration_s"
+            )
+        })?,
+        () = shared.expired() => Err(make_err!(
             Code::DeadlineExceeded,
-            "Fetching the {what} did not finish within {budget:?}, the smaller of the request's \
-             timeout and the fetcher's max_fetch_duration_s"
-        )
-    })?
+            "Fetching the {what} did not finish within the request's timeout (the longest \
+             timeout of the identical requests sharing the fetch)"
+        )),
+    }
 }
 
 impl core::fmt::Debug for UrlFetcher {
@@ -1108,7 +1129,8 @@ impl Fetcher for UrlFetcher {
     async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
         self.check_blob_checksum(job)?;
         within_budget(
-            self.budget(job.timeout),
+            self.budget(job.timeout, job.shared_deadline.as_ref()),
+            job.shared_deadline.as_ref(),
             "blob",
             self.fetch_blob_unbounded(job),
         )
@@ -1131,7 +1153,8 @@ impl Fetcher for UrlFetcher {
         }
         self.check_directory_checksum(job)?;
         within_budget(
-            self.budget(job.timeout),
+            self.budget(job.timeout, job.shared_deadline.as_ref()),
+            job.shared_deadline.as_ref(),
             "directory",
             self.fetch_directory_unbounded(job),
         )

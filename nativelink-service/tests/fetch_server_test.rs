@@ -3697,6 +3697,55 @@ async fn test_rpc_deadline_returns_deadline_exceeded_and_a_retry_joins_the_fetch
 }
 
 #[nativelink_test]
+async fn test_short_timeout_does_not_fail_a_longer_identical_request() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = Arc::new(make_fetch_server_with_cas(&store_manager));
+    // The body takes about 1.1 seconds to arrive.
+    let (uri, requests) =
+        serve_trickling(HELLO_WORLD.to_vec(), 1, Duration::from_millis(100)).await;
+
+    let with_timeout = |timeout: prost_types::Duration| {
+        let mut request = blob_request(vec![uri.clone()], vec![]);
+        request.get_mut().timeout = Some(timeout);
+        request
+    };
+    let short = with_timeout(prost_types::Duration {
+        seconds: 0,
+        nanos: 300_000_000,
+    });
+    let long = with_timeout(prost_types::Duration {
+        seconds: 600,
+        nanos: 0,
+    });
+    let short = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.fetch_blob(short).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let long = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.fetch_blob(long).await })
+    };
+
+    // The short request times out; the long one joined the same download and
+    // gets its result.
+    let short = short.await.unwrap()?.into_inner();
+    assert_eq!(
+        status_code_of(short.status.as_ref()),
+        Some(i32::from(Code::DeadlineExceeded)),
+        "{short:?}"
+    );
+    let long = long.await.unwrap()?.into_inner();
+    assert_eq!(status_code_of(long.status.as_ref()), Some(0), "{long:?}");
+    assert_eq!(
+        long.blob_digest.expect("expected a blob digest").hash,
+        HELLO_WORLD_SHA256_HEX
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[nativelink_test]
 async fn test_rpc_deadline_applies_to_directory_fetches() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
     let fs = make_fetch_server_with_cas(&store_manager);

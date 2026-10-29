@@ -584,6 +584,7 @@ impl FetchServer {
                 timeout: request_timeout(request.timeout.as_ref()),
                 headers,
                 revalidate: Vec::new(),
+                shared_deadline: None,
             };
             // Only an unpinned request revalidates: a pinned one has its
             // content fixed by its checksum.
@@ -776,6 +777,7 @@ impl FetchServer {
             timeout: request_timeout(request.timeout.as_ref()),
             headers,
             revalidate: Vec::new(),
+            shared_deadline: None,
         };
         // Only an unpinned request revalidates, as for a blob.
         if !job.is_pinned() {

@@ -327,6 +327,14 @@ pub struct MetadataCacheSpec {
 }
 
 /// A decorator providing in-flight deduplication and background continuation.
+///
+/// Identical requests share one fetch. It runs until the latest of their
+/// timeouts (after `min_timeout_s` and `max_timeout_s`), each counted from when
+/// its request started or joined the fetch, so a request with a short timeout
+/// does not cut it short for one with a longer timeout. Each request still gets
+/// `DEADLINE_EXCEEDED` once its own timeout has passed with the download under
+/// way. Time spent waiting for one of `max_concurrent_fetches` does not count
+/// against a timeout; only the RPC deadline bounds it.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]

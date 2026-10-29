@@ -312,6 +312,7 @@ fn job(uris: &[&str], checksums: Vec<DirectoryChecksum>) -> FetchDirectoryJob {
         timeout: None,
         headers: FetchHeaders::default(),
         revalidate: vec![],
+        shared_deadline: None,
     }
 }
 

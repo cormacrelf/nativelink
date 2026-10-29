@@ -166,6 +166,31 @@ are never offered to another host. Any other header you set is forwarded.
 
 <SourceLink file="nativelink-fetch/src/url_fetcher.rs" symbol="redirect_policy" />
 
+### Timeouts [#fetch-timeouts]
+
+A request's `timeout` bounds the retrieval from the origin: every URI attempt,
+the download, checksum verification and the CAS upload. A `background` fetcher
+clamps it to `min_timeout_s` and `max_timeout_s`, and the `url` fetcher's
+`max_fetch_duration_s` (one hour by default) caps it, and bounds a request
+with no timeout too. Running out reports `DEADLINE_EXCEEDED` in the response
+`status`.
+
+The timeout does not bound the RPC. When the RPC deadline comes first the call
+fails with a `DEADLINE_EXCEEDED` RPC error, and a fetch run by a `background`
+fetcher carries on; retrying the same request joins it. Nor does it count time
+spent waiting for one of the `background` fetcher's `max_concurrent_fetches`
+slots, which retrieves nothing: only the RPC deadline bounds that wait, and a
+client that goes away while waiting leaves no work behind.
+
+Identical concurrent requests share one fetch. It runs until the latest of
+their timeouts, each counted from when its request arrived at the running
+fetch, so a request with a short timeout does not cut the fetch short for one
+with a longer timeout. Each request still gets `DEADLINE_EXCEEDED` once its
+own timeout has passed with the download under way. Time an `action_verify`
+fetcher spends running its action is not counted.
+
+<SourceLink file="nativelink-fetch/src/fetcher.rs" symbol="SharedDeadline" />
+
 ### How long a fetched asset stays cached [#fetch-freshness]
 
 What a fetch stores is the asset's URI and qualifiers mapped to a digest, and

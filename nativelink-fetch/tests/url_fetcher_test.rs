@@ -161,6 +161,7 @@ fn job(uri: &str, headers: FetchHeaders) -> FetchBlobTask {
         timeout: None,
         headers,
         revalidate: vec![],
+        shared_deadline: None,
     }
 }
 
@@ -300,6 +301,7 @@ async fn a_directory_fetch_reports_freshness_too() {
             timeout: None,
             headers: FetchHeaders::default(),
             revalidate: vec![],
+            shared_deadline: None,
         })
         .await
         .unwrap();
@@ -517,6 +519,7 @@ fn directory_job(uri: &str) -> FetchDirectoryJob {
         timeout: None,
         headers: FetchHeaders::default(),
         revalidate: vec![],
+        shared_deadline: None,
     }
 }
 

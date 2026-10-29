@@ -109,6 +109,7 @@ fn blob_job(uri: &str, qualifiers: Vec<(String, String)>) -> FetchBlobTask {
         timeout: None,
         headers: FetchHeaders::default(),
         revalidate: vec![],
+        shared_deadline: None,
     }
 }
 
@@ -124,6 +125,7 @@ fn directory_job(uri: &str) -> FetchDirectoryJob {
         timeout: None,
         headers: FetchHeaders::default(),
         revalidate: vec![],
+        shared_deadline: None,
     }
 }
 
