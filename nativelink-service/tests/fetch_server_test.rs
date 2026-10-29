@@ -3841,6 +3841,101 @@ async fn test_short_timeout_does_not_fail_a_longer_identical_request() -> Result
     Ok(())
 }
 
+/// Spawns an HTTP/1.1 server that waits `delay` before answering each request:
+/// with `body` if it carries `authorization: <token>`, else with `401`. Returns
+/// the URL and the number of requests the server has received.
+async fn serve_authorizing(
+    body: Vec<u8>,
+    token: &'static str,
+    delay: Duration,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    background_spawn!("fetch_test_authorizing_http_server", async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let body = body.clone();
+            let counted = counted.clone();
+            background_spawn!("fetch_test_authorizing_http_connection", async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                let request = String::from_utf8_lossy(&request).to_lowercase();
+                let authorized = request.contains(&format!("authorization: {token}\r\n"));
+                let (status, body) = if authorized {
+                    ("200 OK", body)
+                } else {
+                    ("401 Unauthorized", Vec::new())
+                };
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                drop(socket.write_all(header.as_bytes()).await);
+                drop(socket.write_all(&body).await);
+                drop(socket.flush().await);
+            });
+        }
+    });
+    (format!("http://{addr}/blob"), requests)
+}
+
+#[nativelink_test]
+async fn test_bad_credentials_do_not_fail_a_concurrent_good_request() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = Arc::new(make_fetch_server_with_cas(&store_manager));
+    let (uri, requests) = serve_authorizing(
+        HELLO_WORLD.to_vec(),
+        "bearer good",
+        Duration::from_millis(500),
+    )
+    .await;
+
+    let with_token = |token: &str| {
+        blob_request(
+            vec![uri.clone()],
+            vec![
+                header_qualifier("checksum.sri", HELLO_WORLD_SRI),
+                header_qualifier("http_header:Authorization", token),
+            ],
+        )
+    };
+    let bad = with_token("Bearer expired");
+    let good = with_token("Bearer good");
+    let bad = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.fetch_blob(bad).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let good = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.fetch_blob(good).await })
+    };
+
+    // The good request arrived while the bad one's fetch was under way, but it
+    // ran its own fetch with its own credentials.
+    let bad = bad.await.unwrap()?.into_inner();
+    assert_ne!(status_code_of(bad.status.as_ref()), Some(0), "{bad:?}");
+    let good = good.await.unwrap()?.into_inner();
+    assert_eq!(status_code_of(good.status.as_ref()), Some(0), "{good:?}");
+    assert_eq!(
+        good.blob_digest.expect("expected a blob digest").hash,
+        HELLO_WORLD_SHA256_HEX
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
 #[nativelink_test]
 async fn test_rpc_deadline_applies_to_directory_fetches() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;

@@ -358,7 +358,7 @@ fn find_qualifier<'a>(qualifiers: &'a [Qualifier], name: &str) -> Option<&'a str
 
 /// Flattens proto qualifiers into the `(name, value)` pairs a fetch job carries,
 /// leaving out HTTP header qualifiers (those travel separately as
-/// `FetchHeaders` and must not be persisted or affect identity).
+/// `FetchHeaders` and must not be persisted or affect the asset's identity).
 fn qualifier_pairs(qualifiers: &[Qualifier]) -> Vec<(String, String)> {
     qualifiers
         .iter()

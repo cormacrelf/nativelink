@@ -183,14 +183,6 @@ async fn dedups_despite_different_timeout_and_qualifier_order() {
     first.qualifiers = vec![qualifier("a", "1"), qualifier("b", "2")];
     let mut second = blob_job("http://example/blob", Some(Duration::from_mins(1)));
     second.qualifiers = vec![qualifier("b", "2"), qualifier("a", "1")];
-    second.headers = FetchHeaders::from_qualifiers(
-        &[Qualifier {
-            name: "http_header:Authorization".to_owned(),
-            value: "Bearer other".to_owned(),
-        }],
-        1,
-    )
-    .unwrap();
 
     let first_call = {
         let bg = bg.clone();
@@ -214,6 +206,92 @@ async fn dedups_despite_different_timeout_and_qualifier_order() {
         *handles.seen_timeouts.lock(),
         vec![Some(Duration::from_secs(5))]
     );
+}
+
+fn headers(qualifiers: &[(&str, &str)]) -> FetchHeaders {
+    let qualifiers: Vec<_> = qualifiers
+        .iter()
+        .map(|&(name, value)| Qualifier {
+            name: name.to_owned(),
+            value: value.to_owned(),
+        })
+        .collect();
+    FetchHeaders::from_qualifiers(&qualifiers, 2).unwrap()
+}
+
+#[nativelink_test]
+async fn jobs_with_different_headers_do_not_share_a_fetch() {
+    let (mock, mut handles) = mock_fetcher(true);
+    let bg = BackgroundFetcher::new(mock, BackgroundFetcherOpts::default());
+
+    // Differing only in a global header, or only in a URI-specific one.
+    let mut jobs = Vec::new();
+    for token in ["Bearer a", "Bearer b"] {
+        let mut job = blob_job("http://example/blob", None);
+        job.headers = headers(&[("http_header:Authorization", token)]);
+        jobs.push(job);
+    }
+    for token in ["Bearer a", "Bearer b"] {
+        let mut job = blob_job("http://example/blob", None);
+        job.headers = headers(&[("http_header_url:0:Authorization", token)]);
+        jobs.push(job);
+    }
+    let calls: Vec<_> = jobs
+        .into_iter()
+        .map(|job| {
+            let bg = bg.clone();
+            tokio::spawn(async move { bg.fetch_blob(&job).await })
+        })
+        .collect();
+    for _ in 0..4 {
+        handles.start_rx.recv().await.expect("a fetch should start");
+    }
+    assert_eq!(handles.started.load(Ordering::SeqCst), 4);
+
+    handles.gate.add_permits(4);
+    for call in calls {
+        call.await.unwrap().unwrap();
+    }
+    assert_eq!(handles.completed.load(Ordering::SeqCst), 4);
+}
+
+#[nativelink_test]
+async fn jobs_with_the_same_headers_in_another_order_share_a_fetch() {
+    let (mock, mut handles) = mock_fetcher(true);
+    let bg = BackgroundFetcher::new(mock, BackgroundFetcherOpts::default());
+
+    let mut first = blob_job("http://example/blob", None);
+    first.headers = headers(&[
+        ("http_header:Authorization", "Bearer a"),
+        ("http_header:X-Other", "other"),
+        ("http_header_url:0:X-Mirror", "0"),
+        ("http_header_url:1:X-Mirror", "1"),
+    ]);
+    let mut second = blob_job("http://example/blob", None);
+    second.headers = headers(&[
+        ("http_header_url:1:x-mirror", "1"),
+        ("http_header:x-other", "other"),
+        ("http_header_url:0:X-MIRROR", "0"),
+        ("http_header:AUTHORIZATION", "Bearer a"),
+    ]);
+    assert_eq!(first, second);
+
+    let first_call = {
+        let bg = bg.clone();
+        tokio::spawn(async move { bg.fetch_blob(&first).await })
+    };
+    handles.start_rx.recv().await.expect("a fetch should start");
+    let second_call = {
+        let bg = bg.clone();
+        tokio::spawn(async move { bg.fetch_blob(&second).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(handles.started.load(Ordering::SeqCst), 1);
+
+    handles.gate.add_permits(1);
+    first_call.await.unwrap().unwrap();
+    second_call.await.unwrap().unwrap();
+    assert_eq!(handles.started.load(Ordering::SeqCst), 1);
 }
 
 #[nativelink_test]

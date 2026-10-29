@@ -183,12 +183,15 @@ spent waiting for one of the `background` fetcher's `max_concurrent_fetches`
 slots, which retrieves nothing: only the RPC deadline bounds that wait, and a
 client that goes away while waiting leaves no work behind.
 
-Identical concurrent requests share one fetch. It runs until the latest of
-their timeouts, each counted from when its request arrived at the running
-fetch, so a request with a short timeout does not cut the fetch short for one
-with a longer timeout. Each request still gets `DEADLINE_EXCEEDED` once its
-own timeout has passed with the download under way. Time an `action_verify`
-fetcher spends running its action is not counted.
+Identical concurrent requests share one fetch. Requests that send different
+`http_header:` or `http_header_url:` qualifiers are not identical: different
+credentials can get different answers from the origin, so each runs its own
+fetch. A shared fetch runs until the latest of its requests' timeouts, each
+counted from when its request arrived at the running fetch, so a request with a
+short timeout does not cut the fetch short for one with a longer timeout. Each
+request still gets `DEADLINE_EXCEEDED` once its own timeout has passed with the
+download under way. Time an `action_verify` fetcher spends running its action
+is not counted.
 
 <SourceLink file="nativelink-fetch/src/fetcher.rs" symbol="SharedDeadline" />
 
