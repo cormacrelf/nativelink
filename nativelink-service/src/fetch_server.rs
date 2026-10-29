@@ -507,6 +507,7 @@ impl FetchServer {
                 hasher_func,
                 timeout,
                 headers,
+                shared_deadline: None,
             };
             // The fetcher (via MetadataCache) caches the asset metadata itself;
             // here we only shape the response.

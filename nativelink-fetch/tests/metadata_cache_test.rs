@@ -93,6 +93,7 @@ fn blob_job(uri: &str, qualifiers: Vec<(String, String)>) -> FetchBlobTask {
         hasher_func: DigestHasherFunc::Sha256,
         timeout: None,
         headers: FetchHeaders::default(),
+        shared_deadline: None,
     }
 }
 

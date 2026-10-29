@@ -150,6 +150,7 @@ fn job(uri: &str, headers: FetchHeaders) -> FetchBlobTask {
         hasher_func: DigestHasherFunc::Sha256,
         timeout: None,
         headers,
+        shared_deadline: None,
     }
 }
 
