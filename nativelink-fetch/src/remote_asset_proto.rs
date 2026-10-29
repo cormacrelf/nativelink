@@ -32,7 +32,13 @@
 //!   `OutputFile` for a blob, or an `OutputDirectory` whose `tree_digest` is a
 //!   `Tree` uploaded to the CAS for a directory. `execution_metadata` carries
 //!   the times (`worker_start_timestamp` is when the content was retrieved or
-//!   pushed) and a [`RemoteAssetMetadata`] in `auxiliary_metadata`.
+//!   pushed) and a [`RemoteAssetMetadata`] in `auxiliary_metadata`. A Push's
+//!   `references_blobs` are further output files and its
+//!   `references_directories` further output directories (by
+//!   `root_directory_digest`, with no `Tree`), at paths under
+//!   `references/`, which `out` is not. They are never served: they are there
+//!   so that `completeness_checking` misses an entry whose references left the
+//!   CAS.
 
 use std::collections::HashSet;
 use std::time::SystemTime;
@@ -74,8 +80,13 @@ pub const REMOTE_ASSET_WORKER: &str = "nativelink-remote-asset";
 /// Type URL of the [`RemoteAssetMetadata`] in `auxiliary_metadata`.
 pub const REMOTE_ASSET_METADATA_TYPE_URL: &str =
     "type.googleapis.com/nativelink.RemoteAssetMetadata";
-/// Path of the single output of every entry.
+/// Path of the output that is the asset itself.
 const OUTPUT_PATH: &str = "out";
+/// Path prefix of a referenced blob's output file: `references/blobs/<idx>`.
+const REFERENCED_BLOB_PATH_PREFIX: &str = "references/blobs/";
+/// Path prefix of a referenced directory's output directory:
+/// `references/directories/<idx>`.
+const REFERENCED_DIRECTORY_PATH_PREFIX: &str = "references/directories/";
 
 /// Whether `name` is an HTTP header qualifier. These are request parameters
 /// (often credentials), not part of an asset's identity: they must neither
@@ -250,6 +261,12 @@ pub struct RemoteAssetEntry {
     pub etag: Option<String>,
     /// The `Last-Modified` the origin gave the content, if any.
     pub last_modified: Option<String>,
+    /// A Push's `references_blobs`: blobs that must outlive the entry. Stored
+    /// as given, so they should be in their parsed (lowercase) form.
+    pub references_blobs: Vec<Digest>,
+    /// A Push's `references_directories`: root `Directory` digests of trees
+    /// that must outlive the entry.
+    pub references_directories: Vec<Digest>,
 }
 
 /// The digests of the subdirectories of `directory` that are not in `seen`,
@@ -314,7 +331,7 @@ pub async fn write_remote_asset_entry(
     let hasher_func = DigestHasherFunc::try_from(entry.digest_function)
         .err_tip(|| "Digest function of Remote Asset entry")?;
     let key = entry.query.key(hasher_func)?;
-    let (output_files, output_directories, root_directory_digest) = match entry.query.kind {
+    let (mut output_files, mut output_directories, root_directory_digest) = match entry.query.kind {
         AssetKind::Blob => (
             vec![OutputFile {
                 path: OUTPUT_PATH.to_owned(),
@@ -358,6 +375,28 @@ pub async fn write_remote_asset_entry(
             )
         }
     };
+    // References are written as outputs so that `completeness_checking` turns
+    // an entry whose references left the CAS into a miss: no reader checks them.
+    output_files.extend(
+        entry
+            .references_blobs
+            .iter()
+            .enumerate()
+            .map(|(idx, digest)| OutputFile {
+                path: format!("{REFERENCED_BLOB_PATH_PREFIX}{idx}"),
+                digest: Some(digest.clone()),
+                is_executable: false,
+                ..Default::default()
+            }),
+    );
+    output_directories.extend(entry.references_directories.iter().enumerate().map(
+        |(idx, digest)| OutputDirectory {
+            path: format!("{REFERENCED_DIRECTORY_PATH_PREFIX}{idx}"),
+            tree_digest: None,
+            is_topologically_sorted: false,
+            root_directory_digest: Some(digest.clone()),
+        },
+    ));
     let metadata = RemoteAssetMetadata {
         uri: entry.query.uri.clone(),
         qualifiers: entry.query.qualifiers.clone(),
@@ -420,22 +459,37 @@ fn entry_from_action_result(
         .iter()
         .find(|any| any.type_url == REMOTE_ASSET_METADATA_TYPE_URL)?;
     let metadata = RemoteAssetMetadata::decode(any.value.as_slice()).ok()?;
-    let (digest, tree_digest) = match kind {
-        AssetKind::Blob => {
-            let [file] = action_result.output_files.as_slice() else {
-                return None;
-            };
-            (file.digest.clone()?, None)
+    // The asset is the one output at `out`; anything else is a reference, and
+    // an output that is neither means this is not one of our entries.
+    let mut files = Vec::new();
+    let mut references_blobs = Vec::new();
+    for file in action_result.output_files {
+        if file.path == OUTPUT_PATH {
+            files.push(file);
+        } else if file.path.starts_with(REFERENCED_BLOB_PATH_PREFIX) {
+            references_blobs.push(file.digest?);
+        } else {
+            return None;
         }
-        AssetKind::Directory => {
-            let [directory] = action_result.output_directories.as_slice() else {
-                return None;
-            };
-            (
-                metadata.root_directory_digest.clone()?,
-                directory.tree_digest.clone(),
-            )
+    }
+    let mut directories = Vec::new();
+    let mut references_directories = Vec::new();
+    for directory in action_result.output_directories {
+        if directory.path == OUTPUT_PATH {
+            directories.push(directory);
+        } else if directory.path.starts_with(REFERENCED_DIRECTORY_PATH_PREFIX) {
+            references_directories.push(directory.root_directory_digest?);
+        } else {
+            return None;
         }
+    }
+    let (digest, tree_digest) = match (kind, files.as_slice(), directories.as_slice()) {
+        (AssetKind::Blob, [file], []) => (file.digest.clone()?, None),
+        (AssetKind::Directory, [], [directory]) => (
+            metadata.root_directory_digest.clone()?,
+            directory.tree_digest.clone(),
+        ),
+        _ => return None,
     };
     Some(RemoteAssetEntry {
         query: RemoteAssetQuery {
@@ -450,5 +504,7 @@ fn entry_from_action_result(
         tree_digest,
         etag: Some(metadata.etag).filter(|etag| !etag.is_empty()),
         last_modified: Some(metadata.last_modified).filter(|value| !value.is_empty()),
+        references_blobs,
+        references_directories,
     })
 }

@@ -264,6 +264,19 @@ fetch, so each fetch checks its own request's entry.
 <SourceLink file="nativelink-fetch/src/fetcher.rs" symbol="Revalidation" />
 <SourceLink file="nativelink-fetch/src/url_fetcher.rs" symbol="UrlFetcher" />
 
+## Remote Asset `Push` references [#remote-asset-push-references]
+
+`PushBlob` and `PushDirectory` keep the `references_blobs` and
+`references_directories` they are given with the entry they write. They are
+never returned, but a `completeness_checking` fetch store checks them like the
+asset itself: every referenced blob, and every `Directory` and file of each
+referenced tree, has to be in the CAS. Once any of them is evicted, a `Fetch`
+for the asset misses instead of returning content whose references are gone,
+such as a BuildStream artifact whose file trees have left the CAS. A malformed
+referenced digest fails the push with `INVALID_ARGUMENT`.
+
+<SourceLink file="nativelink-fetch/src/remote_asset_proto.rs" symbol="write_remote_asset_entry" />
+
 ## Related [#related]
 
 - [Architecture deep dive](/explanations/architecture-deep-dive): where each

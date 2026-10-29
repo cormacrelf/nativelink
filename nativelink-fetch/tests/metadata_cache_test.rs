@@ -25,7 +25,7 @@ use nativelink_fetch::fetcher::{
 use nativelink_fetch::metadata_cache::{MetadataCache, MetadataCacheOptions};
 use nativelink_fetch::remote_asset_proto::{
     AssetKind, RemoteAssetEntry, RemoteAssetMetadata, RemoteAssetQuery, read_remote_asset_entry,
-    timestamp_is_before,
+    timestamp_is_before, write_remote_asset_entry,
 };
 use nativelink_fetch::tree_hash::TreeChecksum;
 use nativelink_fetch::tree_hash::h1::H1;
@@ -856,4 +856,105 @@ async fn an_entry_without_validators_still_decodes() {
     assert_eq!(entry.digest, Digest::from(digest));
     assert_eq!(entry.etag, None);
     assert_eq!(entry.last_modified, None);
+    assert!(entry.references_blobs.is_empty());
+    assert!(entry.references_directories.is_empty());
+}
+
+/// Writes an entry of `kind` for the tree `upload_nested_directories` uploads
+/// (its root for a directory, `a.txt` for a blob) with the given references,
+/// and reads it back.
+async fn round_trip(
+    kind: AssetKind,
+    references_blobs: Vec<Digest>,
+    references_directories: Vec<Digest>,
+) -> (ActionResult, RemoteAssetEntry) {
+    let ac_store = memory_store().await;
+    let cas_store = memory_store().await;
+    let (root, _, _) = upload_nested_directories(&cas_store).await;
+    let digest: Digest = match kind {
+        AssetKind::Blob => sha256_digest_of(b"a").into(),
+        AssetKind::Directory => root.into(),
+    };
+    let query = RemoteAssetQuery::new(kind, "http://example/asset".to_string(), proto_qualifiers());
+    write_remote_asset_entry(
+        &ac_store,
+        Some(&cas_store),
+        &RemoteAssetEntry {
+            query: query.clone(),
+            digest: digest.clone(),
+            expire_at: None,
+            stored_at: None,
+            digest_function: digest_function::Value::Sha256.into(),
+            tree_digest: None,
+            etag: None,
+            last_modified: None,
+            references_blobs: references_blobs.clone(),
+            references_directories: references_directories.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let action_result =
+        stored_action_result(&ac_store, query.key(DigestHasherFunc::Sha256).unwrap()).await;
+    let entry = read_remote_asset_entry(&ac_store, &query, digest_function::Value::Sha256.into())
+        .await
+        .unwrap()
+        .expect("entry should be readable");
+    assert_eq!(entry.digest, digest);
+    assert_eq!(entry.tree_digest.is_some(), kind == AssetKind::Directory);
+    assert_eq!(entry.references_blobs, references_blobs);
+    assert_eq!(entry.references_directories, references_directories);
+    (action_result, entry)
+}
+
+/// A Push's references are stored as extra outputs under paths of their own,
+/// which `completeness_checking` checks, and read back without being taken
+/// for the asset or its `Tree`.
+#[nativelink_test]
+async fn an_entry_with_references_round_trips() {
+    let blobs: Vec<Digest> = vec![sha256_digest_of(b"b").into(), sha256_digest_of(b"c").into()];
+    let cas_store = memory_store().await;
+    let (_, sub, deep) = upload_nested_directories(&cas_store).await;
+    let directories: Vec<Digest> = vec![sub.into(), deep.into()];
+
+    for kind in [AssetKind::Blob, AssetKind::Directory] {
+        let (action_result, _) = round_trip(kind, blobs.clone(), directories.clone()).await;
+        let file_paths: Vec<&str> = action_result
+            .output_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        let directory_paths: Vec<&str> = action_result
+            .output_directories
+            .iter()
+            .map(|directory| directory.path.as_str())
+            .collect();
+        let (mut expected_files, mut expected_directories) = match kind {
+            AssetKind::Blob => (vec!["out"], vec![]),
+            AssetKind::Directory => (vec![], vec!["out"]),
+        };
+        expected_files.extend(["references/blobs/0", "references/blobs/1"]);
+        expected_directories.extend(["references/directories/0", "references/directories/1"]);
+        assert_eq!(file_paths, expected_files);
+        assert_eq!(directory_paths, expected_directories);
+        // A referenced directory is named by its root `Directory`, with no
+        // `Tree`, so `completeness_checking` walks it from the root.
+        for directory in &action_result.output_directories[expected_directories.len() - 2..] {
+            assert_eq!(directory.tree_digest, None);
+            assert!(directory.root_directory_digest.is_some());
+        }
+    }
+}
+
+/// Without references an entry is written exactly as before they were stored:
+/// a single output, which still decodes.
+#[nativelink_test]
+async fn an_entry_without_references_round_trips() {
+    for kind in [AssetKind::Blob, AssetKind::Directory] {
+        let (action_result, _) = round_trip(kind, vec![], vec![]).await;
+        assert_eq!(
+            action_result.output_files.len() + action_result.output_directories.len(),
+            1
+        );
+    }
 }

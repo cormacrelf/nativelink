@@ -173,6 +173,8 @@ impl MetadataCache {
             // Validators only matter to an entry that can go stale.
             etag: outcome.validators.etag.clone().filter(|_| !pinned),
             last_modified: outcome.validators.last_modified.clone().filter(|_| !pinned),
+            references_blobs: vec![],
+            references_directories: vec![],
         };
         write_remote_asset_entry(&self.ac_store, Some(&self.cas_store), &entry)
             .await

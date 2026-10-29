@@ -25,13 +25,28 @@ use nativelink_proto::build::bazel::remote::asset::v1::push_server::{Push, PushS
 use nativelink_proto::build::bazel::remote::asset::v1::{
     PushBlobRequest, PushBlobResponse, PushDirectoryRequest, PushDirectoryResponse,
 };
+use nativelink_proto::build::bazel::remote::execution::v2::Digest;
 use nativelink_store::store_manager::StoreManager;
+use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::make_ctx_for_hash_func;
 use nativelink_util::redact::redact_uri;
 use nativelink_util::store_trait::Store;
 use opentelemetry::context::FutureExt;
 use tonic::{Request, Response, Status};
 use tracing::{Instrument, Level, error_span, info, instrument};
+
+/// Parses the `references_blobs` or `references_directories` of a push, so a
+/// malformed digest is rejected and the rest are stored with lowercase hex.
+fn parse_references(references: &[Digest], field: &str) -> Result<Vec<Digest>, Error> {
+    references
+        .iter()
+        .map(|digest| {
+            DigestInfo::try_from(digest)
+                .map(Into::into)
+                .err_tip(|| format!("Invalid digest in '{field}'"))
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct PushStoreInfo {
@@ -114,6 +129,12 @@ impl PushServer {
                 "No uris in push request".to_owned(),
             ));
         }
+        // The references are hints that this content must outlive the entry.
+        // Stored as outputs of the entry, `completeness_checking` misses the
+        // entry once any of them has left the CAS.
+        let references_blobs = parse_references(&request.references_blobs, "references_blobs")?;
+        let references_directories =
+            parse_references(&request.references_directories, "references_directories")?;
         let stored_at = now_timestamp();
         for uri in request.uris {
             // Header qualifiers are dropped here: they are often credentials
@@ -131,6 +152,8 @@ impl PushServer {
                 tree_digest: None,
                 etag: None,
                 last_modified: None,
+                references_blobs: references_blobs.clone(),
+                references_directories: references_directories.clone(),
             };
             write_remote_asset_entry(&store_info.store, None, &entry)
                 .await
@@ -177,8 +200,11 @@ impl PushServer {
                 "No uris in push request".to_owned(),
             ));
         }
-        // `references_blobs` and `references_directories` are only hints, and
-        // like `push_blob` we do not act on them.
+        // As in `push_blob`, the references are stored so that
+        // `completeness_checking` misses the entry once any has left the CAS.
+        let references_blobs = parse_references(&request.references_blobs, "references_blobs")?;
+        let references_directories =
+            parse_references(&request.references_directories, "references_directories")?;
         let stored_at = now_timestamp();
         for uri in request.uris {
             let entry = RemoteAssetEntry {
@@ -194,6 +220,8 @@ impl PushServer {
                 tree_digest: None,
                 etag: None,
                 last_modified: None,
+                references_blobs: references_blobs.clone(),
+                references_directories: references_directories.clone(),
             };
             // Fails if any `Directory` of the tree is missing from the CAS.
             write_remote_asset_entry(&store_info.store, Some(cas_store), &entry)

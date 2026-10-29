@@ -32,6 +32,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
 use nativelink_service::fetch_server::FetchServer;
 use nativelink_service::push_server::PushServer;
 use nativelink_store::default_store_factory::store_factory;
+use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
@@ -859,5 +860,146 @@ async fn test_fetch_finds_a_push_regardless_of_qualifier_order_and_headers() -> 
         .await?
         .into_inner();
     assert_eq!(response.blob_digest, Some(digest));
+    Ok(())
+}
+
+/// Removes `digest` from the in-memory CAS, as an eviction would.
+async fn evict(store_manager: &StoreManager, digest: &Digest) {
+    let cas_store = store_manager.get_store("test_cas_store").unwrap();
+    let memory_store = cas_store
+        .downcast_ref::<MemoryStore>(None)
+        .expect("test_cas_store is a memory store");
+    assert!(
+        memory_store
+            .remove_entry(DigestInfo::try_from(digest).unwrap().into())
+            .await,
+        "{digest:?} was not in the CAS"
+    );
+}
+
+/// The status code of a `FetchBlob` for `uri`.
+async fn fetch_blob_code(fs: &FetchServer, uri: &str) -> Result<i32, Status> {
+    Ok(fs
+        .fetch_blob(Request::new(fetch_blob_request(uri, test_qualifiers(), 0)))
+        .await?
+        .into_inner()
+        .status
+        .unwrap()
+        .code)
+}
+
+/// A pushed blob that references a blob and a directory, as a `BuildStream`
+/// artifact references its logs and file trees, is served while they are in
+/// the CAS. Once any of them is evicted, down to a file deep in the
+/// referenced tree, `completeness_checking` turns the entry into a miss.
+#[nativelink_test]
+async fn test_push_blob_is_not_fetchable_once_a_reference_is_evicted() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let ps = make_push_server(&store_manager, false);
+    let fs = make_fetch_server(&store_manager);
+    let artifact = put_blob(&store_manager, b"artifact").await;
+    let log = put_blob(&store_manager, b"log").await;
+    let (root, sub, _) = put_nested_directory(&store_manager).await;
+    let deep_file = Digest::from(sha256_digest_of(b"c"));
+
+    for (uri, evicted) in [
+        ("http://log", log.clone()),
+        ("http://sub", sub),
+        ("http://deep-file", deep_file),
+    ] {
+        put_blob(&store_manager, b"log").await;
+        put_nested_directory(&store_manager).await;
+        let mut request = push_blob_request(vec![uri.to_owned()], Some(artifact.clone()));
+        request.references_blobs = vec![log.clone()];
+        request.references_directories = vec![root.clone()];
+        ps.push_blob(Request::new(request)).await?;
+        assert_eq!(fetch_blob_code(&fs, uri).await?, i32::from(Code::Ok));
+
+        evict(&store_manager, &evicted).await;
+        assert_eq!(
+            fetch_blob_code(&fs, uri).await?,
+            i32::from(Code::NotFound),
+            "still served with {evicted:?} evicted"
+        );
+    }
+    Ok(())
+}
+
+/// `PushDirectory` keeps its references the same way.
+#[nativelink_test]
+async fn test_push_directory_is_not_fetchable_once_a_reference_is_evicted() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let ps = make_push_server(&store_manager, false);
+    let fs = make_fetch_server(&store_manager);
+    let (root, _, _) = put_nested_directory(&store_manager).await;
+    let log = put_blob(&store_manager, b"log").await;
+    let referenced = put_directory(
+        &store_manager,
+        &Directory {
+            files: vec![file_node("d.txt", put_blob(&store_manager, b"d").await)],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut request = push_directory_request(vec!["http://1234".to_owned()], Some(root.clone()));
+    request.references_blobs = vec![log];
+    request.references_directories = vec![referenced.clone()];
+    ps.push_directory(Request::new(request)).await?;
+    let fetch_directory_code = || async {
+        Ok::<_, Status>(
+            fs.fetch_directory(Request::new(fetch_directory_request(
+                "http://1234",
+                test_qualifiers(),
+            )))
+            .await?
+            .into_inner()
+            .status
+            .unwrap()
+            .code,
+        )
+    };
+    assert_eq!(fetch_directory_code().await?, i32::from(Code::Ok));
+
+    evict(&store_manager, &referenced).await;
+    assert_eq!(fetch_directory_code().await?, i32::from(Code::NotFound));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_push_with_a_malformed_reference_is_an_invalid_argument() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let ps = make_push_server(&store_manager, false);
+    let artifact = put_blob(&store_manager, b"artifact").await;
+    let (root, _, _) = put_nested_directory(&store_manager).await;
+    let malformed = Digest {
+        hash: "not hex".to_owned(),
+        size_bytes: 1,
+    };
+
+    let mut request = push_blob_request(vec!["http://1234".to_owned()], Some(artifact.clone()));
+    request.references_blobs = vec![malformed.clone()];
+    let err = ps.push_blob(Request::new(request)).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+
+    let mut request = push_blob_request(vec!["http://1234".to_owned()], Some(artifact));
+    request.references_directories = vec![malformed.clone()];
+    let err = ps.push_blob(Request::new(request)).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+
+    let mut request = push_directory_request(vec!["http://1234".to_owned()], Some(root));
+    request.references_blobs = vec![Digest {
+        hash: Digest::from(sha256_digest_of(b"x")).hash,
+        size_bytes: -1,
+    }];
+    let err = ps.push_directory(Request::new(request)).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+
+    // Nothing was written.
+    let fs = make_fetch_server(&store_manager);
+    assert_eq!(
+        fetch_blob_code(&fs, "http://1234").await?,
+        i32::from(Code::NotFound)
+    );
     Ok(())
 }

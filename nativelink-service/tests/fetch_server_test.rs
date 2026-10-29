@@ -2326,6 +2326,8 @@ async fn write_entry(
             tree_digest: None,
             etag: None,
             last_modified: None,
+            references_blobs: vec![],
+            references_directories: vec![],
         },
     )
     .await
