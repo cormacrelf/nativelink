@@ -46,6 +46,7 @@ pub fn fetcher_factory<S: BuildHasher>(
             let options = UrlFetcherOptions {
                 temp_path: spec.temp_path.clone(),
                 max_size_bytes: spec.max_size_bytes,
+                require_checksum: spec.require_checksum,
                 proxy: ProxySettings::from_config(
                     spec.http_proxy.as_deref(),
                     spec.http_proxy_secret_file.as_deref(),
