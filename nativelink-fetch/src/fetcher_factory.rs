@@ -26,7 +26,7 @@ use nativelink_store::store_manager::StoreManager;
 use crate::background_fetcher::{BackgroundFetcher, BackgroundFetcherOpts};
 use crate::fetcher::Fetcher;
 use crate::metadata_cache::MetadataCache;
-use crate::url_fetcher::{UrlFetcher, UrlFetcherOptions};
+use crate::url_fetcher::{ProxySettings, UrlFetcher, UrlFetcherOptions};
 
 /// Builds a single fetcher from `spec`, resolving store references against
 /// `store_manager` and inner-fetcher references against `built` (fetchers
@@ -46,6 +46,11 @@ pub fn fetcher_factory<S: BuildHasher>(
             let options = UrlFetcherOptions {
                 temp_path: spec.temp_path.clone(),
                 max_size_bytes: spec.max_size_bytes,
+                proxy: ProxySettings::from_config(
+                    spec.http_proxy.as_deref(),
+                    spec.http_proxy_secret_file.as_deref(),
+                    &spec.no_proxy,
+                )?,
                 ..UrlFetcherOptions::default()
             };
             let options = match spec.max_fetch_duration_s {
