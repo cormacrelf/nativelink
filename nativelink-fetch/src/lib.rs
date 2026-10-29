@@ -19,4 +19,5 @@ pub mod ip_filter;
 pub mod metadata_cache;
 pub mod remote_asset_proto;
 pub mod route_fetcher;
+pub mod static_fetcher;
 pub mod url_fetcher;

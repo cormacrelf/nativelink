@@ -18,6 +18,7 @@ rust_library(
         "src/metadata_cache.rs",
         "src/remote_asset_proto.rs",
         "src/route_fetcher.rs",
+        "src/static_fetcher.rs",
         "src/url_fetcher.rs",
     ],
     visibility = ["//visibility:public"],
@@ -48,6 +49,7 @@ rust_test_suite(
         "tests/background_fetcher_test.rs",
         "tests/metadata_cache_test.rs",
         "tests/route_fetcher_test.rs",
+        "tests/static_fetcher_test.rs",
         "tests/url_fetcher_test.rs",
     ],
     proc_macro_deps = [
@@ -62,6 +64,7 @@ rust_test_suite(
         "//nativelink-util",
         "@crates//:parking_lot",
         "@crates//:prost",
+        "@crates//:sha2",
         "@crates//:tokio",
         "@crates//:tonic",
         "@crates//:tracing",

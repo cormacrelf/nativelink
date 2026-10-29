@@ -32,6 +32,7 @@ use crate::ip_filter::IpFilter;
 use crate::metadata_cache::MetadataCache;
 use crate::remote_asset_proto::is_http_header_qualifier;
 use crate::route_fetcher::{QualifierMatch, Route, RouteFetcher, RouteMatch};
+use crate::static_fetcher::StaticFetcher;
 use crate::url_fetcher::{ProxySettings, UrlFetcher, UrlFetcherOptions};
 
 /// Builds a single fetcher from `spec`, resolving store references against
@@ -149,6 +150,15 @@ pub fn fetcher_factory<S: BuildHasher>(
                 .map(|name| resolve(name, built))
                 .transpose()?;
             Ok(RouteFetcher::new(routes, otherwise))
+        }
+        FetcherSpec::Static(spec) => {
+            let cas_store = store_manager.get_store(&spec.cas_store).ok_or_else(|| {
+                make_input_err!("'cas_store': '{}' does not exist", spec.cas_store)
+            })?;
+            Ok(Arc::new(StaticFetcher::new(
+                cas_store,
+                spec.content.clone(),
+            )))
         }
     }
 }
