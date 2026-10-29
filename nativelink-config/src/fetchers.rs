@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
+
 #[cfg(feature = "dev-schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -74,6 +76,34 @@ pub enum FetcherSpec {
     /// Sends each URI to a fetcher chosen by its host, scheme, port and path.
     /// Without `otherwise`, any other URI is refused: an allowlist.
     Route(RouteSpec),
+    /// Serves a fixed set of URIs from content written in the config, with no
+    /// network access. For tests, demos and trying out the fetcher chain.
+    Static(StaticSpec),
+}
+
+/// A leaf fetcher that serves the URIs listed in `content`, with the text
+/// given for each as its body, and fails every other URI with `NotFound`,
+/// as a `url` fetcher does for a URI the origin does not have. It honours
+/// the request's checksums (a mismatch is `Aborted`) and tries URIs in the
+/// order the request lists them. It serves blobs only: `FetchDirectory`
+/// fails with `Unimplemented`.
+///
+/// It is meant for tests, demos and diagrams, where running an origin is
+/// more trouble than the thing being tried. It is not a way to serve
+/// content to builds.
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct StaticSpec {
+    /// The CAS store (from the `stores` map) the content is written to.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub cas_store: StoreRefName,
+
+    /// The URIs this fetcher serves, each with the exact text it serves for
+    /// it. A URI is matched as a whole string, as written in the request.
+    /// Not expanded for `${VAR}` references, so any text can be written.
+    #[serde(default)]
+    pub content: HashMap<String, String>,
 }
 
 /// The leaf fetcher: performs the HTTP or HTTPS download and CAS upload.
