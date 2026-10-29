@@ -243,6 +243,77 @@ async fn limits_concurrency() {
 }
 
 #[nativelink_test]
+async fn queued_caller_that_disconnects_leaves_no_fetch_behind() {
+    let (mock, mut handles) = mock_fetcher(true);
+    let bg = BackgroundFetcher::new(
+        mock,
+        BackgroundFetcherOpts {
+            max_concurrent_fetches: Some(1),
+            ..Default::default()
+        },
+    );
+
+    // The first fetch takes the only slot.
+    let running = {
+        let bg = bg.clone();
+        tokio::spawn(async move { bg.fetch_blob(&blob_job("http://example/a", None)).await })
+    };
+    handles.start_rx.recv().await.expect("first fetch starts");
+
+    // A second, distinct fetch queues for the slot; its caller then goes away.
+    let queued = {
+        let bg = bg.clone();
+        tokio::spawn(async move { bg.fetch_blob(&blob_job("http://example/b", None)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    queued.abort();
+    assert!(queued.await.unwrap_err().is_cancelled());
+
+    // Freeing the slot must not start the abandoned fetch.
+    handles.gate.add_permits(2);
+    running.await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(handles.started.load(Ordering::SeqCst), 1);
+}
+
+#[nativelink_test]
+async fn identical_callers_queued_for_a_slot_share_one_fetch() {
+    let (mock, mut handles) = mock_fetcher(true);
+    let bg = BackgroundFetcher::new(
+        mock,
+        BackgroundFetcherOpts {
+            max_concurrent_fetches: Some(1),
+            ..Default::default()
+        },
+    );
+
+    let running = {
+        let bg = bg.clone();
+        tokio::spawn(async move { bg.fetch_blob(&blob_job("http://example/a", None)).await })
+    };
+    handles.start_rx.recv().await.expect("first fetch starts");
+
+    // Three identical requests queue for the slot behind it. The first of them
+    // goes away; the others must still get, and share, one fetch.
+    let mut queued: Vec<_> = (0..3)
+        .map(|_| {
+            let bg = bg.clone();
+            tokio::spawn(async move { bg.fetch_blob(&blob_job("http://example/b", None)).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    queued.remove(0).abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    handles.gate.add_permits(3);
+    running.await.unwrap().unwrap();
+    for call in queued {
+        call.await.unwrap().unwrap();
+    }
+    assert_eq!(handles.started.load(Ordering::SeqCst), 2);
+}
+
+#[nativelink_test]
 async fn fetch_survives_caller_dropping() {
     let (mock, mut handles) = mock_fetcher(true);
     let bg = BackgroundFetcher::new(mock, BackgroundFetcherOpts::default());

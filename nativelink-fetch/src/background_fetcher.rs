@@ -45,11 +45,22 @@ use tonic::{Code, async_trait};
 
 use crate::fetcher::{FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher};
 
-/// The shared, in-flight result of one fetch. `None` until the fetch completes;
-/// once set, every current and future subscriber observes the same
-/// `Arc`-wrapped result. The producing task owns the matching `watch::Sender`
-/// and runs to completion regardless of how many subscribers remain.
-type SharedResult = watch::Receiver<Option<Arc<Result<FetchOutcome, Error>>>>;
+/// Where one fetch is. Once `Done`, every current and future subscriber
+/// observes the same `Arc`-wrapped result.
+#[derive(Clone, Debug)]
+enum FetchState {
+    /// Its first caller is waiting for a concurrency slot. Identical requests
+    /// join it here rather than queueing a duplicate fetch.
+    Queued,
+    /// The detached task is running it.
+    Running,
+    Done(Arc<Result<FetchOutcome, Error>>),
+}
+
+/// The shared state of one fetch. The matching `watch::Sender` is held by the
+/// caller queued for a slot, then by the detached task, which runs to
+/// completion regardless of how many subscribers remain.
+type SharedResult = watch::Receiver<FetchState>;
 
 /// Tuning for [`BackgroundFetcher`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -104,14 +115,35 @@ impl BackgroundFetcher {
     }
 }
 
-/// Subscribes to an in-flight fetch for `key`, or starts one by spawning a
-/// detached task running `run`. The task acquires a concurrency permit (when
-/// configured), publishes its result to the watch channel, then removes itself
-/// from the map. Returns a receiver the caller can await; dropping it does not
-/// cancel the task.
-fn schedule_or_join<K, F, Fut>(
+/// Removes a queued fetch's map entry if its caller goes away before the fetch
+/// is spawned, so that a later request does not join a fetch nobody will run.
+struct QueuedEntry<'a, K: Eq + Hash> {
+    map: &'a Mutex<HashMap<K, SharedResult>>,
+    key: Option<K>,
+}
+
+impl<K: Eq + Hash> Drop for QueuedEntry<'_, K> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.map.lock().remove(&key);
+        }
+    }
+}
+
+/// Subscribes to the fetch for `key`, or starts one by spawning a detached task
+/// running `run`. Returns a receiver the caller can await; dropping it does not
+/// cancel a spawned task.
+///
+/// The concurrency permit (when configured) is taken here, by the caller,
+/// before anything is spawned. A caller queued for a slot holds nothing but its
+/// own future, so one that disconnects stops waiting and leaves no work behind;
+/// only a fetch that holds a slot is detached, which bounds the number of
+/// detached tasks by `max_concurrent_fetches`. Identical requests that arrive
+/// meanwhile join the queued fetch; if its caller goes away they see it
+/// abandoned (see [`await_shared`]) and call this again.
+async fn schedule_or_join<K, F, Fut>(
     map: &Arc<Mutex<HashMap<K, SharedResult>>>,
-    permits: &Option<Arc<Semaphore>>,
+    permits: Option<&Arc<Semaphore>>,
     key: K,
     run: F,
 ) -> SharedResult
@@ -120,53 +152,67 @@ where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = Result<FetchOutcome, Error>> + Send + 'static,
 {
-    let mut guard = map.lock();
-    if let Some(rx) = guard.get(&key) {
-        return rx.clone();
-    }
-    let (tx, rx) = watch::channel(None);
-    guard.insert(key.clone(), rx.clone());
-    drop(guard);
+    let (tx, rx) = {
+        let mut guard = map.lock();
+        if let Some(rx) = guard.get(&key) {
+            return rx.clone();
+        }
+        let (tx, rx) = watch::channel(FetchState::Queued);
+        guard.insert(key.clone(), rx.clone());
+        (tx, rx)
+    };
+    let mut queued = QueuedEntry {
+        map,
+        key: Some(key),
+    };
+    let permit: Option<OwnedSemaphorePermit> = match permits {
+        // `acquire_owned` only fails if the semaphore is closed, which we
+        // never do.
+        Some(semaphore) => Some(
+            semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("fetch semaphore is never closed"),
+        ),
+        None => None,
+    };
+    let key = queued.key.take().expect("set above");
+    tx.send_replace(FetchState::Running);
 
     let map = map.clone();
-    let permits = permits.clone();
     background_spawn!("background_fetch", async move {
-        let _permit: Option<OwnedSemaphorePermit> = match &permits {
-            // `acquire_owned` only fails if the semaphore is closed, which we
-            // never do.
-            Some(semaphore) => Some(
-                semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("fetch semaphore is never closed"),
-            ),
-            None => None,
-        };
+        let _permit = permit;
         let result = run().await;
         // Publish first so a late subscriber that joined just before removal
-        // still sees the result, then drop the in-flight entry. The send only
-        // errors if every receiver has been dropped, which we ignore -- the
-        // fetch result is still cached in the watch channel's last value.
-        drop(tx.send(Some(Arc::new(result))));
+        // still sees the result, then drop the in-flight entry.
+        tx.send_replace(FetchState::Done(Arc::new(result)));
         map.lock().remove(&key);
     });
     rx
 }
 
-/// Awaits a [`SharedResult`] and unwraps it into an owned result.
-async fn await_shared(mut rx: SharedResult) -> Result<FetchOutcome, Error> {
-    let guard = rx.wait_for(Option::is_some).await.map_err(|_| {
-        make_err!(
+/// Awaits a [`SharedResult`] and unwraps it into an owned result. `None` when
+/// the fetch was abandoned while queued for a slot, so the caller should
+/// schedule it again.
+async fn await_shared(mut rx: SharedResult) -> Option<Result<FetchOutcome, Error>> {
+    let done = rx
+        .wait_for(|state| matches!(state, FetchState::Done(_)))
+        .await
+        .map(|state| state.clone())
+        .ok();
+    // The sender is gone: the last state says whether it was ever spawned.
+    let state = done.unwrap_or_else(|| rx.borrow().clone());
+    match state {
+        FetchState::Done(value) => Some(match &*value {
+            Ok(outcome) => Ok(outcome.clone()),
+            Err(err) => Err(err.clone()),
+        }),
+        FetchState::Queued => None,
+        FetchState::Running => Some(Err(make_err!(
             Code::Internal,
             "Background fetch task ended without publishing a result"
-        )
-    })?;
-    let value = (*guard).clone().expect("wait_for guarantees Some");
-    drop(guard);
-    match &*value {
-        Ok(outcome) => Ok(outcome.clone()),
-        Err(err) => Err(err.clone()),
+        ))),
     }
 }
 
@@ -175,28 +221,38 @@ impl Fetcher for BackgroundFetcher {
     async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
         let mut job = job.clone();
         job.timeout = self.clamp(job.timeout);
-        let inner = self.inner.clone();
-        let run_job = job.clone();
-        let rx = schedule_or_join(
-            &self.blob_in_flight,
-            &self.permits,
-            job,
-            move || async move { inner.fetch_blob(&run_job).await },
-        );
-        await_shared(rx).await
+        loop {
+            let inner = self.inner.clone();
+            let run_job = job.clone();
+            let rx = schedule_or_join(
+                &self.blob_in_flight,
+                self.permits.as_ref(),
+                job.clone(),
+                move || async move { inner.fetch_blob(&run_job).await },
+            )
+            .await;
+            if let Some(result) = await_shared(rx).await {
+                return result;
+            }
+        }
     }
 
     async fn fetch_directory(&self, job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
         let mut job = job.clone();
         job.timeout = self.clamp(job.timeout);
-        let inner = self.inner.clone();
-        let run_job = job.clone();
-        let rx = schedule_or_join(
-            &self.dir_in_flight,
-            &self.permits,
-            job,
-            move || async move { inner.fetch_directory(&run_job).await },
-        );
-        await_shared(rx).await
+        loop {
+            let inner = self.inner.clone();
+            let run_job = job.clone();
+            let rx = schedule_or_join(
+                &self.dir_in_flight,
+                self.permits.as_ref(),
+                job.clone(),
+                move || async move { inner.fetch_directory(&run_job).await },
+            )
+            .await;
+            if let Some(result) = await_shared(rx).await {
+                return result;
+            }
+        }
     }
 }
