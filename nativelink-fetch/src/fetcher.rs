@@ -134,9 +134,9 @@ impl FetchHeaders {
 /// `Hash`/`Eq` (implemented manually) define the in-flight deduplication
 /// identity used by [`crate::background_fetcher::BackgroundFetcher`]: the URIs,
 /// the qualifiers (order-insensitive), the checksum and the hash function.
-/// Per-request parameters such as `header_timeout` are deliberately excluded,
-/// so a concurrent duplicate joins the in-flight fetch and runs with the first
-/// requester's parameters (`header_timeout` and `headers`).
+/// Per-request parameters such as `timeout` are deliberately excluded, so a
+/// concurrent duplicate joins the in-flight fetch and runs with the first
+/// requester's parameters (`timeout` and `headers`).
 #[derive(Clone, Debug)]
 pub struct FetchBlobTask {
     /// Candidate URIs, tried in order until one serves valid content.
@@ -153,10 +153,12 @@ pub struct FetchBlobTask {
     pub checksums: Vec<ByteChecksum>,
     /// Hash function used to compute the CAS digest.
     pub hasher_func: DigestHasherFunc,
-    /// Per-attempt deadline for the response headers to arrive. `None` leaves
-    /// only the fetcher's default connect/read timeouts in effect. Not part of
-    /// the deduplication identity.
-    pub header_timeout: Option<Duration>,
+    /// The time budget for the whole job: every URI attempt, the download,
+    /// verification and the CAS upload. Comes from the request's `timeout`. The
+    /// fetcher fails the job with `DeadlineExceeded` when it runs out. `None`
+    /// leaves only the fetcher's own cap in effect. Not part of the
+    /// deduplication identity.
+    pub timeout: Option<Duration>,
     /// HTTP headers to send to the origin. Not part of the deduplication
     /// identity.
     pub headers: FetchHeaders,

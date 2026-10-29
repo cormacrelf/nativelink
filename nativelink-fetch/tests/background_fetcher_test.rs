@@ -94,7 +94,7 @@ impl Fetcher for MockFetcher {
         self.started.fetch_add(1, Ordering::SeqCst);
         let now = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);
-        self.seen_timeouts.lock().push(job.header_timeout);
+        self.seen_timeouts.lock().push(job.timeout);
         let _ = self.start_tx.send(());
         if self.block {
             self.gate.acquire().await.expect("gate not closed").forget();
@@ -109,13 +109,13 @@ impl Fetcher for MockFetcher {
     }
 }
 
-fn blob_job(uri: &str, header_timeout: Option<Duration>) -> FetchBlobTask {
+fn blob_job(uri: &str, timeout: Option<Duration>) -> FetchBlobTask {
     FetchBlobTask {
         uris: vec![uri.to_owned()],
         qualifiers: vec![],
         checksums: vec![],
         hasher_func: DigestHasherFunc::Sha256,
-        header_timeout,
+        timeout,
         headers: FetchHeaders::default(),
     }
 }
@@ -256,7 +256,7 @@ async fn fetch_survives_caller_dropping() {
 }
 
 #[nativelink_test]
-async fn clamps_header_timeout() {
+async fn clamps_total_timeout() {
     let (mock, handles) = mock_fetcher(false);
     let bg = BackgroundFetcher::new(
         mock,

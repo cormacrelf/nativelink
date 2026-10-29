@@ -48,6 +48,13 @@ pub fn fetcher_factory<S: BuildHasher>(
                 max_size_bytes: spec.max_size_bytes,
                 ..UrlFetcherOptions::default()
             };
+            let options = match spec.max_fetch_duration_s {
+                Some(seconds) => UrlFetcherOptions {
+                    max_fetch_duration: Duration::from_secs(seconds),
+                    ..options
+                },
+                None => options,
+            };
             Ok(Arc::new(UrlFetcher::new(cas_store, options)?))
         }
         FetcherSpec::MetadataCache(spec) => {

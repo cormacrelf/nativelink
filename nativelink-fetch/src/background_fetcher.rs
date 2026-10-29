@@ -56,11 +56,11 @@ type SharedResult = watch::Receiver<Option<Arc<Result<FetchOutcome, Error>>>>;
 pub struct BackgroundFetcherOpts {
     /// Maximum number of inner fetches running at once. `None` is unbounded.
     pub max_concurrent_fetches: Option<usize>,
-    /// Lower bound applied to a job's `header_timeout` (only when the job sets
-    /// one). `None` leaves it unchanged.
+    /// Lower bound applied to a job's `timeout`, the budget for the whole fetch
+    /// (only when the job sets one). `None` leaves it unchanged.
     pub min_timeout: Option<Duration>,
-    /// Upper bound applied to a job's `header_timeout` (only when the job sets
-    /// one). `None` leaves it unchanged.
+    /// Upper bound applied to a job's `timeout`, the budget for the whole fetch
+    /// (only when the job sets one). `None` leaves it unchanged.
     pub max_timeout: Option<Duration>,
 }
 
@@ -88,7 +88,7 @@ impl BackgroundFetcher {
         })
     }
 
-    /// Clamps a job's header timeout into `[min, max]`. Only applies when the
+    /// Clamps a job's total timeout into `[min, max]`. Only applies when the
     /// job actually sets a timeout -- an unset deadline is left unset.
     fn clamp(&self, timeout: Option<Duration>) -> Option<Duration> {
         let mut timeout = timeout?;
@@ -172,7 +172,7 @@ async fn await_shared(mut rx: SharedResult) -> Result<FetchOutcome, Error> {
 impl Fetcher for BackgroundFetcher {
     async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
         let mut job = job.clone();
-        job.header_timeout = self.clamp(job.header_timeout);
+        job.timeout = self.clamp(job.timeout);
         let inner = self.inner.clone();
         let run_job = job.clone();
         let rx = schedule_or_join(
