@@ -50,7 +50,7 @@ pub enum FetcherSpec {
 }
 
 /// The leaf fetcher: performs the HTTP or HTTPS download and CAS upload.
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct UrlFetcherSpec {
@@ -78,6 +78,27 @@ pub struct UrlFetcherSpec {
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
     pub max_size_bytes: Option<u64>,
+
+    /// Hard cap, in seconds, on the total duration of a single fetch: every
+    /// URI attempt, the download, checksum verification and the CAS upload
+    /// together. A fetch that runs out of time fails with `DEADLINE_EXCEEDED`
+    /// in the response status, whatever else is going on.
+    ///
+    /// A request's own `timeout` can only shorten this. The effective budget is
+    /// the smaller of the request's `timeout` (after any `min_timeout_s` and
+    /// `max_timeout_s` clamp of a `background` fetcher) and this value, so a
+    /// request with a larger `timeout`, or none at all, is still capped, and a
+    /// slow origin cannot hold a fetch (or a `background` fetcher's concurrency
+    /// slot) forever. It applies whether or not a client is still waiting for
+    /// the result.
+    ///
+    /// The per-connection connect and idle-read timeouts (30 seconds each)
+    /// always apply as well. Defaults to 3600 (one hour) when unset.
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub max_fetch_duration_s: Option<u64>,
 }
 
 /// A decorator that caches fetched-asset metadata.
@@ -116,18 +137,23 @@ pub struct BackgroundSpec {
     )]
     pub max_concurrent_fetches: Option<usize>,
 
-    /// Lower bound (in seconds) applied to a request's `timeout` before it is
-    /// passed to the inner fetcher. Only applies when the request sets a
-    /// timeout. When unset, no lower bound is enforced.
+    /// Lower bound (in seconds) applied to a request's `timeout`, the total
+    /// time budget for the whole fetch, before it is passed to the inner
+    /// fetcher. Only applies when the request sets a timeout; a request
+    /// without one stays without one, and is then bounded only by the URL
+    /// fetcher's `max_fetch_duration_s`. When unset, no lower bound is
+    /// enforced.
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
     pub min_timeout_s: Option<u64>,
 
-    /// Upper bound (in seconds) applied to a request's `timeout` before it is
-    /// passed to the inner fetcher. Only applies when the request sets a
-    /// timeout. When unset, no upper bound is enforced.
+    /// Upper bound (in seconds) applied to a request's `timeout`, the total
+    /// time budget for the whole fetch, before it is passed to the inner
+    /// fetcher. Only applies when the request sets a timeout. When unset, no
+    /// upper bound is enforced (the URL fetcher's `max_fetch_duration_s` still
+    /// is).
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"

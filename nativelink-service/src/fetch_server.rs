@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use core::convert::Into;
+use core::future::Future;
 use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +45,8 @@ use nativelink_util::store_trait::Store;
 use opentelemetry::context::FutureExt;
 use prost::Message;
 use prost_types::Timestamp;
+use tokio::time::{Instant as TokioInstant, timeout_at};
+use tonic::metadata::MetadataMap;
 use tonic::{Code, Request, Response, Status};
 use tracing::{Instrument, Level, debug, error_span, info, instrument, warn};
 
@@ -254,8 +257,9 @@ fn qualifier_pairs(qualifiers: &[Qualifier]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Converts the request's `timeout` (a `google.protobuf.Duration`) into a
-/// `Duration`, treating unset/zero/negative values as "no explicit deadline".
+/// Converts the request's `timeout` (a `google.protobuf.Duration`), the time
+/// budget for the whole fetch, into a `Duration`, treating unset/zero/negative
+/// values as "no explicit timeout".
 fn request_timeout(timeout: Option<&prost_types::Duration>) -> Option<Duration> {
     let timeout = timeout?;
     if timeout.seconds <= 0 && timeout.nanos <= 0 {
@@ -264,6 +268,78 @@ fn request_timeout(timeout: Option<&prost_types::Duration>) -> Option<Duration> 
     let seconds = u64::try_from(timeout.seconds).ok()?;
     let nanos = u32::try_from(timeout.nanos).unwrap_or(0);
     Some(Duration::new(seconds, nanos))
+}
+
+/// How long before the RPC deadline the server stops waiting for a fetch.
+///
+/// tonic's server enforces `grpc-timeout` itself and, when it expires, cancels
+/// the handler and answers `CANCELLED` ("Timeout expired"). Its timer starts
+/// before ours (it runs from the arrival of the request, we start counting in
+/// the handler), so if we waited for exactly the deadline we would lose that
+/// race on every request and the client would see a bare `CANCELLED` instead of
+/// our `DEADLINE_EXCEEDED` explaining that the fetch continues. Giving up a
+/// little early makes our response the one that goes out.
+const RPC_DEADLINE_MARGIN: Duration = Duration::from_millis(100);
+
+/// Parses a `grpc-timeout` header value: at most eight digits followed by a
+/// unit of `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds), `u`
+/// (microseconds) or `n` (nanoseconds), as in the
+/// [gRPC over HTTP/2 spec](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md).
+/// tonic enforces the header but keeps its parser private, so this mirrors it.
+/// Anything malformed is `None`, which is also what tonic treats it as.
+#[must_use]
+pub fn parse_grpc_timeout(value: &str) -> Option<Duration> {
+    let unit = value.chars().next_back()?;
+    let digits = value.get(..value.len() - unit.len_utf8())?;
+    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let amount: u64 = digits.parse().ok()?;
+    match unit {
+        'H' => Some(Duration::from_secs(amount * 60 * 60)),
+        'M' => Some(Duration::from_secs(amount * 60)),
+        'S' => Some(Duration::from_secs(amount)),
+        'm' => Some(Duration::from_millis(amount)),
+        'u' => Some(Duration::from_micros(amount)),
+        'n' => Some(Duration::from_nanos(amount)),
+        _ => None,
+    }
+}
+
+/// The time at which to stop waiting for a fetch so as to answer before the
+/// RPC deadline the client sent in `grpc-timeout` (see
+/// [`RPC_DEADLINE_MARGIN`]), or `None` when the client sent none, in which case
+/// the fetch is waited for.
+fn rpc_wait_deadline(metadata: &MetadataMap) -> Option<TokioInstant> {
+    let deadline = parse_grpc_timeout(metadata.get("grpc-timeout")?.to_str().ok()?)?;
+    let margin = RPC_DEADLINE_MARGIN.min(deadline / 2);
+    TokioInstant::now().checked_add(deadline.saturating_sub(margin))
+}
+
+/// Awaits `fetch` until `deadline`, if there is one. If the deadline comes
+/// first, the RPC fails with `DEADLINE_EXCEEDED`, which the Remote Asset API
+/// reserves for exactly this: the fetch could not be completed within the RPC
+/// deadline, and the client should retry for at least as long as the request's
+/// `timeout`.
+///
+/// Giving up only drops this call's wait. With a `background` fetcher in the
+/// chain the fetch carries on and a retry of the same request joins it; without
+/// one the fetch is dropped along with the wait and a retry starts afresh.
+async fn until_rpc_deadline<T>(
+    deadline: Option<TokioInstant>,
+    fetch: impl Future<Output = Result<T, Error>>,
+) -> Result<Result<T, Error>, Status> {
+    let Some(deadline) = deadline else {
+        return Ok(fetch.await);
+    };
+    timeout_at(deadline, fetch).await.map_err(|_| {
+        Status::new(
+            Code::DeadlineExceeded,
+            "The fetch did not finish within the RPC deadline. A fetch run by a background \
+             fetcher continues, and retrying the same request joins it; retry for at least \
+             as long as the request's timeout",
+        )
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +383,7 @@ impl FetchServer {
     async fn inner_fetch_blob(
         &self,
         request: FetchBlobRequest,
+        rpc_deadline: Option<TokioInstant>,
     ) -> Result<Response<FetchBlobResponse>, Status> {
         let instance_name = &request.instance_name;
         let store_info = self
@@ -384,13 +461,13 @@ impl FetchServer {
                 qualifiers: qualifier_pairs(&request.qualifiers),
                 checksums,
                 hasher_func,
-                header_timeout: request_timeout(request.timeout.as_ref()),
+                timeout: request_timeout(request.timeout.as_ref()),
                 headers,
             };
             // The fetcher (via MetadataCache) caches the asset metadata itself;
             // here we only shape the response.
             info!("Asset is not cached, fetching it");
-            match fetcher.fetch_blob(&job).await {
+            match until_rpc_deadline(rpc_deadline, fetcher.fetch_blob(&job)).await? {
                 Ok(outcome) => {
                     let proto_digest: Digest = outcome.digest.into();
                     info!(
@@ -471,9 +548,10 @@ impl Fetch for FetchServer {
         &self,
         grpc_request: Request<FetchBlobRequest>,
     ) -> Result<Response<FetchBlobResponse>, Status> {
+        let rpc_deadline = rpc_wait_deadline(grpc_request.metadata());
         let request = grpc_request.into_inner();
         let digest_function = request.digest_function;
-        self.inner_fetch_blob(request)
+        self.inner_fetch_blob(request, rpc_deadline)
             .instrument(error_span!("fetch_server_fetch_blob"))
             .with_context(
                 make_ctx_for_hash_func(digest_function).err_tip(|| "In FetchServer::fetch_blob")?,

@@ -20,6 +20,7 @@
 //! payload is never buffered in memory. The temp file is then moved into the
 //! CAS via `update_with_whole_file`.
 
+use core::future::Future;
 use core::time::Duration;
 use std::ffi::OsString;
 
@@ -46,6 +47,11 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// than total transfer time.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default cap on the total duration of one fetch: all URI attempts, the
+/// download, verification and the CAS upload. A request's `timeout` can only
+/// shorten it.
+pub const DEFAULT_MAX_FETCH_DURATION: Duration = Duration::from_hours(1);
+
 /// Maps a reqwest error to the appropriate gRPC code: a timeout becomes
 /// `DeadlineExceeded` (per the Remote Asset API `timeout` semantics), anything
 /// else becomes `NotFound`.
@@ -57,27 +63,16 @@ fn download_error_code(e: &reqwest::Error) -> Code {
     }
 }
 
-/// Sends `req` and waits for the response headers, applying `timeout` (when set)
-/// to the header phase only -- `reqwest::RequestBuilder::send` resolves once the
-/// response headers arrive, so streaming/reading the body afterwards is bounded
-/// by the client's read (idle) timeout rather than this deadline. Also verifies
-/// the HTTP status. A timeout is reported as `DeadlineExceeded`.
+/// Sends `req` and waits for the response headers, then verifies the HTTP
+/// status. There is no deadline here beyond the client's connect timeout: the
+/// time a whole fetch may take is bounded once, around the fetch, by
+/// [`UrlFetcher`]. A reqwest timeout is reported as `DeadlineExceeded`.
 async fn send_awaiting_headers(
     req: reqwest::RequestBuilder,
     uri: &str,
-    timeout: Option<Duration>,
 ) -> Result<reqwest::Response, Error> {
-    let send = req.send();
-    let result = match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, send).await.map_err(|_| {
-            make_err!(
-                Code::DeadlineExceeded,
-                "Timed out waiting for response headers from '{uri}'"
-            )
-        })?,
-        None => send.await,
-    };
-    result
+    req.send()
+        .await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|e| make_err!(download_error_code(&e), "Failed to fetch '{uri}': {e}"))
 }
@@ -160,7 +155,6 @@ fn verify_all(verifiers: &mut [ChecksumVerifier]) -> Result<(), Error> {
 async fn stream_uri_to_file(
     req: reqwest::RequestBuilder,
     uri: &str,
-    timeout: Option<Duration>,
     max_size_bytes: Option<u64>,
     verifiers: &mut [ChecksumVerifier],
     hasher_func: DigestHasherFunc,
@@ -172,7 +166,7 @@ async fn stream_uri_to_file(
     }
     reset_verifiers(verifiers);
 
-    let response = match send_awaiting_headers(req, uri, timeout).await {
+    let response = match send_awaiting_headers(req, uri).await {
         Ok(response) => response,
         Err(err) => return FetchAttempt::DownloadFailed(err),
     };
@@ -244,9 +238,12 @@ pub struct UrlFetcher {
     /// Directory for the temp file downloaded content is buffered to before
     /// being moved into `cas_store`. `None` uses the system temp dir.
     temp_path: Option<String>,
-    /// Shared HTTP client carrying the default connect/read timeouts. Per-fetch
-    /// header deadlines come from each job's `header_timeout`.
+    /// Shared HTTP client carrying the default connect/read timeouts. The
+    /// time a whole fetch may take is bounded separately, by `max_fetch_duration`
+    /// and each job's `timeout`.
     client: reqwest::Client,
+    /// Cap on the total duration of any fetch, whatever the job asks for.
+    max_fetch_duration: Duration,
     /// Largest download accepted from any single URI. `None` is unbounded.
     max_size_bytes: Option<u64>,
 }
@@ -259,6 +256,9 @@ pub struct UrlFetcherOptions {
     pub temp_path: Option<String>,
     /// Largest download accepted from any single URI. `None` is unbounded.
     pub max_size_bytes: Option<u64>,
+    /// Cap on the total duration of a fetch. A job's `timeout` can only
+    /// shorten it. Must not be zero.
+    pub max_fetch_duration: Duration,
     /// Connect timeout applied to all origin fetches.
     pub connect_timeout: Duration,
     /// Per-read (idle) timeout applied to all origin fetches.
@@ -270,6 +270,7 @@ impl Default for UrlFetcherOptions {
         Self {
             temp_path: None,
             max_size_bytes: None,
+            max_fetch_duration: DEFAULT_MAX_FETCH_DURATION,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             read_timeout: DEFAULT_READ_TIMEOUT,
         }
@@ -282,9 +283,16 @@ impl UrlFetcher {
         let UrlFetcherOptions {
             temp_path,
             max_size_bytes,
+            max_fetch_duration,
             connect_timeout,
             read_timeout,
         } = options;
+        if max_fetch_duration.is_zero() {
+            return Err(make_err!(
+                Code::InvalidArgument,
+                "'max_fetch_duration_s' must be greater than zero"
+            ));
+        }
         // Ensure the configured temp directory exists; `NamedTempFile::new_in`
         // does not create it. (The system temp dir, used when unset, always
         // exists.)
@@ -304,14 +312,39 @@ impl UrlFetcher {
             cas_store,
             temp_path,
             client,
+            max_fetch_duration,
             max_size_bytes,
+        })
+    }
+
+    /// The time budget for a job with `job_timeout`: the smaller of it and the
+    /// cap.
+    fn budget(&self, job_timeout: Option<Duration>) -> Duration {
+        job_timeout.map_or(self.max_fetch_duration, |timeout| {
+            timeout.min(self.max_fetch_duration)
         })
     }
 }
 
-#[async_trait]
-impl Fetcher for UrlFetcher {
-    async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
+/// Runs `fetch` for at most `budget`, failing with `DeadlineExceeded` when it
+/// runs out. The future is dropped on expiry, which closes the connection and
+/// deletes the temp file (it is a `TempPath`, removed on drop).
+async fn within_budget(
+    budget: Duration,
+    what: &str,
+    fetch: impl Future<Output = Result<FetchOutcome, Error>>,
+) -> Result<FetchOutcome, Error> {
+    tokio::time::timeout(budget, fetch).await.map_err(|_| {
+        make_err!(
+            Code::DeadlineExceeded,
+            "Fetching the {what} did not finish within {budget:?}, the smaller of the request's \
+             timeout and the fetcher's max_fetch_duration_s"
+        )
+    })?
+}
+
+impl UrlFetcher {
+    async fn fetch_blob_unbounded(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
         // One verifier per checksum; all of them must match.
         let mut verifiers = make_verifiers(&job.checksums);
 
@@ -339,7 +372,6 @@ impl Fetcher for UrlFetcher {
             match stream_uri_to_file(
                 req,
                 uri,
-                job.header_timeout,
                 self.max_size_bytes,
                 &mut verifiers,
                 job.hasher_func,
@@ -391,5 +423,17 @@ impl Fetcher for UrlFetcher {
         }
 
         Err(last_err.unwrap_or_else(|| make_err!(Code::NotFound, "No URIs available to fetch")))
+    }
+}
+
+#[async_trait]
+impl Fetcher for UrlFetcher {
+    async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
+        within_budget(
+            self.budget(job.timeout),
+            "blob",
+            self.fetch_blob_unbounded(job),
+        )
+        .await
     }
 }

@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use nativelink_config::cas_server::{FetchConfig, WithInstanceName};
 use nativelink_config::fetchers::{BackgroundSpec, FetcherSpec, MetadataCacheSpec, UrlFetcherSpec};
@@ -34,7 +37,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
     ActionResult, Digest, digest_function,
 };
 use nativelink_proto::google::rpc::{BadRequest, ErrorInfo, Status as GoogleStatus};
-use nativelink_service::fetch_server::FetchServer;
+use nativelink_service::fetch_server::{FetchServer, parse_grpc_timeout};
 use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::background_spawn;
@@ -193,6 +196,56 @@ async fn serve_stalls() -> String {
     format!("http://{addr}/blob")
 }
 
+/// Spawns an HTTP/1.1 server that answers every request promptly with the
+/// headers of a `body.len()`-byte response and then sends the body `chunk`
+/// bytes at a time, `interval` apart, so the response headers arrive at once
+/// but the body takes `body.len() / chunk * interval` to finish. It stops
+/// writing when the client goes away. Returns the URL and the number of
+/// requests the server has received.
+async fn serve_trickling(
+    body: Vec<u8>,
+    chunk: usize,
+    interval: Duration,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    background_spawn!("fetch_test_trickling_http_server", async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let body = body.clone();
+            let counted = counted.clone();
+            background_spawn!("fetch_test_trickling_http_connection", async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if socket.write_all(header.as_bytes()).await.is_err() {
+                    return;
+                }
+                for piece in body.chunks(chunk) {
+                    tokio::time::sleep(interval).await;
+                    if socket.write_all(piece).await.is_err() || socket.flush().await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}/blob"), requests)
+}
+
 #[nativelink_test]
 async fn test_fetch_blob() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
@@ -297,6 +350,7 @@ fn make_fetch_server_with_cas_and_limit(
             cas_store: String::from("test_cas_store"),
             temp_path: None,
             max_size_bytes,
+            ..Default::default()
         },
     )
 }
@@ -306,6 +360,17 @@ fn make_fetch_server_with_cas_and_limit(
 fn make_fetch_server_with_url_spec(
     store_manager: &StoreManager,
     url_spec: UrlFetcherSpec,
+) -> FetchServer {
+    make_fetch_server_with_clamps(store_manager, url_spec, None, None)
+}
+
+/// Like [`make_fetch_server_with_url_spec`], with the background fetcher's
+/// `min_timeout_s` and `max_timeout_s` set.
+fn make_fetch_server_with_clamps(
+    store_manager: &StoreManager,
+    url_spec: UrlFetcherSpec,
+    min_timeout_s: Option<u64>,
+    max_timeout_s: Option<u64>,
 ) -> FetchServer {
     let mut fetchers: HashMap<String, Arc<dyn Fetcher>> = HashMap::new();
     let url = fetcher_factory(&FetcherSpec::Url(url_spec), store_manager, &fetchers)
@@ -327,8 +392,8 @@ fn make_fetch_server_with_url_spec(
         &FetcherSpec::Background(BackgroundSpec {
             fetcher: String::from("CACHED"),
             max_concurrent_fetches: None,
-            min_timeout_s: None,
-            max_timeout_s: None,
+            min_timeout_s,
+            max_timeout_s,
         }),
         store_manager,
         &fetchers,
@@ -1565,4 +1630,224 @@ async fn test_fetch_blob_supported_qualifiers_are_accepted() -> Result<(), Statu
     assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
     assert_eq!(requests.lock().len(), 1);
     Ok(())
+}
+
+/// The status code a response carries.
+fn status_code_of(status: Option<&GoogleStatus>) -> Option<i32> {
+    Some(status?.code)
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_timeout_bounds_a_trickling_body() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    // The headers arrive at once and the body would take 100 seconds, one byte
+    // at a time, so every read is well inside the 30 second idle timeout. Only a
+    // timeout on the whole fetch can stop it.
+    let (uri, _requests) = serve_trickling(vec![b'x'; 1000], 1, Duration::from_millis(100)).await;
+
+    let started = Instant::now();
+    let mut request = blob_request(vec![uri], vec![]);
+    request.get_mut().timeout = Some(prost_types::Duration {
+        seconds: 0,
+        nanos: 500_000_000,
+    });
+    let response = fs.fetch_blob(request).await?.into_inner();
+
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(i32::from(Code::DeadlineExceeded)),
+        "{response:?}"
+    );
+    assert!(response.blob_digest.is_none());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the fetch outlived its timeout: {:?}",
+        started.elapsed()
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_max_fetch_duration_caps_the_request_timeout() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_url_spec(
+        &store_manager,
+        UrlFetcherSpec {
+            cas_store: String::from("test_cas_store"),
+            max_fetch_duration_s: Some(1),
+            ..Default::default()
+        },
+    );
+    let (uri, _requests) = serve_trickling(vec![b'x'; 1000], 1, Duration::from_millis(100)).await;
+
+    // A request with no timeout, and one asking for far longer than the cap,
+    // are both cut off after the one second the fetcher allows.
+    for timeout in [
+        None,
+        Some(prost_types::Duration {
+            seconds: 3600,
+            nanos: 0,
+        }),
+    ] {
+        let started = Instant::now();
+        let mut request = blob_request(vec![uri.clone()], vec![]);
+        request.get_mut().timeout = timeout;
+        let response = fs.fetch_blob(request).await?.into_inner();
+
+        assert_eq!(
+            status_code_of(response.status.as_ref()),
+            Some(i32::from(Code::DeadlineExceeded)),
+            "{response:?}"
+        );
+        assert!(
+            response
+                .status
+                .as_ref()
+                .is_some_and(|status| status.message.contains("max_fetch_duration_s")),
+            "{response:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the fetch outlived the cap: {:?}",
+            started.elapsed()
+        );
+    }
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_background_clamps_apply_to_the_total_timeout() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    // The background fetcher caps a request's timeout at one second, well under
+    // the hour the request asks for and the hour the URL fetcher allows.
+    let fs = make_fetch_server_with_clamps(
+        &store_manager,
+        UrlFetcherSpec {
+            cas_store: String::from("test_cas_store"),
+            ..Default::default()
+        },
+        None,
+        Some(1),
+    );
+    let (uri, _requests) = serve_trickling(vec![b'x'; 1000], 1, Duration::from_millis(100)).await;
+
+    let started = Instant::now();
+    let mut request = blob_request(vec![uri], vec![]);
+    request.get_mut().timeout = Some(prost_types::Duration {
+        seconds: 3600,
+        nanos: 0,
+    });
+    let response = fs.fetch_blob(request).await?.into_inner();
+
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(i32::from(Code::DeadlineExceeded)),
+        "{response:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the fetch outlived the clamped timeout: {:?}",
+        started.elapsed()
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_rpc_deadline_returns_deadline_exceeded_and_a_retry_joins_the_fetch()
+-> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    // The body takes about 1.1 seconds to arrive, eleven bytes 100ms apart.
+    let (uri, requests) =
+        serve_trickling(HELLO_WORLD.to_vec(), 1, Duration::from_millis(100)).await;
+
+    // The client's RPC deadline is 300ms, far short of the fetch.
+    let mut request = blob_request(vec![uri.clone()], vec![]);
+    request.set_timeout(Duration::from_millis(300));
+    let started = Instant::now();
+    let err = fs
+        .fetch_blob(request)
+        .await
+        .expect_err("the fetch cannot finish within the RPC deadline");
+    assert_eq!(err.code(), Code::DeadlineExceeded, "{err:?}");
+    assert!(
+        err.message().contains("retry"),
+        "the message should say a retry joins the fetch: {err:?}"
+    );
+    // The server answered before the 300ms deadline, which is what stops tonic
+    // from answering CANCELLED first.
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "answered after the RPC deadline: {:?}",
+        started.elapsed()
+    );
+
+    // The fetch carried on in the background, so an identical request with no
+    // deadline joins it and gets the finished result without a second request
+    // to the origin.
+    let response = fs
+        .fetch_blob(blob_request(vec![uri], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(0),
+        "{response:?}"
+    );
+    assert_eq!(
+        response.blob_digest.expect("expected a blob digest").hash,
+        HELLO_WORLD_SHA256_HEX
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_no_rpc_deadline_waits_for_the_fetch() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, _requests) =
+        serve_trickling(HELLO_WORLD.to_vec(), 1, Duration::from_millis(50)).await;
+
+    let response = fs
+        .fetch_blob(blob_request(vec![uri], vec![]))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(0),
+        "{response:?}"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_parse_grpc_timeout() {
+    assert_eq!(parse_grpc_timeout("1H"), Some(Duration::from_hours(1)));
+    assert_eq!(parse_grpc_timeout("2M"), Some(Duration::from_mins(2)));
+    assert_eq!(parse_grpc_timeout("30S"), Some(Duration::from_secs(30)));
+    assert_eq!(parse_grpc_timeout("250m"), Some(Duration::from_millis(250)));
+    assert_eq!(parse_grpc_timeout("15u"), Some(Duration::from_micros(15)));
+    assert_eq!(parse_grpc_timeout("7n"), Some(Duration::from_nanos(7)));
+    assert_eq!(
+        parse_grpc_timeout("99999999S"),
+        Some(Duration::from_secs(99_999_999))
+    );
+    // More than eight digits, no digits, no unit, an unknown unit, a sign and
+    // non-ASCII input are all malformed.
+    for bad in [
+        "123456789S",
+        "S",
+        "",
+        "10",
+        "10s",
+        "10x",
+        "-5S",
+        "+5S",
+        "1.5S",
+        "5\u{e9}",
+    ] {
+        assert_eq!(parse_grpc_timeout(bad), None, "{bad:?}");
+    }
 }
