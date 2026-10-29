@@ -45,12 +45,18 @@ use crate::remote_asset_proto::{QUALIFIER_HTTP_HEADER_PREFIX, QUALIFIER_HTTP_HEA
 /// HTTP headers a request asks the fetcher to send to the origin, parsed from
 /// its `http_header:<name>` and `http_header_url:<idx>:<name>` qualifiers (the
 /// convention Bazel's remote downloader uses). They are request parameters, not
-/// part of the asset's identity: they are excluded from the metadata key and
-/// the deduplication identity, never persisted, and marked sensitive so they
-/// are redacted from `Debug` output (they are often credentials).
+/// part of the asset's identity: they are excluded from the metadata key, never
+/// persisted, and marked sensitive so they are redacted from `Debug` output
+/// (they are often credentials).
+///
+/// They are part of the in-memory deduplication identity, though: different
+/// credentials can get different answers from the origin, so requests with
+/// different headers don't share a fetch. `Eq` compares the headers themselves,
+/// ignoring order and name case; `Hash` covers only the header names, so no
+/// credential is ever fed to a hasher.
 ///
 /// Header qualifiers must never be persisted, logged or made part of any
-/// cache/dedup identity, because they typically carry auth credentials. A
+/// persisted cache key, because they typically carry auth credentials. A
 /// fetcher that sends work elsewhere (another process or node) must carry them
 /// over a non-persisted channel or refuse such requests.
 #[derive(Clone, Debug, Default)]
@@ -133,7 +139,36 @@ impl FetchHeaders {
     }
 }
 
-/// The deadline of a fetch shared by identical requests, set on the job by
+impl PartialEq for FetchHeaders {
+    fn eq(&self, other: &Self) -> bool {
+        // `HeaderMap` equality ignores the order of names, and names are
+        // lowercased on parsing.
+        self.global == other.global && self.per_uri == other.per_uri
+    }
+}
+
+impl Eq for FetchHeaders {}
+
+impl Hash for FetchHeaders {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        fn hash_names<H: Hasher>(headers: &HeaderMap, state: &mut H) {
+            let mut names: Vec<&str> = headers.keys().map(HeaderName::as_str).collect();
+            names.sort_unstable();
+            for name in names {
+                name.hash(state);
+            }
+        }
+        hash_names(&self.global, state);
+        let mut per_uri: Vec<_> = self.per_uri.iter().collect();
+        per_uri.sort_unstable_by_key(|&(&idx, _)| idx);
+        for (idx, headers) in per_uri {
+            idx.hash(state);
+            hash_names(headers, state);
+        }
+    }
+}
+
+/// The deadline of a fetch shared by identical pinned requests, set on the job by
 /// [`crate::background_fetcher::BackgroundFetcher`].
 ///
 /// A request's `timeout` bounds the retrieval from origin, so a fetch that
@@ -227,11 +262,12 @@ impl SharedDeadline {
 ///
 /// `Hash`/`Eq` (implemented manually) define the in-flight deduplication
 /// identity used by [`crate::background_fetcher::BackgroundFetcher`]: the URIs,
-/// the qualifiers (order-insensitive), the checksum and the hash function.
-/// Per-request parameters such as `timeout` are deliberately excluded, so a
-/// concurrent duplicate joins the in-flight fetch. It runs with the first
-/// requester's `headers`, and until the latest of the requesters' deadlines
-/// (see [`SharedDeadline`]).
+/// the qualifiers (order-insensitive), the checksum, the hash function and the
+/// `headers` (see [`FetchHeaders`]). Other per-request parameters such as
+/// `timeout` are deliberately excluded, so a concurrent duplicate joins the
+/// in-flight fetch, which runs until the latest of the requesters' deadlines
+/// (see [`SharedDeadline`]). Only pinned jobs (see [`Self::is_pinned`]) are
+/// shared this way; an unpinned job always runs its own fetch.
 #[derive(Clone, Debug)]
 pub struct FetchBlobTask {
     /// Candidate URIs, tried in order until one serves valid content.
@@ -259,8 +295,8 @@ pub struct FetchBlobTask {
     /// identical requests share; it then bounds the job in place of `timeout`.
     /// Not part of the deduplication identity.
     pub shared_deadline: Option<SharedDeadline>,
-    /// HTTP headers to send to the origin. Not part of the deduplication
-    /// identity.
+    /// HTTP headers to send to the origin. Part of the deduplication identity,
+    /// since different credentials can get different answers.
     pub headers: FetchHeaders,
 }
 
@@ -278,6 +314,7 @@ impl PartialEq for FetchBlobTask {
             && sorted_qualifiers(&self.qualifiers) == sorted_qualifiers(&other.qualifiers)
             && self.checksums == other.checksums
             && self.hasher_func == other.hasher_func
+            && self.headers == other.headers
     }
 }
 
@@ -289,6 +326,7 @@ impl Hash for FetchBlobTask {
         sorted_qualifiers(&self.qualifiers).hash(state);
         self.checksums.hash(state);
         self.hasher_func.hash(state);
+        self.headers.hash(state);
     }
 }
 
