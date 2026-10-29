@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::serde_utils::{
     convert_optional_numeric_with_shellexpand, convert_optional_string_with_shellexpand,
-    convert_string_with_shellexpand,
+    convert_string_with_shellexpand, convert_vec_string_with_shellexpand,
 };
 use crate::stores::StoreRefName;
 
@@ -99,6 +99,46 @@ pub struct UrlFetcherSpec {
         deserialize_with = "convert_optional_numeric_with_shellexpand"
     )]
     pub max_fetch_duration_s: Option<u64>,
+
+    /// URL of an HTTP forward proxy to fetch through, for both `http://` and
+    /// `https://` origins (HTTPS origins are reached with a `CONNECT` tunnel),
+    /// such as `"http://proxy.internal:3128"`. May carry credentials
+    /// (`"http://user:password@proxy.internal:3128"`), but a secret is better
+    /// kept out of the config file: read it from the environment with
+    /// `"${FETCH_PROXY_URL}"`, or use `http_proxy_secret_file`. The scheme must
+    /// be `http` or `https` and the URL must name a host. A bad URL stops the
+    /// server at startup, with an error that does not repeat the URL.
+    ///
+    /// Every request goes through the proxy except those to hosts matching
+    /// `no_proxy`; there is no fallback to a direct connection if the proxy
+    /// fails.
+    ///
+    /// Proxying comes only from this configuration. The fetcher ignores the
+    /// `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` environment
+    /// variables of the server process, which an earlier release honoured
+    /// implicitly: a deployment that relied on them must now set `http_proxy`
+    /// and `no_proxy` here. Setting both this and `http_proxy_secret_file` is
+    /// an error. When neither is set, all fetches connect directly.
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub http_proxy: Option<String>,
+
+    /// Path to a file containing the proxy URL described under `http_proxy`,
+    /// for a URL with credentials that should not be in the config file, such as
+    /// a mounted Kubernetes secret. Leading and trailing whitespace, including
+    /// the final newline, is removed. The file is read once at startup. Setting
+    /// both this and `http_proxy` is an error.
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub http_proxy_secret_file: Option<String>,
+
+    /// Hosts that bypass the proxy and are fetched from directly. Each entry
+    /// is a domain name, which matches that domain and all its subdomains
+    /// (`"internal.example.com"` and `".internal.example.com"` are equivalent),
+    /// an IP address, or an IP range in CIDR notation (`"10.0.0.0/8"`); `"*"`
+    /// matches every host. This is the matching of the `NO_PROXY` environment
+    /// variable as implemented by `reqwest`. Only has an effect when a proxy is
+    /// configured. Defaults to empty, bypassing no host.
+    #[serde(default, deserialize_with = "convert_vec_string_with_shellexpand")]
+    pub no_proxy: Vec<String>,
 }
 
 /// A decorator that caches fetched-asset metadata.

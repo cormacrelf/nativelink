@@ -25,7 +25,7 @@ use core::time::Duration;
 use std::ffi::OsString;
 
 use futures::StreamExt;
-use nativelink_error::{Error, ResultExt, make_err};
+use nativelink_error::{Error, ResultExt, make_err, make_input_err};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::fs;
@@ -231,8 +231,91 @@ async fn stream_uri_to_file(
     FetchAttempt::Verified(digest)
 }
 
+/// An explicit HTTP forward proxy for a [`UrlFetcher`] to send its requests
+/// through, validated at construction.
+///
+/// The proxy URL may carry credentials, so it is kept out of every `Debug`
+/// output and error message.
+#[derive(Clone)]
+pub struct ProxySettings {
+    /// The proxy URL, parseable, `http` or `https`, with a host. A secret.
+    url: String,
+    /// Hosts that bypass the proxy, in `reqwest`'s `NO_PROXY` syntax.
+    no_proxy: Vec<String>,
+}
+
+impl core::fmt::Debug for ProxySettings {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ProxySettings")
+            .field("url", &"<redacted>")
+            .field("no_proxy", &self.no_proxy)
+            .finish()
+    }
+}
+
+impl ProxySettings {
+    /// Resolves the proxy configuration of a `url` fetcher: the URL is
+    /// `http_proxy`, or the whitespace-trimmed contents of
+    /// `http_proxy_secret_file` (read now, once). Returns `None` when neither
+    /// is set. Setting both, an unreadable or empty file and a URL that is not
+    /// a plain `http`/`https` URL with a host are errors, none of which repeat
+    /// the URL since it may contain a password.
+    pub fn from_config(
+        http_proxy: Option<&str>,
+        http_proxy_secret_file: Option<&str>,
+        no_proxy: &[String],
+    ) -> Result<Option<Self>, Error> {
+        let (url, source) = match (http_proxy, http_proxy_secret_file) {
+            (Some(_), Some(_)) => {
+                return Err(make_input_err!(
+                    "'http_proxy' and 'http_proxy_secret_file' cannot both be set"
+                ));
+            }
+            (None, None) => return Ok(None),
+            (Some(url), None) => (url.trim().to_owned(), "'http_proxy'"),
+            (None, Some(path)) => {
+                let contents = std::fs::read_to_string(path).map_err(|e| {
+                    make_input_err!("Could not read 'http_proxy_secret_file' '{path}': {e}")
+                })?;
+                (
+                    contents.trim().to_owned(),
+                    "the contents of 'http_proxy_secret_file'",
+                )
+            }
+        };
+        let parsed = reqwest::Url::parse(&url)
+            .map_err(|_| make_input_err!("{source} is not a valid URL"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(make_input_err!(
+                "{source} must be an http:// or https:// URL"
+            ));
+        }
+        if parsed.host_str().is_none_or(str::is_empty) {
+            return Err(make_input_err!("{source} must name a proxy host"));
+        }
+        Ok(Some(Self {
+            url,
+            no_proxy: no_proxy.to_vec(),
+        }))
+    }
+
+    /// The reqwest proxy that sends all traffic through the proxy, except to
+    /// the `no_proxy` hosts.
+    fn to_reqwest(&self) -> Result<reqwest::Proxy, Error> {
+        let proxy = reqwest::Proxy::all(self.url.as_str())
+            .map_err(|_| make_input_err!("The fetch proxy URL is not usable as a proxy"))?;
+        Ok(if self.no_proxy.is_empty() {
+            proxy
+        } else {
+            proxy.no_proxy(reqwest::NoProxy::from_string(&self.no_proxy.join(",")))
+        })
+    }
+}
+
 /// The leaf [`Fetcher`]: performs HTTP(S) downloads into `cas_store`.
-#[derive(Debug)]
+///
+/// `Debug` is implemented by hand, leaving out the HTTP client, because the
+/// client's `Debug` output lists its proxies, URL credentials included.
 pub struct UrlFetcher {
     cas_store: Store,
     /// Directory for the temp file downloaded content is buffered to before
@@ -242,6 +325,8 @@ pub struct UrlFetcher {
     /// time a whole fetch may take is bounded separately, by `max_fetch_duration`
     /// and each job's `timeout`.
     client: reqwest::Client,
+    /// Whether `client` sends requests through a proxy (the URL is not kept).
+    proxy_configured: bool,
     /// Cap on the total duration of any fetch, whatever the job asks for.
     max_fetch_duration: Duration,
     /// Largest download accepted from any single URI. `None` is unbounded.
@@ -256,6 +341,9 @@ pub struct UrlFetcherOptions {
     pub temp_path: Option<String>,
     /// Largest download accepted from any single URI. `None` is unbounded.
     pub max_size_bytes: Option<u64>,
+    /// The forward proxy to fetch through. `None` connects directly. The
+    /// `HTTP_PROXY`-style environment variables are never consulted.
+    pub proxy: Option<ProxySettings>,
     /// Cap on the total duration of a fetch. A job's `timeout` can only
     /// shorten it. Must not be zero.
     pub max_fetch_duration: Duration,
@@ -270,6 +358,7 @@ impl Default for UrlFetcherOptions {
         Self {
             temp_path: None,
             max_size_bytes: None,
+            proxy: None,
             max_fetch_duration: DEFAULT_MAX_FETCH_DURATION,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             read_timeout: DEFAULT_READ_TIMEOUT,
@@ -283,6 +372,7 @@ impl UrlFetcher {
         let UrlFetcherOptions {
             temp_path,
             max_size_bytes,
+            proxy,
             max_fetch_duration,
             connect_timeout,
             read_timeout,
@@ -303,15 +393,28 @@ impl UrlFetcher {
         // reqwest is built without a TLS provider, so install the ring one as
         // the process default (a no-op if one is already installed).
         drop(rustls::crypto::ring::default_provider().install_default());
-        let client = reqwest::Client::builder()
+        // `no_proxy()` first: it turns off reqwest's reading of the proxy
+        // environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+        // `NO_PROXY`), so the only proxy is the configured one, if any.
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(connect_timeout)
-            .read_timeout(read_timeout)
-            .build()
-            .err_tip(|| "Failed to build HTTP client in UrlFetcher")?;
+            .read_timeout(read_timeout);
+        if let Some(proxy) = &proxy {
+            builder = builder.proxy(proxy.to_reqwest()?);
+        }
+        let client = builder.build().map_err(|e| {
+            make_err!(
+                Code::Internal,
+                "Failed to build HTTP client in UrlFetcher: {}",
+                redact_uris_in_text(&e.to_string())
+            )
+        })?;
         Ok(Self {
             cas_store,
             temp_path,
             client,
+            proxy_configured: proxy.is_some(),
             max_fetch_duration,
             max_size_bytes,
         })
@@ -341,6 +444,19 @@ async fn within_budget(
              timeout and the fetcher's max_fetch_duration_s"
         )
     })?
+}
+
+impl core::fmt::Debug for UrlFetcher {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The client is left out: its Debug output prints the proxy URL.
+        f.debug_struct("UrlFetcher")
+            .field("cas_store", &self.cas_store)
+            .field("temp_path", &self.temp_path)
+            .field("proxy_configured", &self.proxy_configured)
+            .field("max_fetch_duration", &self.max_fetch_duration)
+            .field("max_size_bytes", &self.max_size_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl UrlFetcher {

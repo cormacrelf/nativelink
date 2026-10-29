@@ -1851,3 +1851,231 @@ async fn test_parse_grpc_timeout() {
         assert_eq!(parse_grpc_timeout(bad), None, "{bad:?}");
     }
 }
+
+/// A URL fetcher spec that fetches through `http_proxy` (or the URL in
+/// `http_proxy_secret_file`), bypassing it for the `no_proxy` hosts.
+fn proxy_spec(
+    http_proxy: Option<&str>,
+    http_proxy_secret_file: Option<&str>,
+    no_proxy: &[&str],
+) -> UrlFetcherSpec {
+    UrlFetcherSpec {
+        cas_store: String::from("test_cas_store"),
+        http_proxy: http_proxy.map(str::to_owned),
+        http_proxy_secret_file: http_proxy_secret_file.map(str::to_owned),
+        no_proxy: no_proxy.iter().map(|host| (*host).to_owned()).collect(),
+        ..Default::default()
+    }
+}
+
+/// Spawns a forward proxy (a server answering every request, recording it) and
+/// returns its base URL, `http://127.0.0.1:<port>`, and the requests it saw.
+/// A proxy is sent the absolute-form request target, `GET http://host/path`.
+async fn serve_proxy(body: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let (uri, requests) = serve_recording(body).await;
+    (uri.trim_end_matches("/blob").to_owned(), requests)
+}
+
+/// Builds the URL fetcher `spec` describes, the way the server does.
+async fn build_url_fetcher(spec: UrlFetcherSpec) -> Result<Arc<dyn Fetcher>, Error> {
+    let store_manager = make_store_manager().await?;
+    fetcher_factory(&FetcherSpec::Url(spec), &store_manager, &HashMap::new())
+}
+
+#[nativelink_test]
+async fn test_fetch_blob_through_http_proxy() -> Result<(), Status> {
+    use base64::Engine;
+    use base64::prelude::BASE64_STANDARD;
+
+    let store_manager = make_store_manager().await?;
+    let (proxy, proxy_requests) = serve_proxy(HELLO_WORLD.to_vec()).await;
+    let proxy_with_credentials = proxy.replacen("http://", "http://user:s3cret@", 1);
+    let fs = make_fetch_server_with_url_spec(
+        &store_manager,
+        proxy_spec(Some(&proxy_with_credentials), None, &[]),
+    );
+
+    // The origin's name does not resolve, so the fetch can only succeed
+    // through the proxy.
+    let response = fs
+        .fetch_blob(blob_request(
+            vec!["http://origin.invalid/blob".to_owned()],
+            vec![],
+        ))
+        .await?
+        .into_inner();
+
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(0),
+        "{response:?}"
+    );
+    assert_eq!(
+        response.blob_digest.expect("expected a blob digest").hash,
+        HELLO_WORLD_SHA256_HEX
+    );
+    let seen = proxy_requests.lock().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0].starts_with("get http://origin.invalid/blob http/1.1"),
+        "{seen:?}"
+    );
+    // The credentials in the proxy URL are sent to the proxy as basic auth.
+    let credentials = BASE64_STANDARD.encode("user:s3cret").to_lowercase();
+    assert!(
+        seen[0].contains(&format!("proxy-authorization: basic {credentials}")),
+        "{seen:?}"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_no_proxy_hosts_bypass_the_proxy() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let (proxy, proxy_requests) = serve_proxy(b"from the proxy".to_vec()).await;
+    let (origin, origin_requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+    let fs = make_fetch_server_with_url_spec(
+        &store_manager,
+        proxy_spec(Some(&proxy), None, &["127.0.0.1"]),
+    );
+
+    // The origin is on 127.0.0.1, which `no_proxy` names, so it is fetched
+    // from directly.
+    let response = fs
+        .fetch_blob(blob_request(vec![origin], vec![]))
+        .await?
+        .into_inner();
+
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(0),
+        "{response:?}"
+    );
+    assert_eq!(
+        response.blob_digest.expect("expected a blob digest").hash,
+        HELLO_WORLD_SHA256_HEX
+    );
+    assert_eq!(origin_requests.lock().len(), 1);
+    assert!(
+        origin_requests.lock()[0].starts_with("get /blob http/1.1"),
+        "{:?}",
+        origin_requests.lock()
+    );
+    assert!(proxy_requests.lock().is_empty());
+
+    // A host `no_proxy` does not name still goes through the proxy.
+    let response = fs
+        .fetch_blob(blob_request(
+            vec!["http://origin.invalid/other".to_owned()],
+            vec![],
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(0),
+        "{response:?}"
+    );
+    assert_eq!(proxy_requests.lock().len(), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_proxy_secret_file_is_trimmed() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let (proxy, proxy_requests) = serve_proxy(HELLO_WORLD.to_vec()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let secret_file = dir.path().join("proxy_url");
+    std::fs::write(&secret_file, format!("  {proxy}\n")).unwrap();
+    let fs = make_fetch_server_with_url_spec(
+        &store_manager,
+        proxy_spec(None, Some(secret_file.to_str().unwrap()), &[]),
+    );
+
+    let response = fs
+        .fetch_blob(blob_request(
+            vec!["http://origin.invalid/blob".to_owned()],
+            vec![],
+        ))
+        .await?
+        .into_inner();
+
+    assert_eq!(
+        status_code_of(response.status.as_ref()),
+        Some(0),
+        "{response:?}"
+    );
+    assert_eq!(proxy_requests.lock().len(), 1);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_invalid_proxy_config_is_an_error_without_credentials() -> Result<(), Error> {
+    let dir = tempfile::tempdir().unwrap();
+    let write_secret = |name: &str, contents: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+    let valid_file = write_secret("valid", "http://user:s3cret@proxy.invalid:3128\n");
+    let bad_scheme_file = write_secret("bad_scheme", "socks5://user:s3cret@proxy.invalid:1080\n");
+    let empty_file = write_secret("empty", " \n");
+    let missing_file = dir.path().join("missing").to_str().unwrap().to_owned();
+
+    let cases = [
+        // Both sources set.
+        proxy_spec(
+            Some("http://user:s3cret@proxy.invalid:3128"),
+            Some(&valid_file),
+            &[],
+        ),
+        // Not http or https.
+        proxy_spec(Some("socks5://user:s3cret@proxy.invalid:1080"), None, &[]),
+        proxy_spec(Some("ftp://user:s3cret@proxy.invalid"), None, &[]),
+        // Not a URL, and a URL without a host.
+        proxy_spec(Some("user:s3cret not a url"), None, &[]),
+        proxy_spec(Some("http://user:s3cret@"), None, &[]),
+        proxy_spec(Some("http://user:s3cret@:3128"), None, &[]),
+        // The same faults, in the secret file.
+        proxy_spec(None, Some(&bad_scheme_file), &[]),
+        proxy_spec(None, Some(&empty_file), &[]),
+        proxy_spec(None, Some(&missing_file), &[]),
+    ];
+    for (idx, spec) in cases.into_iter().enumerate() {
+        let err = build_url_fetcher(spec)
+            .await
+            .expect_err(&format!("case {idx} should not build"));
+        assert_eq!(err.code, Code::InvalidArgument, "case {idx}: {err:?}");
+        let shown = format!("{err:?} {err}");
+        assert!(
+            !shown.contains("s3cret"),
+            "credentials in the error: {shown}"
+        );
+    }
+
+    // And the valid one builds.
+    build_url_fetcher(proxy_spec(None, Some(&valid_file), &["localhost"])).await?;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn test_proxy_credentials_are_not_in_debug_output() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let spec = proxy_spec(
+        Some("http://user:s3cret@proxy.invalid:3128"),
+        None,
+        &["internal.example.com"],
+    );
+
+    let fetcher = build_url_fetcher(spec.clone()).await?;
+    let shown = format!("{fetcher:?}");
+    assert!(!shown.contains("s3cret"), "{shown}");
+    assert!(!shown.contains("proxy.invalid"), "{shown}");
+    assert!(shown.contains("proxy_configured: true"), "{shown}");
+
+    // Nor in the Debug output of the whole server that holds the fetcher chain.
+    let fs = make_fetch_server_with_url_spec(&store_manager, spec);
+    let shown = format!("{fs:?}");
+    assert!(!shown.contains("s3cret"), "{shown}");
+    Ok(())
+}
