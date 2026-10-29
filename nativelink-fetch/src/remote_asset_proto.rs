@@ -31,7 +31,10 @@
 //! * **Value**: an `ActionResult` with the content as the `OutputFile` `out`.
 //!   `execution_metadata` carries the times (`worker_start_timestamp` is when
 //!   the content was retrieved or pushed) and a [`RemoteAssetMetadata`] in
-//!   `auxiliary_metadata`.
+//!   `auxiliary_metadata`. A Push's `references_blobs` are further output
+//!   files, at paths under `references/`, which `out` is not. They are never
+//!   served: they are there so that `completeness_checking` misses an entry
+//!   whose references left the CAS.
 
 use std::time::SystemTime;
 
@@ -68,8 +71,10 @@ pub const REMOTE_ASSET_WORKER: &str = "nativelink-remote-asset";
 /// Type URL of the [`RemoteAssetMetadata`] in `auxiliary_metadata`.
 pub const REMOTE_ASSET_METADATA_TYPE_URL: &str =
     "type.googleapis.com/nativelink.RemoteAssetMetadata";
-/// Path of the single output of every entry.
+/// Path of the output that is the asset itself.
 const OUTPUT_PATH: &str = "out";
+/// Path prefix of a referenced blob's output file: `references/blobs/<idx>`.
+const REFERENCED_BLOB_PATH_PREFIX: &str = "references/blobs/";
 
 /// Whether `name` is an HTTP header qualifier. These are request parameters
 /// (often credentials), not part of an asset's identity: they must neither
@@ -213,6 +218,9 @@ pub struct RemoteAssetEntry {
     /// how the key is hashed. What is stored, and read back here, is the
     /// function it resolves to.
     pub digest_function: i32,
+    /// A Push's `references_blobs`: blobs that must outlive the entry. Stored
+    /// as given, so they should be in their parsed (lowercase) form.
+    pub references_blobs: Vec<Digest>,
 }
 
 /// Writes `entry` to the Action Cache `ac_store` as described in the module
@@ -224,7 +232,7 @@ pub async fn write_remote_asset_entry(
     let hasher_func = DigestHasherFunc::try_from(entry.digest_function)
         .err_tip(|| "Digest function of Remote Asset entry")?;
     let key = entry.query.key(hasher_func)?;
-    let output_files = match entry.query.kind {
+    let mut output_files = match entry.query.kind {
         AssetKind::Blob => vec![OutputFile {
             path: OUTPUT_PATH.to_owned(),
             digest: Some(entry.digest.clone()),
@@ -232,6 +240,20 @@ pub async fn write_remote_asset_entry(
             ..Default::default()
         }],
     };
+    // References are written as outputs so that `completeness_checking` turns
+    // an entry whose references left the CAS into a miss: no reader checks them.
+    output_files.extend(
+        entry
+            .references_blobs
+            .iter()
+            .enumerate()
+            .map(|(idx, digest)| OutputFile {
+                path: format!("{REFERENCED_BLOB_PATH_PREFIX}{idx}"),
+                digest: Some(digest.clone()),
+                is_executable: false,
+                ..Default::default()
+            }),
+    );
     let metadata = RemoteAssetMetadata {
         uri: entry.query.uri.clone(),
         qualifiers: entry.query.qualifiers.clone(),
@@ -290,9 +312,22 @@ fn entry_from_action_result(
         .iter()
         .find(|any| any.type_url == REMOTE_ASSET_METADATA_TYPE_URL)?;
     let metadata = RemoteAssetMetadata::decode(any.value.as_slice()).ok()?;
+    // The asset is the one output at `out`; anything else is a reference, and
+    // an output that is neither means this is not one of our entries.
+    let mut files = Vec::new();
+    let mut references_blobs = Vec::new();
+    for file in action_result.output_files {
+        if file.path == OUTPUT_PATH {
+            files.push(file);
+        } else if file.path.starts_with(REFERENCED_BLOB_PATH_PREFIX) {
+            references_blobs.push(file.digest?);
+        } else {
+            return None;
+        }
+    }
     let digest = match kind {
         AssetKind::Blob => {
-            let [file] = action_result.output_files.as_slice() else {
+            let [file] = files.as_slice() else {
                 return None;
             };
             file.digest.clone()?
@@ -308,5 +343,6 @@ fn entry_from_action_result(
         expire_at: metadata.expire_at,
         stored_at: execution_metadata.worker_start_timestamp,
         digest_function: metadata.digest_function,
+        references_blobs,
     })
 }

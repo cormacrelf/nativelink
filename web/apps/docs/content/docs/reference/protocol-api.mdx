@@ -226,6 +226,17 @@ entry holds with `oldest_content_accepted`.
 
 <SourceLink file="nativelink-fetch/src/metadata_cache.rs" symbol="MetadataCache" />
 
+## Remote Asset `Push` references [#remote-asset-push-references]
+
+`PushBlob` keeps the `references_blobs` it is given with the entry it writes.
+They are never returned, but a `completeness_checking` fetch store checks them
+like the asset itself: every referenced blob has to be in the CAS. Once any of
+them is evicted, a `Fetch` for the asset misses instead of returning content
+whose references are gone, such as a BuildStream artifact whose logs have left
+the CAS. A malformed referenced digest fails the push with `INVALID_ARGUMENT`.
+
+<SourceLink file="nativelink-fetch/src/remote_asset_proto.rs" symbol="write_remote_asset_entry" />
+
 ## Related [#related]
 
 - [Architecture deep dive](/explanations/architecture-deep-dive): where each

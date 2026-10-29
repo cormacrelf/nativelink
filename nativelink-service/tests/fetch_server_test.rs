@@ -1158,6 +1158,7 @@ async fn write_entry(
             expire_at,
             stored_at,
             digest_function: 0,
+            references_blobs: vec![],
         },
     )
     .await

@@ -95,6 +95,7 @@ impl MetadataCache {
             expire_at: None,
             stored_at: Some(Timestamp::from(started)),
             digest_function: hasher_func.proto_digest_func().into(),
+            references_blobs: vec![],
         };
         write_remote_asset_entry(&self.ac_store, &entry)
             .await

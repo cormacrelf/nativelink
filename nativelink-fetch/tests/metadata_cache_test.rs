@@ -19,7 +19,8 @@ use nativelink_error::{Code, Error, make_err};
 use nativelink_fetch::fetcher::{FetchBlobTask, FetchHeaders, FetchOutcome, Fetcher};
 use nativelink_fetch::metadata_cache::MetadataCache;
 use nativelink_fetch::remote_asset_proto::{
-    AssetKind, RemoteAssetMetadata, RemoteAssetQuery, read_remote_asset_entry, timestamp_is_before,
+    AssetKind, RemoteAssetEntry, RemoteAssetMetadata, RemoteAssetQuery, read_remote_asset_entry,
+    timestamp_is_before, write_remote_asset_entry,
 };
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
@@ -123,6 +124,12 @@ fn key_of(kind: AssetKind, uri: &str, qualifiers: Vec<Qualifier>) -> DigestInfo 
     RemoteAssetQuery::new(kind, uri.to_string(), qualifiers)
         .key(DigestHasherFunc::Sha256)
         .unwrap()
+}
+
+fn sha256_digest_of(bytes: &[u8]) -> DigestInfo {
+    let mut hasher = DigestHasherFunc::Sha256.hasher();
+    hasher.update(bytes);
+    hasher.finalize_digest()
 }
 
 #[nativelink_test]
@@ -345,4 +352,63 @@ async fn does_not_persist_or_key_on_header_qualifiers() {
             .any(|window| window == b"secret"),
         "no header value should be stored anywhere in the entry"
     );
+}
+
+/// Writes a blob entry with the given references, and reads it back.
+async fn round_trip(references_blobs: Vec<Digest>) -> (ActionResult, RemoteAssetEntry) {
+    let ac_store = memory_store().await;
+    let digest: Digest = sha256_digest_of(b"a").into();
+    let query = RemoteAssetQuery::new(
+        AssetKind::Blob,
+        "http://example/asset".to_string(),
+        proto_qualifiers(),
+    );
+    write_remote_asset_entry(
+        &ac_store,
+        &RemoteAssetEntry {
+            query: query.clone(),
+            digest: digest.clone(),
+            expire_at: None,
+            stored_at: None,
+            digest_function: digest_function::Value::Sha256.into(),
+            references_blobs: references_blobs.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let action_result =
+        stored_action_result(&ac_store, query.key(DigestHasherFunc::Sha256).unwrap()).await;
+    let entry = read_remote_asset_entry(&ac_store, &query, digest_function::Value::Sha256.into())
+        .await
+        .unwrap()
+        .expect("entry should be readable");
+    assert_eq!(entry.digest, digest);
+    assert_eq!(entry.references_blobs, references_blobs);
+    (action_result, entry)
+}
+
+/// A Push's references are stored as extra outputs under paths of their own,
+/// which `completeness_checking` checks, and read back without being taken
+/// for the asset.
+#[nativelink_test]
+async fn an_entry_with_references_round_trips() {
+    let blobs: Vec<Digest> = vec![sha256_digest_of(b"b").into(), sha256_digest_of(b"c").into()];
+    let (action_result, _) = round_trip(blobs).await;
+    let file_paths: Vec<&str> = action_result
+        .output_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(
+        file_paths,
+        vec!["out", "references/blobs/0", "references/blobs/1"]
+    );
+}
+
+/// Without references an entry is written exactly as before they were stored:
+/// a single output, which still decodes.
+#[nativelink_test]
+async fn an_entry_without_references_round_trips() {
+    let (action_result, _) = round_trip(vec![]).await;
+    assert_eq!(action_result.output_files.len(), 1);
 }
