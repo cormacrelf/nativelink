@@ -173,7 +173,8 @@ the download, checksum verification and the CAS upload. A `background` fetcher
 clamps it to `min_timeout_s` and `max_timeout_s`, and the `url` fetcher's
 `max_fetch_duration_s` (one hour by default) caps it, and bounds a request
 with no timeout too. Running out reports `DEADLINE_EXCEEDED` in the response
-`status`.
+`status`. A timeout of zero is the same as none, and a negative or
+malformed one fails the call with `INVALID_ARGUMENT`.
 
 The timeout does not bound the RPC. When the RPC deadline comes first the call
 fails with a `DEADLINE_EXCEEDED` RPC error, and a fetch run by a `background`

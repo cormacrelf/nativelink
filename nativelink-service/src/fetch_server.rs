@@ -393,16 +393,29 @@ fn response_qualifiers(qualifiers: &[Qualifier]) -> Vec<Qualifier> {
 }
 
 /// Converts the request's `timeout` (a `google.protobuf.Duration`), the time
-/// budget for the whole fetch, into a `Duration`, treating unset/zero/negative
-/// values as "no explicit timeout".
-fn request_timeout(timeout: Option<&prost_types::Duration>) -> Option<Duration> {
-    let timeout = timeout?;
-    if timeout.seconds <= 0 && timeout.nanos <= 0 {
-        return None;
+/// budget for the whole fetch, into a `Duration`. Unset or zero is "no explicit
+/// timeout". A negative or malformed one (`nanos` outside a second) is an
+/// `InvalidArgument` error: there is no sensible budget to read into it, and
+/// treating it as unset would quietly give the fetch the longest one.
+fn request_timeout(timeout: Option<&prost_types::Duration>) -> Result<Option<Duration>, Error> {
+    let Some(timeout) = timeout else {
+        return Ok(None);
+    };
+    let (Ok(seconds), Ok(nanos)) = (u64::try_from(timeout.seconds), u32::try_from(timeout.nanos))
+    else {
+        return Err(make_input_err!(
+            "'timeout' must not be negative, got {}s {}ns",
+            timeout.seconds,
+            timeout.nanos
+        ));
+    };
+    if nanos >= 1_000_000_000 {
+        return Err(make_input_err!(
+            "'timeout' is malformed: nanos must be under one second, got {nanos}"
+        ));
     }
-    let seconds = u64::try_from(timeout.seconds).ok()?;
-    let nanos = u32::try_from(timeout.nanos).unwrap_or(0);
-    Some(Duration::new(seconds, nanos))
+    let timeout = Duration::new(seconds, nanos);
+    Ok((!timeout.is_zero()).then_some(timeout))
 }
 
 /// How long before the RPC deadline the server stops waiting for a fetch.
@@ -532,6 +545,9 @@ impl FetchServer {
                 Error::new(Code::InvalidArgument, "No uris in fetch request".to_owned()).into(),
             );
         }
+        // Checked up front, cache hit or not: a malformed field is a malformed
+        // request.
+        let timeout = request_timeout(request.timeout.as_ref())?;
         let now = now_timestamp();
         let mut stale = Vec::new();
         for uri in &request.uris {
@@ -606,7 +622,7 @@ impl FetchServer {
                 qualifiers: qualifier_pairs(&request.qualifiers),
                 checksums,
                 hasher_func,
-                timeout: request_timeout(request.timeout.as_ref()),
+                timeout,
                 headers,
                 revalidate: Vec::new(),
                 shared_deadline: None,
@@ -705,6 +721,7 @@ impl FetchServer {
                 Error::new(Code::InvalidArgument, "No uris in fetch request".to_owned()).into(),
             );
         }
+        let timeout = request_timeout(request.timeout.as_ref())?;
         let now = now_timestamp();
 
         let mut stale = Vec::new();
@@ -799,7 +816,7 @@ impl FetchServer {
             qualifiers: qualifier_pairs(&request.qualifiers),
             checksums,
             hasher_func,
-            timeout: request_timeout(request.timeout.as_ref()),
+            timeout,
             headers,
             revalidate: Vec::new(),
             shared_deadline: None,

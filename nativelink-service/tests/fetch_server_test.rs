@@ -3568,6 +3568,42 @@ fn status_code_of(status: Option<&GoogleStatus>) -> Option<i32> {
 }
 
 #[nativelink_test]
+async fn test_negative_or_malformed_timeout_is_invalid_argument() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+
+    for (seconds, nanos) in [(-1, 0), (0, -1), (1, -1), (0, 1_000_000_000)] {
+        let timeout = Some(prost_types::Duration { seconds, nanos });
+        let mut request = blob_request(vec![uri.clone()], vec![]);
+        request.get_mut().timeout = timeout;
+        let err = fs
+            .fetch_blob(request)
+            .await
+            .expect_err("a bad timeout is rejected");
+        assert_eq!(
+            err.code(),
+            Code::InvalidArgument,
+            "{seconds}s {nanos}ns: {err:?}"
+        );
+
+        let mut request = directory_request_with(vec![uri.clone()], vec![]);
+        request.get_mut().timeout = timeout;
+        let err = fs
+            .fetch_directory(request)
+            .await
+            .expect_err("a bad timeout is rejected");
+        assert_eq!(
+            err.code(),
+            Code::InvalidArgument,
+            "{seconds}s {nanos}ns: {err:?}"
+        );
+    }
+    assert!(requests.lock().is_empty(), "nothing is fetched");
+    Ok(())
+}
+
+#[nativelink_test]
 async fn test_fetch_blob_timeout_bounds_a_trickling_body() -> Result<(), Status> {
     let store_manager = make_store_manager().await?;
     let fs = make_fetch_server_with_cas(&store_manager);
