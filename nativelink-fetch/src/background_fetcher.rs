@@ -37,6 +37,7 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use nativelink_config::fetchers::DEFAULT_MAX_CONCURRENT_FETCHES;
 use nativelink_error::{Error, make_err};
 use nativelink_util::background_spawn;
 use parking_lot::Mutex;
@@ -63,9 +64,10 @@ enum FetchState {
 type SharedResult = watch::Receiver<FetchState>;
 
 /// Tuning for [`BackgroundFetcher`].
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct BackgroundFetcherOpts {
     /// Maximum number of inner fetches running at once. `None` is unbounded.
+    /// Defaults to [`DEFAULT_MAX_CONCURRENT_FETCHES`].
     pub max_concurrent_fetches: Option<usize>,
     /// Lower bound applied to a job's `timeout`, the budget for the whole fetch
     /// (only when the job sets one). `None` leaves it unchanged.
@@ -73,6 +75,16 @@ pub struct BackgroundFetcherOpts {
     /// Upper bound applied to a job's `timeout`, the budget for the whole fetch
     /// (only when the job sets one). `None` leaves it unchanged.
     pub max_timeout: Option<Duration>,
+}
+
+impl Default for BackgroundFetcherOpts {
+    fn default() -> Self {
+        Self {
+            max_concurrent_fetches: Some(DEFAULT_MAX_CONCURRENT_FETCHES),
+            min_timeout: None,
+            max_timeout: None,
+        }
+    }
 }
 
 /// A [`Fetcher`] decorator providing dedup + background continuation.

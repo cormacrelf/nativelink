@@ -34,6 +34,9 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use futures::StreamExt;
+use nativelink_config::fetchers::{
+    DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_ARCHIVE_UNCOMPRESSED_BYTES, DEFAULT_MAX_SIZE_BYTES,
+};
 use nativelink_error::{Error, ResultExt, make_err, make_input_err};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
@@ -560,10 +563,10 @@ impl Default for UrlFetcherOptions {
     fn default() -> Self {
         Self {
             temp_path: None,
-            max_size_bytes: None,
+            max_size_bytes: Some(DEFAULT_MAX_SIZE_BYTES),
             archive_entry_inline_threshold_bytes: None,
-            max_archive_entries: None,
-            max_archive_uncompressed_bytes: None,
+            max_archive_entries: Some(DEFAULT_MAX_ARCHIVE_ENTRIES),
+            max_archive_uncompressed_bytes: Some(DEFAULT_MAX_ARCHIVE_UNCOMPRESSED_BYTES),
             require_checksum: false,
             proxy: None,
             max_fetch_duration: DEFAULT_MAX_FETCH_DURATION,

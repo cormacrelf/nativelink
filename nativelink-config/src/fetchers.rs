@@ -23,6 +23,22 @@ use crate::serde_utils::{
 };
 use crate::stores::StoreRefName;
 
+/// Default for [`UrlFetcherSpec::max_size_bytes`]: 256 GiB. Generous on
+/// purpose: it is there to stop an origin streaming forever, not to judge what
+/// a reasonable asset is.
+pub const DEFAULT_MAX_SIZE_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+
+/// Default for [`UrlFetcherSpec::max_archive_entries`]: four million, well
+/// above any real source archive while keeping the in-memory listing of one
+/// archive to hundreds of megabytes.
+pub const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 4_000_000;
+
+/// Default for [`UrlFetcherSpec::max_archive_uncompressed_bytes`]: 1 TiB.
+pub const DEFAULT_MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+
+/// Default for [`BackgroundSpec::max_concurrent_fetches`].
+pub const DEFAULT_MAX_CONCURRENT_FETCHES: usize = 64;
+
 /// Name of a fetcher. Used to reference a fetcher defined in the
 /// `CasConfig::fetchers` list, either from a `FetchConfig` or from another
 /// fetcher that wraps it (e.g. `Background` wrapping `Url`).
@@ -83,8 +99,10 @@ pub struct UrlFetcherSpec {
     /// one that streams more than this many bytes (including when the server
     /// omits or misreports `Content-Length`) is aborted. The URI is then treated
     /// as failed and the next one is tried; if none succeed the request fails
-    /// with `RESOURCE_EXHAUSTED`. When unset, downloads are unbounded. For a
-    /// directory fetch this limits the size of the (compressed) archive.
+    /// with `RESOURCE_EXHAUSTED`. For a directory fetch this limits the size of
+    /// the (compressed) archive. Set it to 0 for no limit.
+    ///
+    /// Default: 274877906944 (256 GiB)
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
@@ -109,7 +127,9 @@ pub struct UrlFetcherSpec {
     /// read; the URI is then treated as failed and the next one is tried, and if
     /// none succeed the request fails with `RESOURCE_EXHAUSTED`. Counted as the
     /// archive is read rather than taken from any header, so a lying archive
-    /// does not get past it. When unset, the number of entries is unbounded.
+    /// does not get past it. Set it to 0 for no limit.
+    ///
+    /// Default: 4000000
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
@@ -122,7 +142,10 @@ pub struct UrlFetcherSpec {
     /// archive that expands to a huge amount of data. It is counted on the bytes
     /// actually decompressed, never on sizes declared in the archive, so lying
     /// headers do not get past it. Exceeding it fails the URI as for
-    /// `max_archive_entries`. When unset, the expanded size is unbounded.
+    /// `max_archive_entries`. The compression ratio itself is not limited. Set
+    /// it to 0 for no limit.
+    ///
+    /// Default: 1099511627776 (1 TiB)
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
@@ -312,8 +335,12 @@ pub struct BackgroundSpec {
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub fetcher: FetcherRefName,
 
-    /// Maximum number of inner fetches running at once. When unset, the number
-    /// of concurrent fetches is unbounded.
+    /// Maximum number of inner fetches running at once. A request that would
+    /// start another waits for a slot, and stops waiting if its client goes
+    /// away; only a fetch that has a slot carries on in the background. Set it
+    /// to 0 for no limit.
+    ///
+    /// Default: 64
     #[serde(
         default,
         deserialize_with = "convert_optional_numeric_with_shellexpand"
