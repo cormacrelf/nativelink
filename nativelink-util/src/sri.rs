@@ -350,6 +350,11 @@ pub fn verify_byte_checksums(data: &[u8], checksums: &[ByteChecksum]) -> Result<
 /// Content satisfies the pin when, for every algorithm, its digest is one of
 /// those. How the checksums were spelled (SRI or hex, in what order, with what
 /// whitespace) makes no difference to it.
+///
+/// Two checksums of one algorithm that share no digest (`checksum.sha256=X`
+/// with an SRI `sha256-Y`) leave that algorithm with an empty set. Such a pin
+/// is still named, not empty: no content satisfies it, so a lookup misses and
+/// a fetch fails verification.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContentPin {
     by_algorithm: BTreeMap<HashAlgorithm, BTreeSet<Vec<u8>>>,

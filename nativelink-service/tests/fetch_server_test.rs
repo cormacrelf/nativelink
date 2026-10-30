@@ -1296,6 +1296,12 @@ async fn test_fetch_blob_corrupt_metadata_entry_is_a_miss() -> Result<(), Status
 
 /// Builds an in-memory zip archive from `(name, content)` entries.
 fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    build_zip_with(entries, zip::CompressionMethod::Deflated)
+}
+
+/// Builds an in-memory zip archive from `(name, content)` entries, with
+/// every entry compressed by `method`.
+fn build_zip_with(entries: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
     use std::io::{Cursor, Write};
 
     use zip::ZipWriter;
@@ -1304,11 +1310,84 @@ fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     for (name, content) in entries {
         writer
-            .start_file(*name, SimpleFileOptions::default())
+            .start_file(*name, SimpleFileOptions::default().compression_method(method))
             .unwrap();
         writer.write_all(content).unwrap();
     }
     writer.finish().unwrap().into_inner()
+}
+
+/// The `checksum.sha256` and `checksum.sha512` qualifiers of `data`.
+fn hex_checksum_qualifiers(data: &[u8]) -> (Qualifier, Qualifier) {
+    use sha2::{Digest, Sha256, Sha512};
+    (
+        header_qualifier("checksum.sha256", &hex::encode(Sha256::digest(data))),
+        header_qualifier("checksum.sha512", &hex::encode(Sha512::digest(data))),
+    )
+}
+
+/// `nativelink-fetch/tla/PinnedAssetCache.tla` with `Injective = FALSE`: a
+/// directory's byte checksums are of the archive, and two archives can
+/// unpack to the same directory. An entry per algorithm then says only that
+/// *an* archive with that digest unpacked to this directory, and a lookup
+/// that finds every algorithm agreeing on the directory has not found one
+/// archive with every digest. Here the sha256 of one archive and the sha512
+/// of another, which no archive has, hit the directory they share, where a
+/// download of the same request fails verification.
+#[nativelink_test]
+async fn test_fetch_directory_pinned_hit_needs_one_archive_with_every_checksum()
+-> Result<(), Status> {
+    use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::Fetch as _;
+
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+
+    let files: &[(&str, &[u8])] = &[("a.txt", b"alpha"), ("dir/b.txt", b"beta")];
+    let deflated = build_zip_with(files, zip::CompressionMethod::Deflated);
+    let stored = build_zip_with(files, zip::CompressionMethod::Stored);
+    assert_ne!(deflated, stored);
+    let (deflated_sha256, deflated_sha512) = hex_checksum_qualifiers(&deflated);
+    let (stored_sha256, stored_sha512) = hex_checksum_qualifiers(&stored);
+
+    let fetch = |uri: String, qualifiers: Vec<Qualifier>| {
+        fs.fetch_directory(Request::new(FetchDirectoryRequest {
+            instance_name: "foo_instance_name".to_string(),
+            timeout: None,
+            oldest_content_accepted: None,
+            uris: vec![uri],
+            qualifiers,
+            digest_function: 0,
+        }))
+    };
+
+    // Two archives, each pinned by both its own checksums, unpack to the same
+    // directory. That is the premise, not the claim.
+    let uri = serve_once(deflated.clone()).await;
+    let from_deflated = fetch(uri, vec![deflated_sha256.clone(), deflated_sha512])
+        .await?
+        .into_inner();
+    assert_eq!(from_deflated.status.as_ref().map(|s| s.code), Some(0));
+    let uri = serve_once(stored).await;
+    let from_stored = fetch(uri, vec![stored_sha256, stored_sha512.clone()])
+        .await?
+        .into_inner();
+    assert_eq!(from_stored.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(
+        from_deflated.root_directory_digest,
+        from_stored.root_directory_digest
+    );
+
+    // The deflated archive's sha256 with the stored archive's sha512: no
+    // archive has both. The origin serves the deflated one, which the sha512
+    // rejects, so a fetch that does not consult the cache is aborted.
+    let uri = serve_once(deflated).await;
+    let response = fetch(uri, vec![deflated_sha256, stored_sha512])
+        .await?
+        .into_inner();
+    assert_error_info(response.status.as_ref(), Code::Aborted, "FETCH_FAILED");
+    assert!(response.root_directory_digest.is_none());
+
+    Ok(())
 }
 
 #[nativelink_test]
