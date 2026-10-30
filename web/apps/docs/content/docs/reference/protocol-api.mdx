@@ -184,12 +184,16 @@ time spent waiting for one of the `cache` fetcher's
 bounds that wait, and a client that goes away while waiting leaves no work
 behind.
 
-Identical concurrent pinned requests, ones that carry a checksum, share one
-fetch. An unpinned request always runs its own: it accepts only what the origin
+A pinned request, one that carries a checksum, is fetched one URI at a time,
+in order, and concurrent pinned requests share the download of each URI they
+have in common, even when they list different mirrors. A URI that fails on its
+own (not found, unreachable, refused, a checksum mismatch, too large) moves on
+to the next; a failure the other URIs would share, such as a bad request, ends
+the request. An unpinned request always runs its own fetch: it accepts only what the origin
 serves now, and Bazel sets `oldest_content_accepted` to the time of the request,
 so joining a fetch that started earlier could hand it older content. Requests
-that send different `http_header:` or `http_header_url:` qualifiers are not
-identical: different credentials can get different answers from the origin, so
+that send different `http_header:` or `http_header_url:` qualifiers for a URI
+do not share its download: different credentials can get different answers from the origin, so
 each runs its own fetch. A shared fetch runs until the latest of its requests'
 timeouts, each counted from when its request arrived at the running fetch, so a
 request with a short timeout does not cut the fetch short for one with a longer
