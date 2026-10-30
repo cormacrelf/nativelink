@@ -29,8 +29,9 @@ use nativelink_fetch::fetcher::{
 };
 use nativelink_fetch::remote_asset_proto::{
     AssetKind, QUALIFIER_BAZEL_CANONICAL_ID, QUALIFIER_HTTP_HEADER_PREFIX,
-    QUALIFIER_HTTP_HEADER_URL_PREFIX, RemoteAssetEntry, RemoteAssetQuery, is_http_header_qualifier,
-    now_timestamp, qualifier_names, read_remote_asset_entry, redacted_uris, timestamp_is_before,
+    QUALIFIER_HTTP_HEADER_URL_PREFIX, RemoteAssetEntry, RemoteAssetQuery, byte_checksums,
+    is_http_header_qualifier, now_timestamp, qualifier_names, read_remote_asset_entry,
+    read_remote_asset_entry_at, redacted_uris, timestamp_is_before,
 };
 use nativelink_fetch::tree_hash::{TREE_HASH_FORMATS, TreeChecksum};
 use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::{
@@ -46,9 +47,7 @@ use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasherFunc, make_ctx_for_hash_func};
 use nativelink_util::redact::{redact_uri, redact_uris_in_text};
-use nativelink_util::sri::{
-    BYTE_CHECKSUM_QUALIFIERS, ByteChecksum, HEX_CHECKSUM_QUALIFIERS, QUALIFIER_CHECKSUM_SRI,
-};
+use nativelink_util::sri::{BYTE_CHECKSUM_QUALIFIERS, ByteChecksum, ContentPin, HashAlgorithm};
 use nativelink_util::store_trait::Store;
 use opentelemetry::context::FutureExt;
 use prost::Message;
@@ -92,34 +91,16 @@ fn directory_qualifiers() -> Vec<&'static str> {
         .collect()
 }
 
-/// The hex checksums (`checksum.sha1`, ...) a request asks for, over the
-/// downloaded bytes. A malformed value is an `InvalidArgument` error.
-fn hex_checksums(qualifiers: &[Qualifier]) -> Result<Vec<ByteChecksum>, Error> {
-    let mut checksums = Vec::new();
-    for &name in HEX_CHECKSUM_QUALIFIERS {
-        if let Some(value) = find_qualifier(qualifiers, name) {
-            checksums.push(ByteChecksum::from_qualifier(name, value)?);
-        }
-    }
-    Ok(checksums)
-}
-
-/// The `checksum.sri` a request asks for, if any. It is parsed only once a
-/// fetch is needed, so that an asset pushed under a qualifier set with an
-/// unparsable SRI can still be found. A malformed value is an
-/// `InvalidArgument` error.
-fn sri_checksum(qualifiers: &[Qualifier]) -> Result<Option<ByteChecksum>, Error> {
-    find_qualifier(qualifiers, QUALIFIER_CHECKSUM_SRI)
-        .map(|value| ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SRI, value))
-        .transpose()
-}
-
-/// The hex, tree-hash and action checksums a `FetchDirectory` request asks
-/// for, all of which the fetched directory must match. A malformed value is an
-/// `InvalidArgument` error.
-fn directory_checksums(qualifiers: &[Qualifier]) -> Result<Vec<DirectoryChecksum>, Error> {
-    let mut checksums: Vec<_> = hex_checksums(qualifiers)?
-        .into_iter()
+/// The byte, tree-hash and action checksums a `FetchDirectory` request asks
+/// for, all of which the fetched directory must match: `bytes`, already
+/// parsed, and the rest. A malformed value is an `InvalidArgument` error.
+fn directory_checksums(
+    qualifiers: &[Qualifier],
+    bytes: &[ByteChecksum],
+) -> Result<Vec<DirectoryChecksum>, Error> {
+    let mut checksums: Vec<_> = bytes
+        .iter()
+        .cloned()
         .map(DirectoryChecksum::Bytes)
         .collect();
     for &format in TREE_HASH_FORMATS {
@@ -332,6 +313,101 @@ async fn lookup_entry(
     Lookup::Hit(entry)
 }
 
+/// The entry stored under `query`'s hash key for `algorithm` and `digest`, if
+/// there is one and it may be served at `now`. Anything else, an unreadable
+/// store included, is `None`.
+async fn current_hash_entry(
+    store: &Store,
+    query: &RemoteAssetQuery,
+    (algorithm, digest): (HashAlgorithm, &[u8]),
+    hasher_func: DigestHasherFunc,
+    oldest_content_accepted: Option<&Timestamp>,
+    now: &Timestamp,
+) -> Option<RemoteAssetEntry> {
+    let key = query.hash_key(algorithm, digest, hasher_func).ok()?;
+    let entry = match read_remote_asset_entry_at(store, query.kind, key).await {
+        Ok(entry) => entry?,
+        Err(err) => {
+            warn!(?err, "Failed to read fetch asset metadata");
+            return None;
+        }
+    };
+    is_current(
+        entry.expire_at.as_ref(),
+        entry.stored_at.as_ref(),
+        oldest_content_accepted,
+        now,
+    )
+    .then_some(entry)
+}
+
+/// Whether two entries' digests name the same content in the CAS.
+fn same_content(a: &Digest, b: &Digest) -> bool {
+    match (DigestInfo::try_from(a), DigestInfo::try_from(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Looks up an asset pinned by byte checksums, by the [`ContentPin`] of its
+/// request (see `nativelink_fetch::remote_asset_proto`). Candidates come from
+/// the strongest algorithm's entries; one is a hit only if every other
+/// algorithm the pin names has a current entry, under a digest it accepts,
+/// for the same content. Each entry is true of its content, so the content
+/// then satisfies every checksum, and the answer does not depend on the order
+/// algorithms are looked up in. This is the reader of
+/// `nativelink-fetch/tla/PinnedAssetCache.tla`.
+async fn lookup_pinned(
+    store: &Store,
+    query: &RemoteAssetQuery,
+    pin: &ContentPin,
+    digest_function: i32,
+    oldest_content_accepted: Option<&Timestamp>,
+    now: &Timestamp,
+) -> Option<RemoteAssetEntry> {
+    let hasher_func = DigestHasherFunc::try_from(digest_function).ok()?;
+    let mut algorithms = pin.algorithms();
+    let (strongest, candidates) = algorithms.next()?;
+    let others: Vec<_> = algorithms.collect();
+    'candidates: for digest in candidates {
+        let Some(candidate) = current_hash_entry(
+            store,
+            query,
+            (strongest, digest),
+            hasher_func,
+            oldest_content_accepted,
+            now,
+        )
+        .await
+        else {
+            continue;
+        };
+        for (algorithm, accepted) in &others {
+            let mut agrees = false;
+            for digest in *accepted {
+                let entry = current_hash_entry(
+                    store,
+                    query,
+                    (*algorithm, digest),
+                    hasher_func,
+                    oldest_content_accepted,
+                    now,
+                )
+                .await;
+                if entry.is_some_and(|entry| same_content(&entry.digest, &candidate.digest)) {
+                    agrees = true;
+                    break;
+                }
+            }
+            if !agrees {
+                continue 'candidates;
+            }
+        }
+        return Some(candidate);
+    }
+    None
+}
+
 /// What to revalidate the stale `entry` with, if it has validators.
 fn stale_revalidation(entry: &RemoteAssetEntry) -> Option<Revalidation> {
     let validators = Validators {
@@ -386,8 +462,10 @@ const REDACTED_QUALIFIER_VALUE: &str = "<REDACTED>";
 /// HTTP header qualifier replaced by a placeholder. Those values usually carry
 /// credentials, and a response can end up in logs or caches the request never
 /// did. The names stay, so the response still lists every qualifier the
-/// request sent. A cache hit's stored qualifiers have the headers stripped
-/// already.
+/// request sent. A hit under a URI echoes the stored qualifiers instead,
+/// which have the headers stripped already; a hit on a pinned entry echoes the
+/// request's, since the entry may have been stored by a request that spelled
+/// its checksums differently.
 fn response_qualifiers(qualifiers: &[Qualifier]) -> Vec<Qualifier> {
     qualifiers
         .iter()
@@ -561,9 +639,52 @@ impl FetchServer {
         // Checked up front, cache hit or not: a malformed field is a malformed
         // request.
         let timeout = request_timeout(request.timeout.as_ref())?;
+        let checksums = byte_checksums(&request.qualifiers)?;
+        let pin = ContentPin::new(&checksums);
         let now = now_timestamp();
         let mut stale = Vec::new();
-        for uri in &request.uris {
+        if !pin.is_empty() {
+            let query =
+                RemoteAssetQuery::new(AssetKind::Blob, String::new(), request.qualifiers.clone());
+            if let Some(entry) = lookup_pinned(
+                &store_info.store,
+                &query,
+                &pin,
+                request.digest_function,
+                request.oldest_content_accepted.as_ref(),
+                &now,
+            )
+            .await
+            {
+                info!(
+                    digest = %entry.digest.hash,
+                    size_bytes = entry.digest.size_bytes,
+                    source = "cache",
+                    duration = ?start.elapsed(),
+                    "Fetched asset"
+                );
+                return Ok(Response::new(FetchBlobResponse {
+                    status: Some(GoogleStatus {
+                        code: Code::Ok.into(),
+                        message: "Fetch object found".to_owned(),
+                        details: vec![],
+                    }),
+                    uri: hit_uri(entry.query.uri, &request.uris),
+                    qualifiers: response_qualifiers(&request.qualifiers),
+                    expires_at: entry.expire_at,
+                    blob_digest: Some(entry.digest),
+                    digest_function: entry.digest_function,
+                }));
+            }
+        }
+        // An asset pinned only by other checksums has a key without its URI,
+        // so one lookup covers every URI; an unpinned one has one per URI.
+        let uris = if pin.is_empty() {
+            &request.uris[..]
+        } else {
+            &[]
+        };
+        for uri in uris {
             let query =
                 RemoteAssetQuery::new(AssetKind::Blob, uri.clone(), request.qualifiers.clone());
             let pinned = query.is_pinned();
@@ -632,10 +753,8 @@ impl FetchServer {
                 return Err(status);
             }
             let headers = FetchHeaders::from_qualifiers(&request.qualifiers, request.uris.len())?;
-            let mut checksums = hex_checksums(&request.qualifiers)?;
             let hasher_func = DigestHasherFunc::try_from(request.digest_function)
                 .err_tip(|| "In FetchServer::inner_fetch_blob")?;
-            checksums.extend(sri_checksum(&request.qualifiers)?);
             let mut job = FetchBlobTask {
                 uris: request.uris.clone(),
                 qualifiers: qualifier_pairs(&request.qualifiers),
@@ -741,10 +860,54 @@ impl FetchServer {
             );
         }
         let timeout = request_timeout(request.timeout.as_ref())?;
+        let bytes = byte_checksums(&request.qualifiers)?;
+        let pin = ContentPin::new(&bytes);
         let now = now_timestamp();
 
         let mut stale = Vec::new();
-        for uri in &request.uris {
+        if !pin.is_empty() {
+            let query = RemoteAssetQuery::new(
+                AssetKind::Directory,
+                String::new(),
+                request.qualifiers.clone(),
+            );
+            if let Some(entry) = lookup_pinned(
+                &store_info.store,
+                &query,
+                &pin,
+                request.digest_function,
+                request.oldest_content_accepted.as_ref(),
+                &now,
+            )
+            .await
+            {
+                info!(
+                    digest = %entry.digest.hash,
+                    size_bytes = entry.digest.size_bytes,
+                    source = "cache",
+                    duration = ?start.elapsed(),
+                    "Fetched directory"
+                );
+                return Ok(Response::new(FetchDirectoryResponse {
+                    status: Some(GoogleStatus {
+                        code: Code::Ok.into(),
+                        message: "Fetch directory found".to_owned(),
+                        details: vec![],
+                    }),
+                    uri: hit_uri(entry.query.uri, &request.uris),
+                    qualifiers: response_qualifiers(&request.qualifiers),
+                    expires_at: entry.expire_at,
+                    root_directory_digest: Some(entry.digest),
+                    digest_function: entry.digest_function,
+                }));
+            }
+        }
+        let uris = if pin.is_empty() {
+            &request.uris[..]
+        } else {
+            &[]
+        };
+        for uri in uris {
             let query = RemoteAssetQuery::new(
                 AssetKind::Directory,
                 uri.clone(),
@@ -829,10 +992,9 @@ impl FetchServer {
             return Err(status);
         }
         let headers = FetchHeaders::from_qualifiers(&request.qualifiers, request.uris.len())?;
-        let mut checksums = directory_checksums(&request.qualifiers)?;
+        let checksums = directory_checksums(&request.qualifiers, &bytes)?;
         let hasher_func = DigestHasherFunc::try_from(request.digest_function)
             .err_tip(|| "In FetchServer::inner_fetch_directory")?;
-        checksums.extend(sri_checksum(&request.qualifiers)?.map(DirectoryChecksum::Bytes));
         let mut job = FetchDirectoryJob {
             verified_by_action: false,
             uris: request.uris.clone(),

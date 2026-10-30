@@ -530,13 +530,11 @@ async fn a_checksum_is_still_checked_on_a_changed_blob_that_was_revalidated() {
     let fetcher = UrlFetcher::new(memory_store().await, loopback_options()).unwrap();
     let uri = format!("{origin}/x");
     let mut revalidating = job(&uri, FetchHeaders::default());
-    revalidating.checksums = vec![
-        nativelink_util::sri::ByteChecksum::from_qualifier(
-            "checksum.sha256",
-            &digest_of(BODY).packed_hash().to_string(),
-        )
-        .unwrap(),
-    ];
+    revalidating.checksums = nativelink_util::sri::ByteChecksum::from_qualifier(
+        "checksum.sha256",
+        &digest_of(BODY).packed_hash().to_string(),
+    )
+    .unwrap();
     revalidating.revalidate = vec![revalidation(&uri, digest_of(BODY), both_validators())];
 
     let err = fetcher.fetch_blob(&revalidating).await.unwrap_err();

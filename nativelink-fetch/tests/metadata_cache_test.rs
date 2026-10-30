@@ -25,7 +25,7 @@ use nativelink_fetch::fetcher::{
 use nativelink_fetch::metadata_cache::{MetadataCache, MetadataCacheOptions};
 use nativelink_fetch::remote_asset_proto::{
     AssetKind, RemoteAssetEntry, RemoteAssetMetadata, RemoteAssetQuery, read_remote_asset_entry,
-    timestamp_is_before, write_remote_asset_entry,
+    read_remote_asset_entry_at, timestamp_is_before, write_remote_asset_entry,
 };
 use nativelink_fetch::tree_hash::TreeChecksum;
 use nativelink_fetch::tree_hash::h1::H1;
@@ -41,7 +41,7 @@ use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
-use nativelink_util::sri::ByteChecksum;
+use nativelink_util::sri::{ByteChecksum, ContentHasher, ContentPin, HashAlgorithm};
 use nativelink_util::store_trait::{Store, StoreLike};
 use prost::Message;
 use prost_types::Timestamp;
@@ -213,6 +213,23 @@ fn stored_metadata(action_result: &ActionResult) -> RemoteAssetMetadata {
         "type.googleapis.com/nativelink.RemoteAssetMetadata"
     );
     RemoteAssetMetadata::decode(any.value.as_slice()).unwrap()
+}
+
+/// Where a blob fetched as `blob_job("http://example/blob", qualifiers())`
+/// with `checksums` is stored: under its URI when there are none, else under
+/// the hash key of the strongest algorithm.
+fn fetched_blob_key(checksums: &[ByteChecksum]) -> DigestInfo {
+    let pin = ContentPin::new(checksums);
+    let Some((algorithm, digests)) = pin.algorithms().next() else {
+        return key_of(AssetKind::Blob, "http://example/blob", proto_qualifiers());
+    };
+    RemoteAssetQuery::new(AssetKind::Blob, String::new(), proto_qualifiers())
+        .hash_key(
+            algorithm,
+            digests.first().unwrap(),
+            DigestHasherFunc::Sha256,
+        )
+        .unwrap()
 }
 
 fn key_of(kind: AssetKind, uri: &str, qualifiers: Vec<Qualifier>) -> DigestInfo {
@@ -566,11 +583,11 @@ async fn lifetime_of(
         validators: Validators::default(),
     });
     let mc = MetadataCache::with_options(inner, ac_store.clone(), cas_store, options);
+    let key = fetched_blob_key(&checksums);
     let mut job = blob_job("http://example/blob", qualifiers());
     job.checksums = checksums;
     mc.fetch_blob(&job).await.unwrap();
 
-    let key = key_of(AssetKind::Blob, "http://example/blob", proto_qualifiers());
     let action_result = stored_action_result(&ac_store, key).await;
     let stored_at = action_result
         .execution_metadata
@@ -641,7 +658,7 @@ async fn pinned_entry_never_expires_whatever_the_headers_say() {
         Some(secs(99_999)),
     ] {
         assert_eq!(
-            lifetime_of(options, freshness, vec![checksum.clone()]).await,
+            lifetime_of(options, freshness, checksum.clone()).await,
             None,
             "{freshness:?}"
         );
@@ -706,21 +723,14 @@ async fn entry_after_fetch(checksums: Vec<ByteChecksum>) -> RemoteAssetEntry {
         validators: validators(),
     });
     let mc = MetadataCache::new(inner, ac_store.clone(), memory_store().await);
+    let key = fetched_blob_key(&checksums);
     let mut job = blob_job("http://example/blob", qualifiers());
     job.checksums = checksums;
     mc.fetch_blob(&job).await.unwrap();
-    read_remote_asset_entry(
-        &ac_store,
-        &RemoteAssetQuery::new(
-            AssetKind::Blob,
-            "http://example/blob".to_string(),
-            proto_qualifiers(),
-        ),
-        digest_function::Value::Sha256.into(),
-    )
-    .await
-    .unwrap()
-    .unwrap()
+    read_remote_asset_entry_at(&ac_store, AssetKind::Blob, key)
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 #[nativelink_test]
@@ -737,7 +747,7 @@ async fn pinned_entry_stores_no_validators() {
         &sha256_digest_of(b"payload").packed_hash().to_string(),
     )
     .unwrap();
-    let entry = entry_after_fetch(vec![checksum]).await;
+    let entry = entry_after_fetch(checksum).await;
     assert_eq!(entry.etag, None);
     assert_eq!(entry.last_modified, None);
 }
@@ -957,4 +967,113 @@ async fn an_entry_without_references_round_trips() {
             1
         );
     }
+}
+
+/// `algorithm`'s digest of `bytes`.
+fn hash_of(algorithm: HashAlgorithm, bytes: &[u8]) -> Vec<u8> {
+    let mut hasher = ContentHasher::new([algorithm]);
+    hasher.update(bytes);
+    hasher.finalize().remove(&algorithm).unwrap()
+}
+
+/// The hex checksum qualifier of `algorithm` for `bytes`.
+fn hex_checksum(algorithm: HashAlgorithm, bytes: &[u8]) -> Vec<ByteChecksum> {
+    ByteChecksum::from_qualifier(
+        &format!("checksum.{}", algorithm.name()),
+        &hex::encode(hash_of(algorithm, bytes)),
+    )
+    .unwrap()
+}
+
+fn blob_hash_key(algorithm: HashAlgorithm, bytes: &[u8]) -> DigestInfo {
+    RemoteAssetQuery::new(AssetKind::Blob, String::new(), proto_qualifiers())
+        .hash_key(
+            algorithm,
+            &hash_of(algorithm, bytes),
+            DigestHasherFunc::Sha256,
+        )
+        .unwrap()
+}
+
+#[nativelink_test]
+async fn a_pinned_blob_is_stored_under_each_algorithm_and_not_its_uri() {
+    let ac_store = memory_store().await;
+    let digest = sha256_digest_of(b"payload");
+    let inner: Arc<dyn Fetcher> = Arc::new(HeaderFetcher {
+        digest,
+        freshness: None,
+        validators: Validators::default(),
+    });
+    let mc = MetadataCache::new(inner, ac_store.clone(), memory_store().await);
+    let mut job = blob_job("http://example/blob", qualifiers());
+    job.checksums = [
+        hex_checksum(HashAlgorithm::Sha1, b"payload"),
+        hex_checksum(HashAlgorithm::Sha512, b"payload"),
+    ]
+    .concat();
+    mc.fetch_blob(&job).await.unwrap();
+
+    for algorithm in [HashAlgorithm::Sha1, HashAlgorithm::Sha512] {
+        let entry = read_remote_asset_entry_at(
+            &ac_store,
+            AssetKind::Blob,
+            blob_hash_key(algorithm, b"payload"),
+        )
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no {} entry", algorithm.name()));
+        assert_eq!(DigestInfo::try_from(&entry.digest).unwrap(), digest);
+        assert_eq!(entry.query.uri, "http://example/blob");
+    }
+    let uri_key = key_of(AssetKind::Blob, "http://example/blob", proto_qualifiers());
+    assert!(ac_store.has(uri_key).await.unwrap().is_none());
+}
+
+#[nativelink_test]
+async fn an_algorithm_with_alternatives_is_hashed_from_the_cas() {
+    let ac_store = memory_store().await;
+    let cas_store = memory_store().await;
+    let digest = sha256_digest_of(b"payload");
+    cas_store
+        .update_oneshot(digest, bytes::Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    let inner: Arc<dyn Fetcher> = Arc::new(HeaderFetcher {
+        digest,
+        freshness: None,
+        validators: Validators::default(),
+    });
+    let mc = MetadataCache::new(inner, ac_store.clone(), cas_store);
+    let mut job = blob_job("http://example/blob", qualifiers());
+    // One SRI expression for the content and one for something else: either
+    // may match, so which one did is read from the CAS.
+    let sri = |bytes: &[u8]| {
+        use base64::Engine;
+        format!(
+            "sha256-{}",
+            base64::prelude::BASE64_STANDARD.encode(hash_of(HashAlgorithm::Sha256, bytes))
+        )
+    };
+    job.checksums = ByteChecksum::from_qualifier(
+        "checksum.sri",
+        &format!("{} {}", sri(b"other"), sri(b"payload")),
+    )
+    .unwrap();
+    mc.fetch_blob(&job).await.unwrap();
+
+    let found = |bytes: &'static [u8]| {
+        let ac_store = ac_store.clone();
+        async move {
+            read_remote_asset_entry_at(
+                &ac_store,
+                AssetKind::Blob,
+                blob_hash_key(HashAlgorithm::Sha256, bytes),
+            )
+            .await
+            .unwrap()
+            .is_some()
+        }
+    };
+    assert!(found(b"payload").await);
+    assert!(!found(b"other").await);
 }

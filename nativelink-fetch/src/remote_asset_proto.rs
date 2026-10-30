@@ -31,6 +31,17 @@
 //!   the `Action` nor the `Command` is uploaded to the CAS: an Action Cache
 //!   entry does not need them. A push made with one digest function is not
 //!   found by a fetch asking for another.
+//! * **Hash keys**: an asset pinned by byte checksums (`checksum.sri`,
+//!   `checksum.sha*`) is instead stored once per algorithm, under
+//!   `["nativelink-remote-asset", "<blob|directory>", "<algorithm>", "<hex
+//!   digest>"]` with the other qualifiers as environment variables (see
+//!   [`RemoteAssetQuery::hash_key`]). Each entry is true of its content: the
+//!   digest in its key is that algorithm's digest of the content it points
+//!   at. A lookup hits only when every algorithm the request names has an
+//!   entry under one of the digests it accepts and all of them point at the
+//!   same content, so how the request spells its checksums, and which
+//!   algorithm is looked up first, cannot change the answer. This is the
+//!   scheme `nativelink-fetch/tla/PinnedAssetCache.tla` models and checks.
 //! * **Value**: an `ActionResult` with the content as output `out`: an
 //!   `OutputFile` for a blob, or an `OutputDirectory` whose `tree_digest` is a
 //!   `Tree` uploaded to the CAS for a directory. `execution_metadata` carries
@@ -43,7 +54,7 @@
 //!   so that `completeness_checking` misses an entry whose references left the
 //!   CAS.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::SystemTime;
 
 use bytes::BytesMut;
@@ -58,9 +69,13 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
 use nativelink_store::ac_utils::{
     get_and_decode_digest, message_to_digest, serialize_and_upload_message,
 };
+use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::redact::redact_uri;
+use nativelink_util::sri::{
+    BYTE_CHECKSUM_QUALIFIERS, ByteChecksum, ContentHasher, ContentPin, HashAlgorithm,
+};
 use nativelink_util::store_trait::{Store, StoreLike};
 use prost::Message;
 use prost_types::{Any, Timestamp};
@@ -114,6 +129,21 @@ pub fn qualifier_names(qualifiers: &[Qualifier]) -> Vec<&str> {
 /// `uris` with their credentials redacted, for logging them.
 pub fn redacted_uris(uris: &[String]) -> Vec<String> {
     uris.iter().map(|uri| redact_uri(uri)).collect()
+}
+
+/// The byte checksums (`checksum.sri`, `checksum.sha*`) among `qualifiers`,
+/// every occurrence of each. A malformed value is an `InvalidArgument` error.
+pub fn byte_checksums(qualifiers: &[Qualifier]) -> Result<Vec<ByteChecksum>, Error> {
+    let mut checksums = Vec::new();
+    for qualifier in qualifiers {
+        if BYTE_CHECKSUM_QUALIFIERS.contains(&qualifier.name.as_str()) {
+            checksums.extend(ByteChecksum::from_qualifier(
+                &qualifier.name,
+                &qualifier.value,
+            )?);
+        }
+    }
+    Ok(checksums)
 }
 
 /// The current time as a proto `Timestamp`, for stamping entries as they are
@@ -223,10 +253,9 @@ impl RemoteAssetQuery {
     /// A pinned asset's key leaves out the URI, so every URI of a request
     /// shares it. The other qualifiers stay in, including
     /// `bazel.canonical_id`, which Bazel changes precisely so that a cached
-    /// answer is not reused.
+    /// answer is not reused. An asset pinned by byte checksums is stored
+    /// under its [`Self::hash_key`]s instead.
     pub fn key(&self, hasher_func: DigestHasherFunc) -> Result<DigestInfo, Error> {
-        let mut sorted: Vec<&Qualifier> = self.qualifiers.iter().collect();
-        sorted.sort_by(|a, b| (&a.name, &a.value).cmp(&(&b.name, &b.value)));
         let mut arguments = vec![
             REMOTE_ASSET_WORKER.to_owned(),
             self.kind.as_str().to_owned(),
@@ -235,28 +264,64 @@ impl RemoteAssetQuery {
         if !self.is_pinned() {
             arguments.push(self.uri.clone());
         }
-        let command = Command {
-            arguments,
-            environment_variables: sorted
-                .into_iter()
-                .map(|qualifier| EnvironmentVariable {
-                    name: qualifier.name.clone(),
-                    value: qualifier.value.clone(),
-                })
-                .collect(),
-            ..Default::default()
-        };
-        let command_digest =
-            message_to_digest(&command, &mut BytesMut::new(), &mut hasher_func.hasher())
-                .err_tip(|| "Hashing the Remote Asset command")?;
-        let action = Action {
-            command_digest: Some(command_digest.into()),
-            do_not_cache: false,
-            ..Default::default()
-        };
-        message_to_digest(&action, &mut BytesMut::new(), &mut hasher_func.hasher())
-            .err_tip(|| "Hashing the Remote Asset action")
+        action_key(arguments, self.qualifiers.iter(), hasher_func)
     }
+
+    /// The Action Cache key of the content whose `algorithm` digest is
+    /// `digest`, among assets of this kind with this asset's other
+    /// qualifiers. The URI and the byte checksum qualifiers are left out: the
+    /// digest stands for them, whichever way they spelled it. Four arguments,
+    /// so neither form of [`Self::key`] can produce it.
+    pub fn hash_key(
+        &self,
+        algorithm: HashAlgorithm,
+        digest: &[u8],
+        hasher_func: DigestHasherFunc,
+    ) -> Result<DigestInfo, Error> {
+        let arguments = vec![
+            REMOTE_ASSET_WORKER.to_owned(),
+            self.kind.as_str().to_owned(),
+            algorithm.name().to_owned(),
+            hex::encode(digest),
+        ];
+        let qualifiers = self
+            .qualifiers
+            .iter()
+            .filter(|qualifier| !BYTE_CHECKSUM_QUALIFIERS.contains(&qualifier.name.as_str()));
+        action_key(arguments, qualifiers, hasher_func)
+    }
+}
+
+/// The digest of the synthetic `Action` whose `Command` has `arguments` and
+/// `qualifiers` (sorted by `(name, value)`) as environment variables.
+fn action_key<'a>(
+    arguments: Vec<String>,
+    qualifiers: impl Iterator<Item = &'a Qualifier>,
+    hasher_func: DigestHasherFunc,
+) -> Result<DigestInfo, Error> {
+    let mut sorted: Vec<&Qualifier> = qualifiers.collect();
+    sorted.sort_by(|a, b| (&a.name, &a.value).cmp(&(&b.name, &b.value)));
+    let command = Command {
+        arguments,
+        environment_variables: sorted
+            .into_iter()
+            .map(|qualifier| EnvironmentVariable {
+                name: qualifier.name.clone(),
+                value: qualifier.value.clone(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let command_digest =
+        message_to_digest(&command, &mut BytesMut::new(), &mut hasher_func.hasher())
+            .err_tip(|| "Hashing the Remote Asset command")?;
+    let action = Action {
+        command_digest: Some(command_digest.into()),
+        do_not_cache: false,
+        ..Default::default()
+    };
+    message_to_digest(&action, &mut BytesMut::new(), &mut hasher_func.hasher())
+        .err_tip(|| "Hashing the Remote Asset action")
 }
 
 /// A stored asset: what [`write_remote_asset_entry`] writes and
@@ -346,9 +411,10 @@ pub async fn build_tree(cas_store: &Store, root: DigestInfo) -> Result<Tree, Err
     })
 }
 
-/// Writes `entry` to the Action Cache `ac_store` as described in the module
-/// docs. For a directory, `cas_store` is used to read the `Directory` protos
-/// and to upload the `Tree`; this fails if any `Directory` is missing, or with
+/// Writes `entry` to the Action Cache `ac_store` under its
+/// [`RemoteAssetQuery::key`], as described in the module docs. For a
+/// directory, `cas_store` is used to read the `Directory` protos and to upload
+/// the `Tree`; this fails if any `Directory` is missing, or with
 /// `FailedPrecondition` if there is no `cas_store`. A blob needs none.
 pub async fn write_remote_asset_entry(
     ac_store: &Store,
@@ -358,6 +424,35 @@ pub async fn write_remote_asset_entry(
     let hasher_func = DigestHasherFunc::try_from(entry.digest_function)
         .err_tip(|| "Digest function of Remote Asset entry")?;
     let key = entry.query.key(hasher_func)?;
+    write_remote_asset_entry_under(ac_store, cas_store, entry, &[key]).await
+}
+
+/// The [`RemoteAssetQuery::hash_key`] of `entry` for each digest in `hashes`,
+/// which must be digests of the entry's content.
+pub fn hash_keys(
+    entry: &RemoteAssetEntry,
+    hashes: &BTreeMap<HashAlgorithm, Vec<u8>>,
+) -> Result<Vec<DigestInfo>, Error> {
+    let hasher_func = DigestHasherFunc::try_from(entry.digest_function)
+        .err_tip(|| "Digest function of Remote Asset entry")?;
+    hashes
+        .iter()
+        .map(|(algorithm, digest)| entry.query.hash_key(*algorithm, digest, hasher_func))
+        .collect()
+}
+
+/// Writes `entry` to the Action Cache `ac_store` under each of `keys`, one at
+/// a time. Each key is written on its own, so a failure part way leaves some
+/// written and others not, which is safe for [`hash_keys`]: each entry is
+/// true of its content by itself.
+pub async fn write_remote_asset_entry_under(
+    ac_store: &Store,
+    cas_store: Option<&Store>,
+    entry: &RemoteAssetEntry,
+    keys: &[DigestInfo],
+) -> Result<(), Error> {
+    let hasher_func = DigestHasherFunc::try_from(entry.digest_function)
+        .err_tip(|| "Digest function of Remote Asset entry")?;
     let (mut output_files, mut output_directories, root_directory_digest) = match entry.query.kind {
         AssetKind::Blob => (
             vec![OutputFile {
@@ -448,10 +543,14 @@ pub async fn write_remote_asset_entry(
         }),
         ..Default::default()
     };
-    ac_store
-        .update_oneshot(key, action_result.encode_to_vec().into())
-        .await
-        .err_tip(|| "Writing the Remote Asset entry to the Action Cache")
+    let value: bytes::Bytes = action_result.encode_to_vec().into();
+    for key in keys {
+        ac_store
+            .update_oneshot(*key, value.clone())
+            .await
+            .err_tip(|| "Writing the Remote Asset entry to the Action Cache")?;
+    }
+    Ok(())
 }
 
 /// Reads the entry for `query` from the Action Cache `ac_store`, looking it up
@@ -466,12 +565,70 @@ pub async fn read_remote_asset_entry(
     let hasher_func = DigestHasherFunc::try_from(digest_function)
         .err_tip(|| "Digest function of Remote Asset lookup")?;
     let key = query.key(hasher_func)?;
+    read_remote_asset_entry_at(ac_store, query.kind, key).await
+}
+
+/// Reads the entry of `kind` stored under `key` in the Action Cache
+/// `ac_store`. Returns `None` as [`read_remote_asset_entry`] does.
+pub async fn read_remote_asset_entry_at(
+    ac_store: &Store,
+    kind: AssetKind,
+    key: DigestInfo,
+) -> Result<Option<RemoteAssetEntry>, Error> {
     let action_result = match get_and_decode_digest::<ActionResult>(ac_store, key.into()).await {
         Ok(action_result) => action_result,
         Err(err) if err.code == Code::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    Ok(entry_from_action_result(query.kind, action_result))
+    Ok(entry_from_action_result(kind, action_result))
+}
+
+/// Hashes the blob `digest` in `cas_store` with each of `algorithms`, reading
+/// it once. Fails with the store's error (`NotFound` if it is not there).
+pub async fn hash_blob(
+    cas_store: &Store,
+    digest: DigestInfo,
+    algorithms: impl IntoIterator<Item = HashAlgorithm>,
+) -> Result<BTreeMap<HashAlgorithm, Vec<u8>>, Error> {
+    let (tx, mut rx) = make_buf_channel_pair();
+    // The writer is moved in so that it is dropped when the read ends, which
+    // ends the hashing too when the read fails before sending EOF.
+    let read = async move {
+        let mut tx = tx;
+        cas_store.get_part(digest, &mut tx, 0, None).await
+    };
+    let mut hasher = ContentHasher::new(algorithms);
+    let hash = async {
+        loop {
+            let data = rx.recv().await.err_tip(|| "Reading the blob to hash it")?;
+            if data.is_empty() {
+                return Ok::<_, Error>(());
+            }
+            hasher.update(&data);
+        }
+    };
+    let (read_result, hash_result) = futures::join!(read, hash);
+    read_result.err_tip(|| format!("Reading blob {digest} to hash it"))?;
+    hash_result?;
+    Ok(hasher.finalize())
+}
+
+/// The digests of `pin`'s algorithms that content satisfying it has, so far
+/// as the pin alone says: an algorithm for which it accepts exactly one
+/// digest. Content that was verified against the pin has that digest. An
+/// algorithm that accepts several is in the second set, to be hashed.
+pub fn pinned_hashes(pin: &ContentPin) -> (BTreeMap<HashAlgorithm, Vec<u8>>, Vec<HashAlgorithm>) {
+    let mut known = BTreeMap::new();
+    let mut unknown = Vec::new();
+    for (algorithm, accepted) in pin.algorithms() {
+        match accepted.iter().collect::<Vec<_>>().as_slice() {
+            [digest] => {
+                known.insert(algorithm, (*digest).clone());
+            }
+            _ => unknown.push(algorithm),
+        }
+    }
+    (known, unknown)
 }
 
 /// Decodes a stored `ActionResult`, or `None` if it is not a Remote Asset entry

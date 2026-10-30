@@ -16,11 +16,11 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use nativelink_error::{Code, Error};
 use nativelink_util::sri::{
-    ByteChecksum, ChecksumVerifier, QUALIFIER_CHECKSUM_SHA1, QUALIFIER_CHECKSUM_SHA256,
-    QUALIFIER_CHECKSUM_SHA384, QUALIFIER_CHECKSUM_SHA512, QUALIFIER_CHECKSUM_SRI,
-    verify_byte_checksums, verify_sri_hash,
+    ByteChecksum, ChecksumVerifier, ContentHasher, ContentPin, HashAlgorithm,
+    QUALIFIER_CHECKSUM_SHA1, QUALIFIER_CHECKSUM_SHA256, QUALIFIER_CHECKSUM_SHA384,
+    QUALIFIER_CHECKSUM_SHA512, QUALIFIER_CHECKSUM_SRI, verify_byte_checksums, verify_sri_hash,
 };
-use sha2::{Digest, Sha384, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 
 #[test]
 fn verifies_known_sha256_of_empty_input() {
@@ -86,7 +86,7 @@ const HEX_VECTORS: [(&str, &str); 4] = [
 ];
 
 fn verify_qualifier(data: &[u8], qualifier: &str, value: &str) -> Result<(), Error> {
-    verify_byte_checksums(data, &[ByteChecksum::from_qualifier(qualifier, value)?])
+    verify_byte_checksums(data, &ByteChecksum::from_qualifier(qualifier, value)?)
 }
 
 #[test]
@@ -199,15 +199,16 @@ fn sri_and_hex_spellings_of_one_digest_are_the_same_checksum() {
 fn every_checksum_must_match() {
     let sha1 = ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SHA1, SHA1).unwrap();
     let sha256 = ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SHA256, SHA256).unwrap();
-    verify_byte_checksums(HELLO_WORLD, &[sha1.clone(), sha256.clone()]).expect("both match");
-    let err = verify_byte_checksums(b"other", &[sha1, sha256]).expect_err("neither matches");
+    let both = [sha1, sha256].concat();
+    verify_byte_checksums(HELLO_WORLD, &both).expect("both match");
+    let err = verify_byte_checksums(b"other", &both).expect_err("neither matches");
     assert_eq!(err.code, Code::Aborted);
 }
 
 #[test]
 fn verifier_is_reusable_after_reset() {
     let checksum = ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SHA1, SHA1).unwrap();
-    let mut verifier = ChecksumVerifier::new(&checksum);
+    let mut verifier = ChecksumVerifier::new(&checksum[0]);
     verifier.update(b"partial garbage");
     verifier.reset();
     verifier.update(b"hello ");
@@ -227,35 +228,94 @@ fn sri_of<D: Digest>(algorithm: &str, data: &[u8]) -> String {
 }
 
 #[test]
-fn uses_the_strongest_supported_expression() {
+fn every_supported_algorithm_must_match() {
     let data = b"hello nativelink";
     let sha512 = sri_of::<Sha512>("sha512", data);
+    let sha384 = sri_of::<Sha384>("sha384", data);
     let wrong_sha384 = sri_of::<Sha384>("sha384", b"other data");
-    // `sha1` is not an SRI algorithm and is ignored; the weaker `sha384`
-    // expression is not checked, whatever the order.
+    // `sha1` is not an SRI algorithm and is ignored.
     for sri in [
         format!("sha1-AAAAAAAAAAAAAAAAAAAAAAAAAAA= {sha512}"),
-        format!("{wrong_sha384} {sha512}"),
-        format!("{sha512}\t{wrong_sha384}"),
+        format!("{sha384} {sha512}"),
+        format!("{sha512}\t{sha384}"),
     ] {
         verify_sri_hash(data, &sri).unwrap_or_else(|e| panic!("{sri}: {e:?}"));
+    }
+    // A weaker algorithm is checked too, whatever the order.
+    for sri in [
+        format!("{wrong_sha384} {sha512}"),
+        format!("{sha512} {wrong_sha384}"),
+    ] {
+        let err = verify_sri_hash(data, &sri).expect_err(&sri);
+        assert_eq!(err.code, Code::Aborted, "{sri}");
     }
 }
 
 #[test]
-fn the_strongest_expression_must_match() {
+fn spelling_does_not_change_the_pin() {
     let data = b"hello nativelink";
-    let sri = format!(
-        "{} {}",
-        sri_of::<Sha384>("sha384", data),
-        sri_of::<Sha512>("sha512", b"other data")
+    let sha512 = sri_of::<Sha512>("sha512", data);
+    let sha256 = sri_of::<Sha256>("sha256", data);
+    let sha256_hex = hex::encode(Sha256::digest(data));
+    let pin_of = |qualifiers: &[(&str, &str)]| {
+        let checksums: Vec<ByteChecksum> = qualifiers
+            .iter()
+            .flat_map(|(name, value)| ByteChecksum::from_qualifier(name, value).unwrap())
+            .collect();
+        ContentPin::new(&checksums)
+    };
+    let pin = pin_of(&[(QUALIFIER_CHECKSUM_SRI, &format!("{sha256} {sha512}"))]);
+    assert_eq!(
+        pin,
+        pin_of(&[(QUALIFIER_CHECKSUM_SRI, &format!(" {sha512}\n\t{sha256} "))])
     );
-    let err = verify_sri_hash(data, &sri).expect_err("sha512 mismatch should error");
-    assert_eq!(err.code, Code::Aborted);
+    assert_eq!(
+        pin,
+        pin_of(&[
+            (QUALIFIER_CHECKSUM_SRI, &sha512),
+            (QUALIFIER_CHECKSUM_SHA256, &sha256_hex)
+        ])
+    );
+    let algorithms: Vec<&str> = pin.algorithms().map(|(a, _)| a.name()).collect();
+    assert_eq!(algorithms, ["sha512", "sha256"]);
 }
 
 #[test]
-fn any_expression_of_the_strongest_algorithm_may_match() {
+fn a_pin_accepts_what_every_checksum_of_an_algorithm_allows() {
+    let a = Sha256::digest(b"a").to_vec();
+    let b = Sha256::digest(b"b").to_vec();
+    let sri = format!(
+        "{} {}",
+        sri_of::<Sha256>("sha256", b"a"),
+        sri_of::<Sha256>("sha256", b"b")
+    );
+    let checksums = [
+        ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SRI, &sri).unwrap(),
+        ByteChecksum::from_qualifier(QUALIFIER_CHECKSUM_SHA256, &hex::encode(&b)).unwrap(),
+    ]
+    .concat();
+    let pin = ContentPin::new(&checksums);
+    assert!(pin.accepts(HashAlgorithm::Sha256, &b));
+    assert!(!pin.accepts(HashAlgorithm::Sha256, &a));
+    assert!(!pin.accepts(HashAlgorithm::Sha512, &b));
+}
+
+#[test]
+fn a_content_hasher_computes_each_algorithm() {
+    let mut hasher = ContentHasher::new([HashAlgorithm::Sha1, HashAlgorithm::Sha512]);
+    hasher.update(b"hello ");
+    hasher.update(b"world");
+    let digests = hasher.finalize();
+    assert_eq!(digests.len(), 2);
+    assert_eq!(hex::encode(&digests[&HashAlgorithm::Sha1]), SHA1);
+    assert_eq!(
+        digests[&HashAlgorithm::Sha512],
+        Sha512::digest(HELLO_WORLD).to_vec()
+    );
+}
+
+#[test]
+fn any_expression_of_an_algorithm_may_match() {
     let data = b"hello nativelink";
     let sri = format!(
         "{} {}",

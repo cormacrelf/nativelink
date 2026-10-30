@@ -25,8 +25,12 @@
 //!   it (Cargo, pip, Maven, Composer, ...), optionally prefixed with the
 //!   algorithm (`sha256:...`).
 //!
-//! Both parse into a [`ByteChecksum`], which a [`ChecksumVerifier`] checks
-//! incrementally as the bytes arrive.
+//! Both parse into [`ByteChecksum`]s, one per algorithm, which a
+//! [`ChecksumVerifier`] checks incrementally as the bytes arrive. A
+//! [`ContentPin`] gathers a request's checksums by algorithm, and a
+//! [`ContentHasher`] computes several algorithms' digests in one pass.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -62,7 +66,7 @@ pub const BYTE_CHECKSUM_QUALIFIERS: &[&str] = &[
 
 /// A hash algorithm a byte checksum can use, weakest first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum HashAlgorithm {
+pub enum HashAlgorithm {
     Sha1,
     Sha256,
     Sha384,
@@ -71,7 +75,8 @@ enum HashAlgorithm {
 
 impl HashAlgorithm {
     /// The algorithm's lowercase name, as used in SRI values and hex prefixes.
-    const fn name(self) -> &'static str {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Sha1 => "sha1",
             Self::Sha256 => "sha256",
@@ -123,8 +128,8 @@ impl HashAlgorithm {
 
 /// An expected digest over the raw bytes of a download: the algorithm and the
 /// digest bytes, however the request spelled them. An SRI value may give more
-/// than one digest of its strongest algorithm, any of which the bytes may
-/// match.
+/// than one digest of an algorithm, any of which the bytes may match. The
+/// digests are kept sorted, so two spellings of the same checksum are equal.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ByteChecksum {
     algorithm: HashAlgorithm,
@@ -132,29 +137,44 @@ pub struct ByteChecksum {
 }
 
 impl ByteChecksum {
-    /// Parses the value of any qualifier in [`BYTE_CHECKSUM_QUALIFIERS`].
+    /// Parses the value of any qualifier in [`BYTE_CHECKSUM_QUALIFIERS`]: one
+    /// checksum for a hex qualifier, one per algorithm for an SRI value.
     /// Returns `InvalidArgument` if the value is malformed or `qualifier` is
     /// not one of them.
-    pub fn from_qualifier(qualifier: &str, value: &str) -> Result<Self, Error> {
+    pub fn from_qualifier(qualifier: &str, value: &str) -> Result<Vec<Self>, Error> {
         if qualifier == QUALIFIER_CHECKSUM_SRI {
             return Self::from_sri(value);
         }
         let algorithm = HashAlgorithm::from_hex_qualifier(qualifier)
             .ok_or_else(|| make_input_err!("'{qualifier}' is not a checksum qualifier"))?;
-        Self::from_hex(algorithm, value).map_err(|e| e.append(format!("In '{qualifier}'")))
+        Self::from_hex(algorithm, value)
+            .map(|checksum| vec![checksum])
+            .map_err(|e| e.append(format!("In '{qualifier}'")))
+    }
+
+    /// The algorithm the digests are of.
+    #[must_use]
+    pub const fn algorithm(&self) -> HashAlgorithm {
+        self.algorithm
+    }
+
+    /// The digests the bytes may match, any one of them.
+    #[must_use]
+    pub fn expected(&self) -> &[Vec<u8>] {
+        &self.expected
     }
 
     /// Parses an SRI value: whitespace-separated hash expressions
-    /// `{algorithm}-{base64-digest}`, each optionally followed by `?options`.
-    /// As the SRI spec has it, options are ignored, as are expressions whose
-    /// algorithm is not one of `sha256`, `sha384` or `sha512`, and only the
-    /// expressions of the strongest algorithm left count: the bytes must match
-    /// one of them. Returns `InvalidArgument` if no expression has a supported
-    /// algorithm, or if one that does has a digest that is not valid base64,
-    /// even when a stronger one would be used: such a value is a mistake that
-    /// should not go unnoticed.
-    pub fn from_sri(sri_value: &str) -> Result<Self, Error> {
-        let mut strongest: Option<Self> = None;
+    /// `{algorithm}-{base64-digest}`, each optionally followed by `?options`,
+    /// into one checksum per algorithm, strongest first. Options are ignored,
+    /// as are expressions whose algorithm is not one of `sha256`, `sha384` or
+    /// `sha512`. Every algorithm left counts, not only the strongest as a
+    /// browser would have it (the SRI spec lets an implementation check the
+    /// others): the bytes must match one expression of each. Returns
+    /// `InvalidArgument` if no expression has a supported algorithm, or if
+    /// one that does has a digest that is not valid base64.
+    pub fn from_sri(sri_value: &str) -> Result<Vec<Self>, Error> {
+        let mut by_algorithm: BTreeMap<HashAlgorithm, BTreeSet<Vec<u8>>> = BTreeMap::new();
         for expression in sri_value.split_whitespace() {
             let hash = expression
                 .split_once('?')
@@ -168,24 +188,21 @@ impl ByteChecksum {
             let expected = BASE64_STANDARD.decode(expected_b64).map_err(|e| {
                 make_input_err!("Invalid base64 in SRI checksum '{sri_value}': {e}")
             })?;
-            match &mut strongest {
-                Some(current) if current.algorithm > algorithm => {}
-                Some(current) if current.algorithm == algorithm => {
-                    current.expected.push(expected);
-                }
-                _ => {
-                    strongest = Some(Self {
-                        algorithm,
-                        expected: vec![expected],
-                    });
-                }
-            }
+            by_algorithm.entry(algorithm).or_default().insert(expected);
         }
-        strongest.ok_or_else(|| {
-            make_input_err!(
+        if by_algorithm.is_empty() {
+            return Err(make_input_err!(
                 "No supported hash expression in SRI checksum '{sri_value}': expected sha256, sha384 or sha512"
-            )
-        })
+            ));
+        }
+        Ok(by_algorithm
+            .into_iter()
+            .rev()
+            .map(|(algorithm, expected)| Self {
+                algorithm,
+                expected: expected.into_iter().collect(),
+            })
+            .collect())
     }
 
     /// Parses a hex digest of `algorithm`: exactly the digest's length in
@@ -229,6 +246,26 @@ enum ByteHasher {
     Sha512(Sha512),
 }
 
+impl ByteHasher {
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Sha1(h) => Digest::update(h, data),
+            Self::Sha256(h) => Digest::update(h, data),
+            Self::Sha384(h) => Digest::update(h, data),
+            Self::Sha512(h) => Digest::update(h, data),
+        }
+    }
+
+    fn finalize(self) -> Vec<u8> {
+        match self {
+            Self::Sha1(h) => h.finalize().to_vec(),
+            Self::Sha256(h) => h.finalize().to_vec(),
+            Self::Sha384(h) => h.finalize().to_vec(),
+            Self::Sha512(h) => h.finalize().to_vec(),
+        }
+    }
+}
+
 /// Incrementally verifies a stream of bytes against a [`ByteChecksum`].
 ///
 /// This lets callers hash data as it arrives (for example while downloading a
@@ -254,12 +291,7 @@ impl ChecksumVerifier {
 
     /// Feeds an additional chunk of data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
-        match &mut self.hasher {
-            ByteHasher::Sha1(h) => Digest::update(h, data),
-            ByteHasher::Sha256(h) => Digest::update(h, data),
-            ByteHasher::Sha384(h) => Digest::update(h, data),
-            ByteHasher::Sha512(h) => Digest::update(h, data),
-        }
+        self.hasher.update(data);
     }
 
     /// Resets the hasher to its initial state, discarding any data fed so far.
@@ -313,11 +345,92 @@ pub fn verify_byte_checksums(data: &[u8], checksums: &[ByteChecksum]) -> Result<
     Ok(())
 }
 
+/// What a set of byte checksums accepts, by algorithm: for each algorithm one
+/// of them uses, the digests that every checksum of that algorithm allows.
+/// Content satisfies the pin when, for every algorithm, its digest is one of
+/// those. How the checksums were spelled (SRI or hex, in what order, with what
+/// whitespace) makes no difference to it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContentPin {
+    by_algorithm: BTreeMap<HashAlgorithm, BTreeSet<Vec<u8>>>,
+}
+
+impl ContentPin {
+    #[must_use]
+    pub fn new<'a>(checksums: impl IntoIterator<Item = &'a ByteChecksum>) -> Self {
+        let mut by_algorithm: BTreeMap<HashAlgorithm, BTreeSet<Vec<u8>>> = BTreeMap::new();
+        for checksum in checksums {
+            let expected: BTreeSet<Vec<u8>> = checksum.expected.iter().cloned().collect();
+            by_algorithm
+                .entry(checksum.algorithm)
+                .and_modify(|accepted| accepted.retain(|digest| expected.contains(digest)))
+                .or_insert(expected);
+        }
+        Self { by_algorithm }
+    }
+
+    /// Whether no checksum was given, so any content satisfies the pin.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_algorithm.is_empty()
+    }
+
+    /// Each algorithm with the digests it accepts, strongest first.
+    pub fn algorithms(&self) -> impl Iterator<Item = (HashAlgorithm, &BTreeSet<Vec<u8>>)> {
+        self.by_algorithm
+            .iter()
+            .rev()
+            .map(|(algorithm, accepted)| (*algorithm, accepted))
+    }
+
+    /// Whether `digest` is one the pin accepts for `algorithm`. False for an
+    /// algorithm the pin does not name.
+    #[must_use]
+    pub fn accepts(&self, algorithm: HashAlgorithm, digest: &[u8]) -> bool {
+        self.by_algorithm
+            .get(&algorithm)
+            .is_some_and(|accepted| accepted.contains(digest))
+    }
+}
+
+/// Computes the digests of several algorithms over one stream of bytes.
+#[derive(Debug)]
+pub struct ContentHasher {
+    hashers: Vec<(HashAlgorithm, ByteHasher)>,
+}
+
+impl ContentHasher {
+    #[must_use]
+    pub fn new(algorithms: impl IntoIterator<Item = HashAlgorithm>) -> Self {
+        Self {
+            hashers: algorithms
+                .into_iter()
+                .map(|algorithm| (algorithm, algorithm.hasher()))
+                .collect(),
+        }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        for (_, hasher) in &mut self.hashers {
+            hasher.update(data);
+        }
+    }
+
+    /// Each algorithm's digest of the bytes fed so far.
+    #[must_use]
+    pub fn finalize(self) -> BTreeMap<HashAlgorithm, Vec<u8>> {
+        self.hashers
+            .into_iter()
+            .map(|(algorithm, hasher)| (algorithm, hasher.finalize()))
+            .collect()
+    }
+}
+
 /// Verifies that `data` matches the given SRI checksum value.
 ///
 /// The `sri_value` is parsed as [`ByteChecksum::from_sri`] describes. Returns
 /// `InvalidArgument` if the value cannot be parsed and `Aborted` if the
 /// computed hash does not match the expected digest.
 pub fn verify_sri_hash(data: &[u8], sri_value: &str) -> Result<(), Error> {
-    verify_byte_checksums(data, &[ByteChecksum::from_sri(sri_value)?])
+    verify_byte_checksums(data, &ByteChecksum::from_sri(sri_value)?)
 }

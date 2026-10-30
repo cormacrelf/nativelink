@@ -218,7 +218,8 @@ so a newly supported checksum is covered without a change here.
   Nor does it depend on the URI: a pinned entry is keyed on the qualifiers
   alone, so a request that lists other mirrors, or the same ones in another
   order, finds what an earlier `Fetch` or `Push` stored. Any other qualifier
-  still counts, including `bazel.canonical_id`.
+  still counts, including `bazel.canonical_id`, which Bazel sets from the URLs
+  by default, so with Bazel a changed URL is still a miss.
 - **An unpinned entry expires.** Without a checksum the first answer for a URL
   would otherwise be served forever. The `url` fetcher reads the freshness of
   the *final* response, after any redirects, as a shared cache would (RFC 9111):
@@ -239,6 +240,35 @@ newer content than an entry holds with `oldest_content_accepted`.
 
 <SourceLink file="nativelink-fetch/src/http_cache.rs" symbol="freshness_lifetime" />
 <SourceLink file="nativelink-fetch/src/metadata_cache.rs" symbol="MetadataCache" />
+
+### Byte checksums and the cache [#fetch-byte-checksums]
+
+A request pinned by byte checksums, `checksum.sri` or a hex `checksum.sha*`,
+is stored once per hash algorithm it names, keyed on that algorithm's digest of
+the content. How the checksums are spelled does not matter: SRI or hex, in any
+order, with any whitespace, the same digests find the same entries.
+
+- **Every algorithm counts.** An SRI value naming `sha256` and `sha512` has to
+  match both, not only the strongest as a browser would check it, which the
+  SRI spec allows. Where an algorithm is given several digests the content has
+  to match one of them.
+- **A hit needs every algorithm to agree.** The lookup takes candidates from
+  the strongest algorithm and accepts one only if each other algorithm the
+  request names has an entry, under a digest it accepts, for the same CAS
+  digest. Two entries stored for different content, say one blob under its
+  SHA-1 and another under its SHA-256, never combine into a hit for a request
+  naming both; it is fetched instead, and fails if no content matches both.
+- **A push is verified.** `PushBlob` with a byte checksum reads the blob back
+  from the CAS (the instance needs `cas_store`) and is refused with
+  `INVALID_ARGUMENT` unless it matches every checksum, or `FAILED_PRECONDITION`
+  if the blob is not there. `PushDirectory` with one is refused: the checksum
+  is of an archive the push does not carry.
+
+The scheme is modelled in TLA+, and TLC checks that every hit satisfies every
+checksum of its request, with every hash function allowed to collide.
+
+<SourceLink file="nativelink-fetch/tla/PinnedAssetCache.tla" />
+<SourceLink file="nativelink-service/src/fetch_server.rs" symbol="lookup_pinned" />
 
 ### Checking a stale entry with the origin [#fetch-revalidation]
 

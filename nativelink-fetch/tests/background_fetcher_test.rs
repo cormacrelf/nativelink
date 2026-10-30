@@ -148,7 +148,7 @@ fn blob_job(uri: &str, timeout: Option<Duration>) -> FetchBlobTask {
 /// A [`blob_job`] that carries a checksum, so identical ones share a fetch.
 fn pinned_blob_job(uri: &str, timeout: Option<Duration>) -> FetchBlobTask {
     let mut job = blob_job(uri, timeout);
-    job.checksums = vec![ByteChecksum::from_qualifier("checksum.sha256", &"0".repeat(64)).unwrap()];
+    job.checksums = ByteChecksum::from_qualifier("checksum.sha256", &"0".repeat(64)).unwrap();
     assert!(job.is_pinned());
     job
 }

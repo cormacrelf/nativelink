@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use nativelink_config::cas_server::{FetchConfig, PushConfig, WithInstanceName};
 use nativelink_config::stores::{CompletenessCheckingSpec, MemorySpec, RefSpec, StoreSpec};
 use nativelink_error::Error;
@@ -36,6 +38,7 @@ use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+use nativelink_util::sri::{ContentHasher, HashAlgorithm};
 use nativelink_util::store_trait::{Store, StoreLike};
 use prost::Message;
 use tonic::{Code, Request, Status};
@@ -842,7 +845,7 @@ async fn test_fetch_finds_a_push_regardless_of_qualifier_order_and_headers() -> 
     let mut request = push_blob_request(vec!["http://1234".to_owned()], Some(digest.clone()));
     request.qualifiers = vec![
         qualifier("bazel.canonical_id", "x"),
-        qualifier("checksum.sri", "sha256-abc"),
+        qualifier("checksum.sri", &sri(HashAlgorithm::Sha256, b"hello")),
         qualifier("http_header:Authorization", "Bearer one"),
     ];
     ps.push_blob(Request::new(request)).await?;
@@ -852,7 +855,7 @@ async fn test_fetch_finds_a_push_regardless_of_qualifier_order_and_headers() -> 
             "http://1234",
             vec![
                 qualifier("http_header:Authorization", "Bearer two"),
-                qualifier("checksum.sri", "sha256-abc"),
+                qualifier("checksum.sri", &sri(HashAlgorithm::Sha256, b"hello")),
                 qualifier("bazel.canonical_id", "x"),
             ],
             0,
@@ -860,6 +863,220 @@ async fn test_fetch_finds_a_push_regardless_of_qualifier_order_and_headers() -> 
         .await?
         .into_inner();
     assert_eq!(response.blob_digest, Some(digest));
+    Ok(())
+}
+
+/// `algorithm`'s digest of `bytes`.
+fn hash_of(algorithm: HashAlgorithm, bytes: &[u8]) -> Vec<u8> {
+    let mut hasher = ContentHasher::new([algorithm]);
+    hasher.update(bytes);
+    hasher.finalize().remove(&algorithm).unwrap()
+}
+
+/// The SRI expression of `algorithm` for `bytes`.
+fn sri(algorithm: HashAlgorithm, bytes: &[u8]) -> String {
+    format!(
+        "{}-{}",
+        algorithm.name(),
+        BASE64_STANDARD.encode(hash_of(algorithm, bytes))
+    )
+}
+
+fn checksum_qualifier(algorithm: HashAlgorithm, bytes: &[u8]) -> Qualifier {
+    Qualifier {
+        name: format!("checksum.{}", algorithm.name()),
+        value: hex::encode(hash_of(algorithm, bytes)),
+    }
+}
+
+fn sri_qualifier(value: &str) -> Qualifier {
+    Qualifier {
+        name: "checksum.sri".to_owned(),
+        value: value.to_owned(),
+    }
+}
+
+/// Pushes `data`, already in the CAS, as `uri` with `qualifiers`.
+async fn push_pinned(
+    ps: &PushServer,
+    store_manager: &StoreManager,
+    uri: &str,
+    data: &[u8],
+    qualifiers: Vec<Qualifier>,
+) -> Result<Digest, Status> {
+    let digest = put_blob(store_manager, data).await;
+    let mut request = push_blob_request(vec![uri.to_owned()], Some(digest.clone()));
+    request.qualifiers = qualifiers;
+    ps.push_blob(Request::new(request)).await?;
+    Ok(digest)
+}
+
+/// A pushed blob is found by any request whose checksums it satisfies,
+/// whichever URI the request lists and however it spells them.
+#[nativelink_test]
+async fn test_a_pinned_push_is_found_from_any_uri_and_any_spelling() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let ps = make_push_server(&store_manager, false);
+    let fs = make_fetch_server(&store_manager);
+    let digest = push_pinned(
+        &ps,
+        &store_manager,
+        "http://origin/a",
+        b"hello",
+        vec![sri_qualifier(&format!(
+            "{} {}",
+            sri(HashAlgorithm::Sha256, b"hello"),
+            sri(HashAlgorithm::Sha512, b"hello")
+        ))],
+    )
+    .await?;
+
+    for qualifiers in [
+        vec![sri_qualifier(&format!(
+            "  {}\t{} ",
+            sri(HashAlgorithm::Sha512, b"hello"),
+            sri(HashAlgorithm::Sha256, b"hello")
+        ))],
+        vec![checksum_qualifier(HashAlgorithm::Sha256, b"hello")],
+        vec![
+            sri_qualifier(&sri(HashAlgorithm::Sha512, b"hello")),
+            checksum_qualifier(HashAlgorithm::Sha256, b"hello"),
+        ],
+    ] {
+        let response = fs
+            .fetch_blob(Request::new(fetch_blob_request(
+                "http://mirror/b",
+                qualifiers.clone(),
+                0,
+            )))
+            .await?
+            .into_inner();
+        assert_eq!(response.blob_digest, Some(digest.clone()), "{qualifiers:?}");
+    }
+    Ok(())
+}
+
+/// Two blobs pushed under different algorithms do not combine into a hit for
+/// a request naming both: the entries it finds must agree on the content.
+/// Whichever algorithm a lookup tried first, taking its entry would serve
+/// content that fails the other checksum.
+#[nativelink_test]
+async fn test_entries_that_disagree_on_the_content_are_a_miss() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let ps = make_push_server(&store_manager, false);
+    let fs = make_fetch_server(&store_manager);
+    push_pinned(
+        &ps,
+        &store_manager,
+        "http://origin/abc",
+        b"abc",
+        vec![checksum_qualifier(HashAlgorithm::Sha1, b"abc")],
+    )
+    .await?;
+    push_pinned(
+        &ps,
+        &store_manager,
+        "http://origin/def",
+        b"def",
+        vec![checksum_qualifier(HashAlgorithm::Sha256, b"def")],
+    )
+    .await?;
+
+    let both = vec![
+        checksum_qualifier(HashAlgorithm::Sha1, b"abc"),
+        checksum_qualifier(HashAlgorithm::Sha256, b"def"),
+    ];
+    let response = fs
+        .fetch_blob(Request::new(fetch_blob_request("http://origin/x", both, 0)))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.unwrap().code, Code::NotFound as i32);
+    assert_eq!(response.blob_digest, None);
+
+    // Once both are recorded for one content, the request hits.
+    let def = push_pinned(
+        &ps,
+        &store_manager,
+        "http://origin/def",
+        b"def",
+        vec![
+            checksum_qualifier(HashAlgorithm::Sha1, b"def"),
+            checksum_qualifier(HashAlgorithm::Sha256, b"def"),
+        ],
+    )
+    .await?;
+    let response = fs
+        .fetch_blob(Request::new(fetch_blob_request(
+            "http://origin/x",
+            vec![
+                checksum_qualifier(HashAlgorithm::Sha1, b"def"),
+                checksum_qualifier(HashAlgorithm::Sha256, b"def"),
+            ],
+            0,
+        )))
+        .await?
+        .into_inner();
+    assert_eq!(response.blob_digest, Some(def));
+    Ok(())
+}
+
+/// A push is verified against every checksum it names, and nothing is
+/// stored when one does not match.
+#[nativelink_test]
+async fn test_a_push_that_fails_a_checksum_is_rejected() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let ps = make_push_server(&store_manager, false);
+    let fs = make_fetch_server(&store_manager);
+    let qualifiers = vec![sri_qualifier(&format!(
+        "{} {}",
+        sri(HashAlgorithm::Sha512, b"hello"),
+        sri(HashAlgorithm::Sha256, b"something else")
+    ))];
+    let err = push_pinned(&ps, &store_manager, "http://origin/a", b"hello", qualifiers)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+
+    let response = fs
+        .fetch_blob(Request::new(fetch_blob_request(
+            "http://origin/a",
+            vec![sri_qualifier(&sri(HashAlgorithm::Sha512, b"hello"))],
+            0,
+        )))
+        .await?
+        .into_inner();
+    assert_eq!(response.blob_digest, None);
+    Ok(())
+}
+
+/// A pinned push of a blob that is not in the CAS cannot be verified.
+#[nativelink_test]
+async fn test_a_pinned_push_of_a_missing_blob_is_a_failed_precondition() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let ps = make_push_server(&store_manager, false);
+    let mut request = push_blob_request(
+        vec!["http://origin/a".to_owned()],
+        Some(sha256_digest_of(b"never uploaded").into()),
+    );
+    request.qualifiers = vec![checksum_qualifier(HashAlgorithm::Sha256, b"never uploaded")];
+    let err = ps.push_blob(Request::new(request)).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    Ok(())
+}
+
+/// A directory's byte checksums are of an archive a push does not carry, so
+/// a push naming them is refused rather than stored unverified.
+#[nativelink_test]
+async fn test_push_directory_with_a_byte_checksum_is_rejected() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let ps = make_push_server(&store_manager, false);
+    let (root, _, _) = put_nested_directory(&store_manager).await;
+    let mut request = push_directory_request(vec!["http://origin/a.tar".to_owned()], Some(root));
+    request
+        .qualifiers
+        .push(checksum_qualifier(HashAlgorithm::Sha256, b"the archive"));
+    let err = ps.push_directory(Request::new(request)).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
     Ok(())
 }
 

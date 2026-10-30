@@ -30,6 +30,14 @@
 //! old digest, and the entry is written again like any other: with a new
 //! `stored_at` and `expire_at`, and the validators the origin last gave.
 //!
+//! A request pinned by byte checksums has its entry written once per
+//! algorithm, under its [`crate::remote_asset_proto::RemoteAssetQuery::hash_key`]
+//! for that algorithm's digest of the content. The inner fetcher has verified
+//! the content against every checksum, so an algorithm for which the request
+//! accepts one digest has that one. One for which it accepts several is hashed
+//! from the CAS for a blob. A directory's archive is not kept, so such an
+//! algorithm gets no entry and a request naming it misses.
+//!
 //! Only the *write* lives here. The metadata *read* (cache lookup) stays in the
 //! `FetchServer`, where a hit is served verbatim from the stored entry and
 //! never has to spawn a background task.
@@ -38,19 +46,21 @@ use core::time::Duration;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use nativelink_error::{Error, ResultExt};
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
 use nativelink_proto::build::bazel::remote::execution::v2::Digest;
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::redact::redact_uri;
+use nativelink_util::sri::ContentPin;
 use nativelink_util::store_trait::Store;
 use prost_types::Timestamp;
 use tonic::async_trait;
 use tracing::debug;
 
-use crate::fetcher::{FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher};
+use crate::fetcher::{DirectoryChecksum, FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher};
 use crate::remote_asset_proto::{
-    AssetKind, RemoteAssetEntry, RemoteAssetQuery, write_remote_asset_entry,
+    AssetKind, RemoteAssetEntry, RemoteAssetQuery, hash_blob, hash_keys, pinned_hashes,
+    write_remote_asset_entry_under,
 };
 
 /// How long entries for unpinned requests (those with no checksum) stay fresh.
@@ -138,11 +148,13 @@ impl MetadataCache {
     /// `stored_at` plus the lifetime the origin's headers gave
     /// (`outcome.freshness`), within the configured limits. The expiry is
     /// recorded on `outcome` too, for the `Fetch` response.
+    #[allow(clippy::too_many_arguments)]
     async fn write(
         &self,
         kind: AssetKind,
         outcome: &mut FetchOutcome,
         qualifiers: &[(String, String)],
+        pin: &ContentPin,
         hasher_func: DigestHasherFunc,
         pinned: bool,
         started: SystemTime,
@@ -177,7 +189,28 @@ impl MetadataCache {
             references_blobs: vec![],
             references_directories: vec![],
         };
-        write_remote_asset_entry(&self.ac_store, Some(&self.cas_store), &entry)
+        let keys = if pin.is_empty() {
+            vec![entry.query.key(hasher_func)?]
+        } else {
+            let (mut hashes, unknown) = pinned_hashes(pin);
+            if !unknown.is_empty() && kind == AssetKind::Blob {
+                let computed = hash_blob(&self.cas_store, outcome.digest, unknown)
+                    .await
+                    .err_tip(|| "Hashing the fetched blob for its metadata keys")?;
+                for (algorithm, digest) in computed {
+                    if !pin.accepts(algorithm, &digest) {
+                        return Err(make_err!(
+                            Code::Internal,
+                            "The fetched blob's {} digest is not one the request accepts",
+                            algorithm.name()
+                        ));
+                    }
+                    hashes.insert(algorithm, digest);
+                }
+            }
+            hash_keys(&entry, &hashes)?
+        };
+        write_remote_asset_entry_under(&self.ac_store, Some(&self.cas_store), &entry, &keys)
             .await
             .err_tip(|| "Caching fetched asset metadata")?;
         debug!(
@@ -200,6 +233,7 @@ impl Fetcher for MetadataCache {
             AssetKind::Blob,
             &mut outcome,
             &job.qualifiers,
+            &ContentPin::new(&job.checksums),
             job.hasher_func,
             job.is_pinned(),
             started,
@@ -211,10 +245,15 @@ impl Fetcher for MetadataCache {
     async fn fetch_directory(&self, job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
         let started = SystemTime::now();
         let mut outcome = self.inner.fetch_directory(job).await?;
+        let pin = ContentPin::new(job.checksums.iter().filter_map(|checksum| match checksum {
+            DirectoryChecksum::Bytes(checksum) => Some(checksum),
+            DirectoryChecksum::Tree(_) | DirectoryChecksum::Action(_) => None,
+        }));
         self.write(
             AssetKind::Directory,
             &mut outcome,
             &job.qualifiers,
+            &pin,
             job.hasher_func,
             job.is_pinned(),
             started,
