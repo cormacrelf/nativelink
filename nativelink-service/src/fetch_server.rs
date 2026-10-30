@@ -470,7 +470,7 @@ fn rpc_wait_deadline(metadata: &MetadataMap) -> Option<TokioInstant> {
 /// deadline, and the client should retry for at least as long as the request's
 /// `timeout`.
 ///
-/// Giving up only drops this call's wait. With a `background` fetcher in the
+/// Giving up only drops this call's wait. With a `cache` fetcher in the
 /// chain the fetch carries on and a retry of the same pinned request joins it;
 /// without one the fetch is dropped along with the wait and a retry starts
 /// afresh.

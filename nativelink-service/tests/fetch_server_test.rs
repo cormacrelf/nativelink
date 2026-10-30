@@ -19,9 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nativelink_config::cas_server::{FetchConfig, WithInstanceName};
-use nativelink_config::fetchers::{
-    ActionVerifySpec, BackgroundSpec, FetcherSpec, MetadataCacheSpec, UrlFetcherSpec,
-};
+use nativelink_config::fetchers::{ActionVerifySpec, CacheSpec, FetcherSpec, UrlFetcherSpec};
 use nativelink_config::stores::{CompletenessCheckingSpec, MemorySpec, RefSpec, StoreSpec};
 use nativelink_error::{Code as ErrorCode, Error, make_err};
 use nativelink_fetch::fetcher::Fetcher;
@@ -463,11 +461,14 @@ fn make_fetch_server_with_options(
     .expect("failed to build url fetcher");
     fetchers.insert("URL".to_string(), url);
 
-    let cached = fetcher_factory(
-        &FetcherSpec::MetadataCache(MetadataCacheSpec {
+    let cache = fetcher_factory(
+        &FetcherSpec::Cache(CacheSpec {
+            fetcher: String::from("URL"),
             fetch_store: String::from("test_fetch_store"),
             cas_store: String::from("test_cas_store"),
-            fetcher: String::from("URL"),
+            max_concurrent_fetches: None,
+            min_timeout_s,
+            max_timeout_s,
             unpinned_default_ttl_s: default_ttl_s,
             unpinned_min_ttl_s: min_ttl_s,
             unpinned_max_ttl_s: max_ttl_s,
@@ -476,22 +477,8 @@ fn make_fetch_server_with_options(
         &schedulers,
         &fetchers,
     )
-    .expect("failed to build metadata cache fetcher");
-    fetchers.insert("CACHED".to_string(), cached);
-
-    let background = fetcher_factory(
-        &FetcherSpec::Background(BackgroundSpec {
-            fetcher: String::from("CACHED"),
-            max_concurrent_fetches: None,
-            min_timeout_s,
-            max_timeout_s,
-        }),
-        store_manager,
-        &schedulers,
-        &fetchers,
-    )
-    .expect("failed to build background fetcher");
-    fetchers.insert("FETCH".to_string(), background);
+    .expect("failed to build cache fetcher");
+    fetchers.insert("FETCH".to_string(), cache);
 
     FetchServer::new(
         &[WithInstanceName {
