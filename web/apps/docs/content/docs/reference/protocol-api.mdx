@@ -211,6 +211,10 @@ so a newly supported checksum is covered without a change here.
 
 - **A pinned entry never expires.** The content has to match the checksum, so it
   cannot legitimately change, and the origin's caching headers are ignored.
+  Nor does it depend on the URI: a pinned entry is keyed on the qualifiers
+  alone, so a request that lists other mirrors, or the same ones in another
+  order, finds what an earlier `Fetch` or `Push` stored. Any other qualifier
+  still counts, including `bazel.canonical_id`.
 - **An unpinned entry expires.** Without a checksum the first answer for a URL
   would otherwise be served forever. The `url` fetcher reads the freshness of
   the *final* response, after any redirects, as a shared cache would (RFC 9111):
