@@ -345,8 +345,9 @@ async fn current_hash_entry(
 /// hash keys are digests of. For a blob that is the blob, under `digest`. For
 /// a directory it is the archive it was expanded from, under
 /// `archive_digest`; its `Directory` is not enough, since different archives
-/// expand to the same one. A directory entry without an archive digest
-/// (written before it was recorded) is for no content anything else is for.
+/// expand to the same one. Every directory entry under a hash key has one,
+/// since PushDirectory with a byte checksum is rejected; one without is for
+/// no content anything else is for.
 fn same_content(a: &RemoteAssetEntry, b: &RemoteAssetEntry) -> bool {
     let (a, b) = match a.query.kind {
         AssetKind::Blob => (Some(&a.digest), Some(&b.digest)),

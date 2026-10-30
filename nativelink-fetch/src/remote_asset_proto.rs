@@ -218,8 +218,9 @@ pub struct RemoteAssetMetadata {
     /// bytes under `digest_function`: the content the byte checksums in the
     /// entry's hash keys are of. Two directory entries are for the same
     /// content when these agree, not when their `Directory`s do, which
-    /// different archives can share. Entries written before this field
-    /// existed, and pushed directories, decode with it unset.
+    /// different archives can share. Unset for a blob, whose `digest` already
+    /// is that, and for a pushed directory, which is never under a hash key:
+    /// PushDirectory with a byte checksum is rejected.
     #[prost(message, optional, tag = "8")]
     pub archive_digest: Option<Digest>,
 }
