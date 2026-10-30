@@ -29,7 +29,7 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nativelink_error::{Error, make_input_err};
+use nativelink_error::{Code, Error, make_input_err};
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
@@ -484,6 +484,20 @@ impl Hash for FetchDirectoryJob {
     }
 }
 
+/// `uris[indices]`, in that order.
+fn select_uris(uris: &[String], indices: &[usize]) -> Vec<String> {
+    indices.iter().map(|&idx| uris[idx].clone()).collect()
+}
+
+/// The stale answers among `revalidate` for one of `uris`.
+fn select_revalidations(revalidate: &[Revalidation], uris: &[String]) -> Vec<Revalidation> {
+    revalidate
+        .iter()
+        .filter(|stale| uris.contains(&stale.uri))
+        .cloned()
+        .collect()
+}
+
 impl FetchBlobTask {
     /// Whether the request is pinned: it carries a checksum, so the content it
     /// can accept is fixed and a cached answer can never go out of date. An
@@ -491,6 +505,20 @@ impl FetchBlobTask {
     #[must_use]
     pub const fn is_pinned(&self) -> bool {
         !self.checksums.is_empty()
+    }
+
+    /// The job for `uris[indices]` alone, in that order, with `timeout`: the
+    /// headers and stale answers of those URIs come with them.
+    #[must_use]
+    pub fn select(&self, indices: &[usize], timeout: Option<Duration>) -> Self {
+        let uris = select_uris(&self.uris, indices);
+        Self {
+            headers: self.headers.select(indices),
+            revalidate: select_revalidations(&self.revalidate, &uris),
+            uris,
+            timeout,
+            ..self.clone()
+        }
     }
 }
 
@@ -502,6 +530,39 @@ impl FetchDirectoryJob {
     pub const fn is_pinned(&self) -> bool {
         !self.checksums.is_empty()
     }
+
+    /// As [`FetchBlobTask::select`].
+    #[must_use]
+    pub fn select(&self, indices: &[usize], timeout: Option<Duration>) -> Self {
+        let uris = select_uris(&self.uris, indices);
+        Self {
+            headers: self.headers.select(indices),
+            revalidate: select_revalidations(&self.revalidate, &uris),
+            uris,
+            timeout,
+            ..self.clone()
+        }
+    }
+}
+
+/// Whether a fetch of some of a job's URIs failing with `code` leaves its
+/// other URIs worth trying: the codes a fetcher reports when the URIs it was
+/// given could not produce the asset (not found, unreachable, refused,
+/// mismatched, too large, unverifiable). Anything else, such as a bad request
+/// (`InvalidArgument`), a broken checker or CAS (`Internal`) or a spent budget
+/// (`DeadlineExceeded`), would fail the other URIs the same way, so it ends
+/// the job.
+#[must_use]
+pub const fn fails_only_these_uris(code: Code) -> bool {
+    matches!(
+        code,
+        Code::NotFound
+            | Code::Unavailable
+            | Code::PermissionDenied
+            | Code::Aborted
+            | Code::ResourceExhausted
+            | Code::FailedPrecondition
+    )
 }
 
 /// The result of a successful fetch.

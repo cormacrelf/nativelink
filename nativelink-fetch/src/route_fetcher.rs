@@ -64,7 +64,9 @@ use tokio::time::Instant;
 use tonic::async_trait;
 use tracing::debug;
 
-use crate::fetcher::{FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher};
+use crate::fetcher::{
+    FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher, fails_only_these_uris,
+};
 
 /// A host a route matches: one host name or IP address exactly, or, written
 /// `*.example.com`, every subdomain of `example.com` (but not `example.com`
@@ -503,24 +505,6 @@ impl RouteFetcher {
     }
 }
 
-/// Whether a group failing with `code` leaves the other groups worth trying:
-/// the codes a fetcher reports when the URIs it was given could not produce
-/// the asset (not found, unreachable, refused, mismatched, too large,
-/// unverifiable). Anything else, such as a bad request (`InvalidArgument`), a
-/// broken checker or CAS (`Internal`) or a spent budget (`DeadlineExceeded`),
-/// would fail the other groups the same way, so it is returned at once.
-const fn fails_only_these_uris(code: Code) -> bool {
-    matches!(
-        code,
-        Code::NotFound
-            | Code::Unavailable
-            | Code::PermissionDenied
-            | Code::Aborted
-            | Code::ResourceExhausted
-            | Code::FailedPrecondition
-    )
-}
-
 /// Hosts for an error message: `'a', 'b'`.
 struct HostList<'a>(&'a [String]);
 
@@ -548,11 +532,6 @@ trait RoutedJob: Send + Sync {
     ) -> BoxFuture<'a, Result<FetchOutcome, Error>>;
 }
 
-/// `uris[indices]`, in that order.
-fn select_uris(uris: &[String], indices: &[usize]) -> Vec<String> {
-    indices.iter().map(|&idx| uris[idx].clone()).collect()
-}
-
 impl RoutedJob for FetchBlobTask {
     fn uris(&self) -> &[String] {
         &self.uris
@@ -563,19 +542,7 @@ impl RoutedJob for FetchBlobTask {
     }
 
     fn select(&self, indices: &[usize], timeout: Option<Duration>) -> Self {
-        let uris = select_uris(&self.uris, indices);
-        Self {
-            headers: self.headers.select(indices),
-            revalidate: self
-                .revalidate
-                .iter()
-                .filter(|stale| uris.contains(&stale.uri))
-                .cloned()
-                .collect(),
-            uris,
-            timeout,
-            ..self.clone()
-        }
+        Self::select(self, indices, timeout)
     }
 
     fn fetch_with<'a>(
@@ -596,19 +563,7 @@ impl RoutedJob for FetchDirectoryJob {
     }
 
     fn select(&self, indices: &[usize], timeout: Option<Duration>) -> Self {
-        let uris = select_uris(&self.uris, indices);
-        Self {
-            headers: self.headers.select(indices),
-            revalidate: self
-                .revalidate
-                .iter()
-                .filter(|stale| uris.contains(&stale.uri))
-                .cloned()
-                .collect(),
-            uris,
-            timeout,
-            ..self.clone()
-        }
+        Self::select(self, indices, timeout)
     }
 
     fn fetch_with<'a>(

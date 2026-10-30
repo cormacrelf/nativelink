@@ -22,10 +22,14 @@
 //! running each inner fetch in a detached task that owns a
 //! [`tokio::sync::watch`] sender; callers merely *subscribe* to the result. If
 //! a client gives up on its RPC the subscriber is dropped, but the detached
-//! task -- and the watch sender it owns -- keeps running to completion. A
-//! concurrent or subsequent identical pinned request (one that carries a
-//! checksum) finds the in-flight entry and subscribes to the same task instead
-//! of starting a new download. An unpinned request always runs its own fetch.
+//! task -- and the watch sender it owns -- keeps running to completion.
+//!
+//! A pinned request (one that carries a checksum) runs one such task per URI,
+//! in turn, and a concurrent or subsequent pinned request that reaches the
+//! same URI with the same qualifiers and headers finds the in-flight entry and
+//! subscribes to that task instead of starting a new download. Requests that
+//! list different mirrors of one asset so share the mirrors they have in
+//! common. An unpinned request always runs its own fetch, whole.
 //!
 //! A request's `timeout` is, in the API's words, "the timeout for the
 //! underlying fetch, if content needs to be retrieved from origin". It bounds
@@ -47,6 +51,7 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use nativelink_config::fetchers::DEFAULT_MAX_CONCURRENT_FETCHES;
 use nativelink_error::{Error, make_err};
 use nativelink_util::background_spawn;
@@ -54,8 +59,11 @@ use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Instant;
 use tonic::{Code, async_trait};
+use tracing::debug;
 
-use crate::fetcher::{FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher, SharedDeadline};
+use crate::fetcher::{
+    FetchBlobTask, FetchDirectoryJob, FetchOutcome, Fetcher, SharedDeadline, fails_only_these_uris,
+};
 
 /// Where one fetch is. Once `Done`, every current and future subscriber
 /// observes the same `Arc`-wrapped result.
@@ -221,8 +229,10 @@ where
 }
 
 /// Awaits a [`SharedResult`] for a request with `timeout` and unwraps it into
-/// an owned result. `None` when the fetch was abandoned while queued for a
-/// slot, so the caller should schedule it again.
+/// an owned result, with how long the request waited on it once it was
+/// running: the part of the wait that counts against its timeout. `None` when
+/// the fetch was abandoned while queued for a slot, so the caller should
+/// schedule it again.
 ///
 /// The request lengthens the shared deadline to its own `timeout`, and gives up
 /// with `DeadlineExceeded` once that has passed with the retrieval still under
@@ -230,7 +240,7 @@ where
 async fn await_shared(
     mut rx: SharedResult,
     timeout: Option<Duration>,
-) -> Option<Result<FetchOutcome, Error>> {
+) -> Option<(Result<FetchOutcome, Error>, Duration)> {
     let started = rx
         .wait_for(|state| !matches!(state, FetchState::Queued))
         .await
@@ -238,11 +248,12 @@ async fn await_shared(
         .ok();
     let deadline = match started.unwrap_or_else(|| rx.borrow().clone()) {
         FetchState::Queued => return None,
-        FetchState::Done(value) => return Some(unwrap_shared(&value)),
+        FetchState::Done(value) => return Some((unwrap_shared(&value), Duration::ZERO)),
         FetchState::Running(deadline) => deadline,
     };
     deadline.extend(timeout);
-    let own_deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+    let running_since = Instant::now();
+    let own_deadline = timeout.and_then(|timeout| running_since.checked_add(timeout));
     let done = async {
         let done = rx
             .wait_for(|state| matches!(state, FetchState::Done(_)))
@@ -256,14 +267,15 @@ async fn await_shared(
             )),
         }
     };
-    Some(tokio::select! {
+    let result = tokio::select! {
         result = done => result,
         () = deadline.outlived(own_deadline) => Err(make_err!(
             Code::DeadlineExceeded,
             "The fetch did not finish within the request's timeout; it continues for an \
              identical request that allowed longer"
         )),
-    })
+    };
+    Some((result, running_since.elapsed()))
 }
 
 fn unwrap_shared(value: &Result<FetchOutcome, Error>) -> Result<FetchOutcome, Error> {
@@ -273,55 +285,165 @@ fn unwrap_shared(value: &Result<FetchOutcome, Error>) -> Result<FetchOutcome, Er
     }
 }
 
-#[async_trait]
-impl Fetcher for BackgroundFetcher {
-    async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
-        let mut job = job.clone();
-        job.timeout = self.clamp(job.timeout);
+/// What [`BackgroundFetcher`] needs of a job, so that blobs and directories
+/// share one implementation.
+trait Job: Clone + Eq + Hash + Send + Sync + 'static {
+    fn uris(&self) -> &[String];
+    fn timeout(&self) -> Option<Duration>;
+    fn is_pinned(&self) -> bool;
+    fn select(&self, indices: &[usize], timeout: Option<Duration>) -> Self;
+    fn in_flight(fetcher: &BackgroundFetcher) -> &Arc<Mutex<HashMap<Self, SharedResult>>>;
+    /// Runs the job on `inner`, under `deadline`.
+    fn run(
+        self,
+        inner: Arc<dyn Fetcher>,
+        deadline: SharedDeadline,
+    ) -> BoxFuture<'static, Result<FetchOutcome, Error>>;
+}
+
+impl Job for FetchBlobTask {
+    fn uris(&self) -> &[String] {
+        &self.uris
+    }
+
+    fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    fn is_pinned(&self) -> bool {
+        Self::is_pinned(self)
+    }
+
+    fn select(&self, indices: &[usize], timeout: Option<Duration>) -> Self {
+        Self::select(self, indices, timeout)
+    }
+
+    fn in_flight(fetcher: &BackgroundFetcher) -> &Arc<Mutex<HashMap<Self, SharedResult>>> {
+        &fetcher.blob_in_flight
+    }
+
+    fn run(
+        mut self,
+        inner: Arc<dyn Fetcher>,
+        deadline: SharedDeadline,
+    ) -> BoxFuture<'static, Result<FetchOutcome, Error>> {
+        Box::pin(async move {
+            self.shared_deadline = Some(deadline);
+            inner.fetch_blob(&self).await
+        })
+    }
+}
+
+impl Job for FetchDirectoryJob {
+    fn uris(&self) -> &[String] {
+        &self.uris
+    }
+
+    fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    fn is_pinned(&self) -> bool {
+        Self::is_pinned(self)
+    }
+
+    fn select(&self, indices: &[usize], timeout: Option<Duration>) -> Self {
+        Self::select(self, indices, timeout)
+    }
+
+    fn in_flight(fetcher: &BackgroundFetcher) -> &Arc<Mutex<HashMap<Self, SharedResult>>> {
+        &fetcher.dir_in_flight
+    }
+
+    fn run(
+        mut self,
+        inner: Arc<dyn Fetcher>,
+        deadline: SharedDeadline,
+    ) -> BoxFuture<'static, Result<FetchOutcome, Error>> {
+        Box::pin(async move {
+            self.shared_deadline = Some(deadline);
+            inner.fetch_directory(&self).await
+        })
+    }
+}
+
+impl BackgroundFetcher {
+    /// Fetches `job`. A pinned job is fetched one URI at a time, each as a
+    /// fetch of its own that an identical pinned request for that URI joins,
+    /// so requests that list different mirrors of one asset share the
+    /// download of the mirrors they have in common. The URIs are tried in
+    /// order until one succeeds, or one fails in a way the rest would too (see
+    /// [`fails_only_these_uris`]), and the job's timeout covers them all.
+    ///
+    /// An unpinned job joins nothing, so it is run whole.
+    async fn fetch<J: Job>(&self, job: &J) -> Result<FetchOutcome, Error> {
+        let timeout = self.clamp(job.timeout());
+        if !job.is_pinned() || job.uris().len() <= 1 {
+            let all: Vec<usize> = (0..job.uris().len()).collect();
+            return self.run(job.select(&all, timeout)).await.0;
+        }
+        let mut spent = Duration::ZERO;
+        let mut last_err = None;
+        for idx in 0..job.uris().len() {
+            let left = match timeout {
+                Some(timeout) => {
+                    let left = timeout.saturating_sub(spent);
+                    if left.is_zero() {
+                        last_err = Some(make_err!(
+                            Code::DeadlineExceeded,
+                            "The fetch ran out of time before every URI was tried"
+                        ));
+                        break;
+                    }
+                    Some(left)
+                }
+                None => None,
+            };
+            let (result, waited) = self.run(job.select(&[idx], left)).await;
+            spent += waited;
+            match result {
+                Ok(outcome) => return Ok(outcome),
+                Err(err) if fails_only_these_uris(err.code) => {
+                    debug!(idx, code = ?err.code, "Fetch of one URI failed, trying the next");
+                    last_err = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_err.expect("there are several URIs, and each failed"))
+    }
+
+    /// Runs `job`, or joins an identical pinned one, and waits for it. Returns
+    /// the result and how long of the wait counts against the job's timeout.
+    async fn run<J: Job>(&self, job: J) -> (Result<FetchOutcome, Error>, Duration) {
         loop {
             let inner = self.inner.clone();
-            let mut run_job = job.clone();
+            let run_job = job.clone();
             let rx = schedule_or_join(
-                &self.blob_in_flight,
+                J::in_flight(self),
                 self.permits.as_ref(),
                 job.clone(),
                 // An unpinned request accepts only what the origin serves now, so it
                 // must not take the result of a fetch that started before it.
                 job.is_pinned(),
-                job.timeout,
-                move |deadline| async move {
-                    run_job.shared_deadline = Some(deadline);
-                    inner.fetch_blob(&run_job).await
-                },
+                job.timeout(),
+                move |deadline| run_job.run(inner, deadline),
             )
             .await;
-            if let Some(result) = await_shared(rx, job.timeout).await {
-                return result;
+            if let Some(done) = await_shared(rx, job.timeout()).await {
+                return done;
             }
         }
     }
+}
+
+#[async_trait]
+impl Fetcher for BackgroundFetcher {
+    async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
+        self.fetch(job).await
+    }
 
     async fn fetch_directory(&self, job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
-        let mut job = job.clone();
-        job.timeout = self.clamp(job.timeout);
-        loop {
-            let inner = self.inner.clone();
-            let mut run_job = job.clone();
-            let rx = schedule_or_join(
-                &self.dir_in_flight,
-                self.permits.as_ref(),
-                job.clone(),
-                job.is_pinned(),
-                job.timeout,
-                move |deadline| async move {
-                    run_job.shared_deadline = Some(deadline);
-                    inner.fetch_directory(&run_job).await
-                },
-            )
-            .await;
-            if let Some(result) = await_shared(rx, job.timeout).await {
-                return result;
-            }
-        }
+        self.fetch(job).await
     }
 }
