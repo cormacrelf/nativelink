@@ -151,7 +151,7 @@ fill it.
 
 ## Remote Asset `Fetch` behaviour [#remote-asset-fetch]
 
-These are the behaviours of the `url` fetcher and the `metadata_cache` decorator
+These are the behaviours of the `url` fetcher and the `cache` fetcher
 behind the `Fetch` service that the Remote Asset protocol leaves to the server.
 
 ### Redirects [#fetch-redirects]
@@ -169,7 +169,7 @@ are never offered to another host. Any other header you set is forwarded.
 ### Timeouts [#fetch-timeouts]
 
 A request's `timeout` bounds the retrieval from the origin: every URI attempt,
-the download, checksum verification and the CAS upload. A `background` fetcher
+the download, checksum verification and the CAS upload. A `cache` fetcher
 clamps it to `min_timeout_s` and `max_timeout_s`, and the `url` fetcher's
 `max_fetch_duration_s` (one hour by default) caps it, and bounds a request
 with no timeout too. Running out reports `DEADLINE_EXCEEDED` in the response
@@ -177,9 +177,9 @@ with no timeout too. Running out reports `DEADLINE_EXCEEDED` in the response
 malformed one fails the call with `INVALID_ARGUMENT`.
 
 The timeout does not bound the RPC. When the RPC deadline comes first the call
-fails with a `DEADLINE_EXCEEDED` RPC error, and a fetch run by a `background`
+fails with a `DEADLINE_EXCEEDED` RPC error, and a fetch run by a `cache`
 fetcher carries on; retrying the same pinned request joins it. Nor does it count
-time spent waiting for one of the `background` fetcher's
+time spent waiting for one of the `cache` fetcher's
 `max_concurrent_fetches` slots, which retrieves nothing: only the RPC deadline
 bounds that wait, and a client that goes away while waiting leaves no work
 behind.
@@ -225,7 +225,7 @@ so a newly supported checksum is covered without a change here.
   to the origin.
 
 The three fields are on the
-[`metadata_cache` fetcher](/reference/nativelink-config/main#metadatacachespec),
+[`cache` fetcher](/reference/nativelink-config/main#cachespec),
 defaulting to one day, five minutes and 30 days. A client can always ask for
 newer content than an entry holds with `oldest_content_accepted`.
 
@@ -242,7 +242,7 @@ down the fetcher chain, and the `url` fetcher sends the request with
 
 - **`304 Not Modified`**: nothing is downloaded. The fetcher checks that the
   stored blob, or for a directory the whole tree and every file in it, is still
-  in the CAS, and if so answers with the old digest. The `metadata_cache`
+  in the CAS, and if so answers with the old digest. The `cache`
   fetcher stores the entry again with a new `stored_at` and an `expire_at`
   taken from the `304`'s own caching headers, so it is fresh again. If the
   content has left the CAS the request is repeated without the conditional headers

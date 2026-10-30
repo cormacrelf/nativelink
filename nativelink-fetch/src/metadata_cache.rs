@@ -16,8 +16,9 @@
 //! Remote Asset metadata (the URI+qualifiers -> digest mapping) into an Action
 //! Cache store on success, as described in [`crate::remote_asset_proto`].
 //!
-//! It is placed *inside* [`crate::background_fetcher::BackgroundFetcher`] in the
-//! chain (`Background(MetadataCache(Url))`) so that the metadata write runs in
+//! The `cache` fetcher config builds it *inside* a
+//! [`crate::background_fetcher::BackgroundFetcher`]
+//! (`Background(MetadataCache(inner))`) so that the metadata write runs in
 //! the same detached, deduplicated unit of work as the download and CAS upload.
 //! That way the write survives a client abandoning its RPC -- without this, a
 //! backgrounded fetch could land the blob in the CAS while the URI->digest
@@ -55,7 +56,7 @@ use crate::remote_asset_proto::{
 /// How long entries for unpinned requests (those with no checksum) stay fresh.
 /// Entries for pinned requests never expire. Built from the
 /// `unpinned_*_ttl_s` fields of
-/// [`MetadataCacheSpec`](nativelink_config::fetchers::MetadataCacheSpec).
+/// [`CacheSpec`](nativelink_config::fetchers::CacheSpec).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetadataCacheOptions {
     /// Lifetime when the origin's headers say nothing.

@@ -38,24 +38,23 @@ pub const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 4_000_000;
 /// Default for [`UrlFetcherSpec::max_archive_uncompressed_bytes`]: 1 TiB.
 pub const DEFAULT_MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
-/// Default for [`BackgroundSpec::max_concurrent_fetches`].
+/// Default for [`CacheSpec::max_concurrent_fetches`].
 pub const DEFAULT_MAX_CONCURRENT_FETCHES: usize = 64;
 
 /// Name of a fetcher. Used to reference a fetcher defined in the
 /// `CasConfig::fetchers` list, either from a `FetchConfig` or from another
-/// fetcher that wraps it (e.g. `Background` wrapping `Url`).
+/// fetcher that wraps it (e.g. `Cache` wrapping `Url`).
 pub type FetcherRefName = String;
 
-/// A composable fetcher. Fetchers form a chain via name references: a leaf
-/// [`FetcherSpec::Url`] does the real HTTP work, and decorators
-/// ([`FetcherSpec::MetadataCache`], [`FetcherSpec::Background`],
-/// [`FetcherSpec::ActionVerify`]) wrap an inner fetcher referenced by name. A
-/// production config typically composes `Background -> MetadataCache -> Url`
-/// so that the metadata write happens inside the background unit of work that
-/// joins identical fetches. `ActionVerify`, when used, goes between
-/// `MetadataCache` and `Url`, so that a directory failing verification is
-/// never recorded. `Route`, when used, also goes inside `MetadataCache`, and
-/// picks between `Url` fetchers (or whole chains) by host, port and path.
+/// A composable fetcher. Fetchers form a chain via name references. A `Fetch`
+/// service names a [`FetcherSpec::Cache`], which runs the rest of the chain in
+/// the background and records what it fetches. Below it, the fetchers that
+/// get content: [`FetcherSpec::Url`] downloads over HTTP,
+/// [`FetcherSpec::Static`] serves content written in the config,
+/// [`FetcherSpec::Route`] picks between fetchers by host, port and path, and
+/// [`FetcherSpec::ActionVerify`] verifies the directory a fetcher below it
+/// fetched. `ActionVerify` goes below `Cache`, so that a directory failing
+/// verification is never recorded.
 ///
 /// Referenced fetchers must be defined earlier in the `fetchers` list than the
 /// fetchers that reference them.
@@ -65,11 +64,9 @@ pub type FetcherRefName = String;
 pub enum FetcherSpec {
     /// Downloads content over HTTP or HTTPS and uploads it to a CAS store.
     Url(UrlFetcherSpec),
-    /// Writes fetched-asset metadata into an Action Cache store on success.
-    MetadataCache(MetadataCacheSpec),
-    /// Joins identical in-flight pinned fetches and keeps fetches running past
-    /// a client's RPC deadline.
-    Background(BackgroundSpec),
+    /// Runs a fetcher in the background, joining identical in-flight pinned
+    /// fetches, and records what it fetches in an Action Cache store.
+    Cache(CacheSpec),
     /// Verifies fetched directories by running the action a request names in
     /// its `checksum.action_digest` qualifier.
     ActionVerify(ActionVerifySpec),
@@ -193,9 +190,9 @@ pub struct UrlFetcherSpec {
     ///
     /// A request's own `timeout` can only shorten this. The effective budget is
     /// the smaller of the request's `timeout` (after any `min_timeout_s` and
-    /// `max_timeout_s` clamp of a `background` fetcher) and this value, so a
+    /// `max_timeout_s` clamp of a `cache` fetcher) and this value, so a
     /// request with a larger `timeout`, or none at all, is still capped, and a
-    /// slow origin cannot hold a fetch (or a `background` fetcher's concurrency
+    /// slow origin cannot hold a fetch (or a `cache` fetcher's concurrency
     /// slot) forever. It applies whether or not a client is still waiting for
     /// the result.
     ///
@@ -296,26 +293,40 @@ pub struct UrlFetcherSpec {
     pub require_checksum: bool,
 }
 
-/// Default for [`MetadataCacheSpec::unpinned_default_ttl_s`]: one day.
+/// Default for [`CacheSpec::unpinned_default_ttl_s`]: one day.
 const fn default_unpinned_default_ttl_s() -> u64 {
     24 * 60 * 60
 }
 
-/// Default for [`MetadataCacheSpec::unpinned_min_ttl_s`]: five minutes.
+/// Default for [`CacheSpec::unpinned_min_ttl_s`]: five minutes.
 const fn default_unpinned_min_ttl_s() -> u64 {
     5 * 60
 }
 
-/// Default for [`MetadataCacheSpec::unpinned_max_ttl_s`]: 30 days.
+/// Default for [`CacheSpec::unpinned_max_ttl_s`]: 30 days.
 const fn default_unpinned_max_ttl_s() -> u64 {
     30 * 24 * 60 * 60
 }
 
-/// A decorator that caches fetched-asset metadata.
+/// The fetcher a `Fetch` service names: it runs the fetcher below it in the
+/// background and records what that fetcher fetches, so that the next `Fetch`
+/// for the same asset is answered without downloading it again.
 ///
-/// An entry for a *pinned* request, one with any checksum qualifier
-/// (`checksum.sri`, `checksum.sha256`, `checksum.action_digest`, a tree
-/// checksum such as `checksum.nar` or `checksum.git_tree`, ...), never
+/// Background: identical pinned requests (ones that carry a checksum) share
+/// one fetch; an unpinned request always runs its own, since it accepts only
+/// what the origin serves now. A fetch keeps running after its client gives up,
+/// so a retry of a pinned request joins it, or finds it recorded. A shared
+/// fetch runs until the latest of its requests' timeouts (after
+/// `min_timeout_s` and `max_timeout_s`), each counted from when its request
+/// started or joined the fetch, so a request with a short timeout does not cut
+/// it short for one with a longer timeout. Each request still gets
+/// `DEADLINE_EXCEEDED` once its own timeout has passed with the download under
+/// way. Time spent waiting for one of `max_concurrent_fetches` does not count
+/// against a timeout; only the RPC deadline bounds it.
+///
+/// Recording: an entry for a *pinned* request, one with any checksum
+/// qualifier (`checksum.sri`, `checksum.sha256`, `checksum.action_digest`, a
+/// tree checksum such as `checksum.nar` or `checksum.git_tree`, ...), never
 /// expires: its content cannot legitimately change. An entry for an
 /// *unpinned* request, one with no checksum, takes whatever the origin served,
 /// which can change, so it expires. Its lifetime is what the origin's HTTP
@@ -335,7 +346,12 @@ const fn default_unpinned_max_ttl_s() -> u64 {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
-pub struct MetadataCacheSpec {
+pub struct CacheSpec {
+    /// The fetcher (from the `fetchers` list) that does the fetching: a
+    /// `url`, `static`, `route` or `action_verify`.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub fetcher: FetcherRefName,
+
     /// The Action Cache store (from the `stores` map) the fetched asset's
     /// URI+qualifiers -> digest mapping is written to, as an `ActionResult`.
     /// For lookups to hit, this should be the same store named by the
@@ -346,14 +362,43 @@ pub struct MetadataCacheSpec {
     pub fetch_store: StoreRefName,
 
     /// The CAS store (from the `stores` map) the fetched content lives in; the
-    /// `cas_store` of the inner `url` fetcher. For a directory it is read to
-    /// build the `Tree` stored with the metadata.
+    /// `cas_store` of the fetchers below this one. For a directory it is read
+    /// to build the `Tree` stored with the metadata.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub cas_store: StoreRefName,
 
-    /// The inner fetcher (from the `fetchers` list) this decorates.
-    #[serde(deserialize_with = "convert_string_with_shellexpand")]
-    pub fetcher: FetcherRefName,
+    /// Maximum number of fetches running at once. A request that would start
+    /// another waits for a slot, and stops waiting if its client goes away;
+    /// only a fetch that has a slot carries on in the background. Set it to 0
+    /// for no limit.
+    ///
+    /// Default: 64
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub max_concurrent_fetches: Option<usize>,
+
+    /// Lower bound (in seconds) applied to a request's `timeout`, the total
+    /// time budget for the whole fetch, before it is passed to `fetcher`.
+    /// Only applies when the request sets a timeout; a request without one
+    /// stays without one, and is then bounded only by the URL fetcher's
+    /// `max_fetch_duration_s`. When unset, no lower bound is enforced.
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub min_timeout_s: Option<u64>,
+
+    /// Upper bound (in seconds) applied to a request's `timeout`, the total
+    /// time budget for the whole fetch, before it is passed to `fetcher`.
+    /// Only applies when the request sets a timeout. When unset, no upper
+    /// bound is enforced (the URL fetcher's `max_fetch_duration_s` still is).
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub max_timeout_s: Option<u64>,
 
     /// Seconds an unpinned entry stays fresh when the origin's response says
     /// nothing about caching (no `Cache-Control` freshness directive and no
@@ -390,61 +435,6 @@ pub struct MetadataCacheSpec {
         deserialize_with = "convert_numeric_with_shellexpand"
     )]
     pub unpinned_max_ttl_s: u64,
-}
-
-/// A decorator providing in-flight deduplication and background continuation.
-///
-/// Identical pinned requests (ones that carry a checksum) share one fetch; an
-/// unpinned request always runs its own, since it accepts only what the origin
-/// serves now. A shared fetch runs until the latest of its requests' timeouts
-/// (after `min_timeout_s` and `max_timeout_s`), each counted from when its
-/// request started or joined the fetch, so a request with a short timeout does
-/// not cut it short for one with a longer timeout. Each request still gets
-/// `DEADLINE_EXCEEDED` once its own timeout has passed with the download under
-/// way. Time spent waiting for one of `max_concurrent_fetches` does not count
-/// against a timeout; only the RPC deadline bounds it.
-#[derive(Deserialize, Serialize, Debug, Clone)]
-#[serde(deny_unknown_fields)]
-#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
-pub struct BackgroundSpec {
-    /// The inner fetcher (from the `fetchers` list) this decorates.
-    #[serde(deserialize_with = "convert_string_with_shellexpand")]
-    pub fetcher: FetcherRefName,
-
-    /// Maximum number of inner fetches running at once. A request that would
-    /// start another waits for a slot, and stops waiting if its client goes
-    /// away; only a fetch that has a slot carries on in the background. Set it
-    /// to 0 for no limit.
-    ///
-    /// Default: 64
-    #[serde(
-        default,
-        deserialize_with = "convert_optional_numeric_with_shellexpand"
-    )]
-    pub max_concurrent_fetches: Option<usize>,
-
-    /// Lower bound (in seconds) applied to a request's `timeout`, the total
-    /// time budget for the whole fetch, before it is passed to the inner
-    /// fetcher. Only applies when the request sets a timeout; a request
-    /// without one stays without one, and is then bounded only by the URL
-    /// fetcher's `max_fetch_duration_s`. When unset, no lower bound is
-    /// enforced.
-    #[serde(
-        default,
-        deserialize_with = "convert_optional_numeric_with_shellexpand"
-    )]
-    pub min_timeout_s: Option<u64>,
-
-    /// Upper bound (in seconds) applied to a request's `timeout`, the total
-    /// time budget for the whole fetch, before it is passed to the inner
-    /// fetcher. Only applies when the request sets a timeout. When unset, no
-    /// upper bound is enforced (the URL fetcher's `max_fetch_duration_s` still
-    /// is).
-    #[serde(
-        default,
-        deserialize_with = "convert_optional_numeric_with_shellexpand"
-    )]
-    pub max_timeout_s: Option<u64>,
 }
 
 /// A decorator that verifies a fetched directory by running an action against
