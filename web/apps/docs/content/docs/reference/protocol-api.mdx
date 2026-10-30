@@ -209,7 +209,10 @@ covered without a change here.
 
 - **A pinned fetch is recorded, and never expires.** The content has to match
   the checksum, so it cannot legitimately change, and the origin's caching
-  headers are ignored.
+  headers are ignored. Nor does the entry depend on the URI: a pinned entry is
+  keyed on the qualifiers alone, so a request that lists other mirrors, or the
+  same ones in another order, finds what an earlier `Fetch` or `Push` stored.
+  Any other qualifier still counts, including `bazel.canonical_id`.
 - **An unpinned fetch is not recorded.** Without a checksum the request accepts
   whatever the origin serves now, so a saved answer could only ever be older
   than what it asked for. Bazel says as much: with no checksum it sets

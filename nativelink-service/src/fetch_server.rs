@@ -265,6 +265,18 @@ async fn lookup_entry(
     Some(entry)
 }
 
+/// The `uri` of a response served from a cached entry: the URI the content was
+/// stored under if the request lists it, else the request's first. A pinned
+/// entry is found whichever mirrors the request lists, and a response names a
+/// URI from the request.
+fn hit_uri(stored: String, uris: &[String]) -> String {
+    if uris.contains(&stored) {
+        stored
+    } else {
+        uris.first().cloned().unwrap_or(stored)
+    }
+}
+
 /// Returns the value of the qualifier named `name`, if present.
 fn find_qualifier<'a>(qualifiers: &'a [Qualifier], name: &str) -> Option<&'a str> {
     qualifiers
@@ -470,6 +482,7 @@ impl FetchServer {
         for uri in &request.uris {
             let query =
                 RemoteAssetQuery::new(AssetKind::Blob, uri.clone(), request.qualifiers.clone());
+            let pinned = query.is_pinned();
             let entry = lookup_entry(
                 &store_info.store,
                 &query,
@@ -498,12 +511,17 @@ impl FetchServer {
                         message: "Fetch object found".to_owned(),
                         details: vec![],
                     }),
-                    uri: entry.query.uri,
+                    uri: hit_uri(entry.query.uri, &request.uris),
                     qualifiers: response_qualifiers(&entry.query.qualifiers),
                     expires_at: entry.expire_at,
                     blob_digest: Some(entry.digest),
                     digest_function: entry.digest_function,
                 }));
+            }
+            // A pinned asset's key does not depend on the URI, so one lookup
+            // has covered them all.
+            if pinned {
+                break;
             }
         }
 

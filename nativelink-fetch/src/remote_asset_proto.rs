@@ -24,10 +24,13 @@
 //! * **Key**: the digest of `Action { command_digest: digest(Command) }`, hashed
 //!   with the request's digest function. The `Command` is
 //!   `["nativelink-remote-asset", "blob", "<uri>"]` with the qualifiers
-//!   (sorted, HTTP header qualifiers excluded) as environment variables.
-//!   Neither the `Action` nor the `Command` is uploaded to the CAS: an Action
-//!   Cache entry does not need them. A push made with one digest function is
-//!   not found by a fetch asking for another.
+//!   (sorted, HTTP header qualifiers excluded) as environment variables. For
+//!   a pinned asset, one with a `checksum.*` qualifier, the `<uri>` is left
+//!   out: the checksum names the content wherever it came from, so a request
+//!   listing other mirrors finds the same entry. Neither the `Action` nor the
+//!   `Command` is uploaded to the CAS: an Action Cache entry does not need
+//!   them. A push made with one digest function is not found by a fetch
+//!   asking for another.
 //! * **Value**: an `ActionResult` with the content as the `OutputFile` `out`.
 //!   `execution_metadata` carries the times (`worker_start_timestamp` is when
 //!   the content was retrieved or pushed) and a [`RemoteAssetMetadata`] in
@@ -57,6 +60,10 @@ use prost_types::{Any, Timestamp};
 /// example the same URL fetched under different repository rules). It is part
 /// of the asset's identity.
 pub const QUALIFIER_BAZEL_CANONICAL_ID: &str = "bazel.canonical_id";
+/// Prefix of every checksum qualifier (`checksum.sri`, `checksum.sha256`,
+/// ...). A qualifier with it pins an asset: see
+/// [`RemoteAssetQuery::is_pinned`].
+pub const QUALIFIER_CHECKSUM_PREFIX: &str = "checksum.";
 /// Prefix of a qualifier carrying an HTTP header sent to every URI:
 /// `http_header:<name>`.
 pub const QUALIFIER_HTTP_HEADER_PREFIX: &str = "http_header:";
@@ -167,18 +174,38 @@ impl RemoteAssetQuery {
         }
     }
 
+    /// Whether the asset is pinned: a qualifier names a checksum, so what it
+    /// can be is fixed whichever URI serves it. Decided by the qualifier
+    /// names alone, not by parsing them, so that a push and a later fetch
+    /// with the same qualifiers agree on the key even when a value does not
+    /// parse.
+    #[must_use]
+    pub fn is_pinned(&self) -> bool {
+        self.qualifiers
+            .iter()
+            .any(|qualifier| qualifier.name.starts_with(QUALIFIER_CHECKSUM_PREFIX))
+    }
+
     /// The Action Cache key of this asset: the digest of its synthetic `Action`,
     /// computed with `hasher_func`. Qualifiers are sorted by `(name, value)`
     /// first so the key does not depend on the order the client sent them in.
+    /// A pinned asset's key leaves out the URI, so every URI of a request
+    /// shares it. The other qualifiers stay in, including
+    /// `bazel.canonical_id`, which Bazel changes precisely so that a cached
+    /// answer is not reused.
     pub fn key(&self, hasher_func: DigestHasherFunc) -> Result<DigestInfo, Error> {
         let mut sorted: Vec<&Qualifier> = self.qualifiers.iter().collect();
         sorted.sort_by(|a, b| (&a.name, &a.value).cmp(&(&b.name, &b.value)));
+        let mut arguments = vec![
+            REMOTE_ASSET_WORKER.to_owned(),
+            self.kind.as_str().to_owned(),
+        ];
+        // Two arguments rather than three, so no URI can produce this key.
+        if !self.is_pinned() {
+            arguments.push(self.uri.clone());
+        }
         let command = Command {
-            arguments: vec![
-                REMOTE_ASSET_WORKER.to_owned(),
-                self.kind.as_str().to_owned(),
-                self.uri.clone(),
-            ],
+            arguments,
             environment_variables: sorted
                 .into_iter()
                 .map(|qualifier| EnvironmentVariable {
