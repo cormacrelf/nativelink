@@ -3026,6 +3026,86 @@ async fn test_fetch_blob_pushed_asset_with_unsupported_qualifier_is_a_hit() -> R
     Ok(())
 }
 
+/// A pinned asset is keyed on its checksum, not its URI: a request that lists
+/// a different mirror finds what an earlier fetch stored, and downloads
+/// nothing. The response names a URI from the request.
+#[nativelink_test]
+async fn test_fetch_blob_pinned_hit_from_another_mirror() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (first, first_requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+    let (mirror, mirror_requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+    let qualifiers = vec![header_qualifier("checksum.sri", HELLO_WORLD_SRI)];
+
+    let response = fs
+        .fetch_blob(blob_request(vec![first.clone()], qualifiers.clone()))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(first_requests.lock().len(), 1);
+
+    let response = fs
+        .fetch_blob(blob_request(vec![mirror.clone()], qualifiers.clone()))
+        .await?
+        .into_inner();
+    assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    assert_eq!(
+        response.blob_digest.map(|digest| digest.hash),
+        Some(HELLO_WORLD_SHA256_HEX.to_owned())
+    );
+    assert_eq!(response.uri, mirror);
+    assert!(
+        mirror_requests.lock().is_empty(),
+        "the mirror should not be asked"
+    );
+    Ok(())
+}
+
+/// Without a checksum the URI is part of the key: another URI may serve other
+/// content, so it is downloaded from.
+#[nativelink_test]
+async fn test_fetch_blob_unpinned_other_uri_is_a_miss() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (first, _) = serve_recording(HELLO_WORLD.to_vec()).await;
+    let (other, other_requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+
+    for uri in [first, other] {
+        let response = fs
+            .fetch_blob(blob_request(vec![uri], vec![]))
+            .await?
+            .into_inner();
+        assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    }
+    assert_eq!(other_requests.lock().len(), 1);
+    Ok(())
+}
+
+/// The other qualifiers stay in a pinned key. Bazel changes
+/// `bazel.canonical_id` exactly so that a cached answer is not reused.
+#[nativelink_test]
+async fn test_fetch_blob_pinned_other_canonical_id_is_a_miss() -> Result<(), Status> {
+    let store_manager = make_store_manager().await?;
+    let fs = make_fetch_server_with_cas(&store_manager);
+    let (uri, requests) = serve_recording(HELLO_WORLD.to_vec()).await;
+
+    for canonical_id in ["one", "two"] {
+        let response = fs
+            .fetch_blob(blob_request(
+                vec![uri.clone()],
+                vec![
+                    header_qualifier("checksum.sri", HELLO_WORLD_SRI),
+                    header_qualifier("bazel.canonical_id", canonical_id),
+                ],
+            ))
+            .await?
+            .into_inner();
+        assert_eq!(response.status.as_ref().map(|s| s.code), Some(0));
+    }
+    assert_eq!(requests.lock().len(), 2);
+    Ok(())
+}
+
 /// Without a fetcher nothing is downloaded, so there is nothing to reject: an
 /// unsupported qualifier on a miss is just a miss.
 #[nativelink_test]
