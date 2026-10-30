@@ -885,6 +885,10 @@ async fn round_trip(
         AssetKind::Blob => sha256_digest_of(b"a").into(),
         AssetKind::Directory => root.into(),
     };
+    let archive_digest: Option<Digest> = match kind {
+        AssetKind::Blob => None,
+        AssetKind::Directory => Some(sha256_digest_of(b"the archive").into()),
+    };
     let query = RemoteAssetQuery::new(kind, "http://example/asset".to_string(), proto_qualifiers());
     write_remote_asset_entry(
         &ac_store,
@@ -898,6 +902,7 @@ async fn round_trip(
             tree_digest: None,
             etag: None,
             last_modified: None,
+            archive_digest: archive_digest.clone(),
             references_blobs: references_blobs.clone(),
             references_directories: references_directories.clone(),
         },
@@ -912,6 +917,7 @@ async fn round_trip(
         .expect("entry should be readable");
     assert_eq!(entry.digest, digest);
     assert_eq!(entry.tree_digest.is_some(), kind == AssetKind::Directory);
+    assert_eq!(entry.archive_digest, archive_digest);
     assert_eq!(entry.references_blobs, references_blobs);
     assert_eq!(entry.references_directories, references_directories);
     (action_result, entry)

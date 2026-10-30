@@ -1328,12 +1328,12 @@ fn hex_checksum_qualifiers(data: &[u8]) -> (Qualifier, Qualifier) {
 
 /// `nativelink-fetch/tla/PinnedAssetCache.tla` with `Injective = FALSE`: a
 /// directory's byte checksums are of the archive, and two archives can
-/// unpack to the same directory. An entry per algorithm then says only that
-/// *an* archive with that digest unpacked to this directory, and a lookup
-/// that finds every algorithm agreeing on the directory has not found one
-/// archive with every digest. Here the sha256 of one archive and the sha512
-/// of another, which no archive has, hit the directory they share, where a
-/// download of the same request fails verification.
+/// unpack to the same directory. An entry per algorithm says only that *an*
+/// archive with that digest unpacked to this directory, so a lookup that
+/// took every algorithm agreeing on the directory as a hit would serve the
+/// sha256 of one archive with the sha512 of another, which no archive has,
+/// where a download of the same request fails verification. The lookup
+/// compares the entries' archive digests instead, and misses.
 #[nativelink_test]
 async fn test_fetch_directory_pinned_hit_needs_one_archive_with_every_checksum()
 -> Result<(), Status> {
@@ -2408,6 +2408,7 @@ async fn write_entry(
             tree_digest: None,
             etag: None,
             last_modified: None,
+            archive_digest: None,
             references_blobs: vec![],
             references_directories: vec![],
         },

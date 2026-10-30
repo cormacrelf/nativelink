@@ -250,7 +250,12 @@ enum FetchAttempt {
     /// directory it was expanded into the CAS. Carries the CAS digest (of the
     /// blob, or of the root `Directory`) and what the final response's headers
     /// said about it.
-    Verified(DigestInfo, ResponseMeta),
+    Verified {
+        digest: DigestInfo,
+        /// For a directory, the digest of the archive it was expanded from.
+        archive_digest: Option<DigestInfo>,
+        meta: ResponseMeta,
+    },
     /// The origin answered a conditional request with `304 Not Modified`: the
     /// content offered by a [`Revalidation`] is still current. Nothing was
     /// downloaded.
@@ -404,7 +409,11 @@ async fn stream_uri_to_file(
         return FetchAttempt::DownloadFailed(err);
     }
 
-    FetchAttempt::Verified(digest, meta)
+    FetchAttempt::Verified {
+        digest,
+        archive_digest: None,
+        meta,
+    }
 }
 
 /// The outcome of a revalidation that found `stale` still current. The `304`
@@ -796,6 +805,9 @@ impl UrlFetcher {
     ) -> FetchAttempt {
         let max_size_bytes = self.max_size_bytes;
         reset_verifiers(verifiers);
+        // The archive's own digest, recorded with the entry: it is what the
+        // byte checksums are of, and the archive is not kept.
+        let mut archive_hasher = options.hasher_func.hasher();
 
         let conditional = req.conditional;
         let response = match send_awaiting_headers(req.builder, uri).await {
@@ -834,6 +846,7 @@ impl UrlFetcher {
                     for verifier in verifiers.iter_mut() {
                         verifier.update(chunk.as_ref());
                     }
+                    archive_hasher.update(chunk.as_ref());
                     Ok(chunk)
                 }
                 Err(err) => {
@@ -878,7 +891,11 @@ impl UrlFetcher {
             return FetchAttempt::ChecksumMismatch(err);
         }
         match tree_hashes.finish(&tree.listing).await {
-            Ok(()) => FetchAttempt::Verified(tree.root_digest, meta),
+            Ok(()) => FetchAttempt::Verified {
+                digest: tree.root_digest,
+                archive_digest: Some(archive_hasher.finalize_digest()),
+                meta,
+            },
             Err(TreeHashFailure::Mismatch(err)) => FetchAttempt::ChecksumMismatch(err),
             Err(TreeHashFailure::Unverifiable(err)) => FetchAttempt::Unverifiable(err),
             Err(TreeHashFailure::Failed(err)) => {
@@ -1039,7 +1056,7 @@ impl UrlFetcher {
                     );
                     last_err = Some(err);
                 }
-                FetchAttempt::Verified(digest, meta) => {
+                FetchAttempt::Verified { digest, meta, .. } => {
                     self.cas_store
                         .update_with_whole_file(
                             digest,
@@ -1138,8 +1155,13 @@ impl UrlFetcher {
                         redact_uri(uri)
                     ));
                 }
-                FetchAttempt::Verified(digest, meta) => {
+                FetchAttempt::Verified {
+                    digest,
+                    archive_digest,
+                    meta,
+                } => {
                     return Ok(FetchOutcome {
+                        archive_digest,
                         freshness: meta.freshness,
                         validators: meta.validators,
                         ..FetchOutcome::new(uri.clone(), digest)

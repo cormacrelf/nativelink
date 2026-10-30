@@ -573,6 +573,11 @@ pub struct FetchOutcome {
     /// CAS digest of the fetched blob, or of the root `Directory` for a
     /// directory fetch.
     pub digest: DigestInfo,
+    /// For a directory, the digest (under the request's digest function) of
+    /// the archive bytes it was expanded from: what the byte checksums were
+    /// taken over. The archive is not kept, so this is its identity in the
+    /// metadata cache. `None` for a blob, whose `digest` already is that.
+    pub archive_digest: Option<DigestInfo>,
     /// How long the origin said the content stays fresh, from the headers of
     /// the final response (see [`crate::http_cache::freshness_lifetime`]).
     /// `None` when the headers said nothing; `Some(Duration::ZERO)` when they
@@ -600,6 +605,7 @@ impl FetchOutcome {
         Self {
             uri,
             digest,
+            archive_digest: None,
             freshness: None,
             expire_at: None,
             validators: Validators {

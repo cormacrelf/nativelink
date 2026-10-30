@@ -341,10 +341,19 @@ async fn current_hash_entry(
     .then_some(entry)
 }
 
-/// Whether two entries' digests name the same content in the CAS.
-fn same_content(a: &Digest, b: &Digest) -> bool {
-    match (DigestInfo::try_from(a), DigestInfo::try_from(b)) {
-        (Ok(a), Ok(b)) => a == b,
+/// Whether two entries of one kind are for the same content: the bytes their
+/// hash keys are digests of. For a blob that is the blob, under `digest`. For
+/// a directory it is the archive it was expanded from, under
+/// `archive_digest`; its `Directory` is not enough, since different archives
+/// expand to the same one. A directory entry without an archive digest
+/// (written before it was recorded) is for no content anything else is for.
+fn same_content(a: &RemoteAssetEntry, b: &RemoteAssetEntry) -> bool {
+    let (a, b) = match a.query.kind {
+        AssetKind::Blob => (Some(&a.digest), Some(&b.digest)),
+        AssetKind::Directory => (a.archive_digest.as_ref(), b.archive_digest.as_ref()),
+    };
+    match (a.map(DigestInfo::try_from), b.map(DigestInfo::try_from)) {
+        (Some(Ok(a)), Some(Ok(b))) => a == b,
         _ => false,
     }
 }
@@ -394,7 +403,7 @@ async fn lookup_pinned(
                     now,
                 )
                 .await;
-                if entry.is_some_and(|entry| same_content(&entry.digest, &candidate.digest)) {
+                if entry.is_some_and(|entry| same_content(&entry, &candidate)) {
                     agrees = true;
                     break;
                 }

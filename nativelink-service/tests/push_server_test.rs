@@ -317,6 +317,7 @@ async fn test_push_blob() -> Result<(), Status> {
             root_directory_digest: None,
             etag: String::new(),
             last_modified: String::new(),
+            archive_digest: None,
         }
     );
     Ok(())

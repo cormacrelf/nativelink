@@ -186,6 +186,7 @@ impl MetadataCache {
             // Validators only matter to an entry that can go stale.
             etag: outcome.validators.etag.clone().filter(|_| !pinned),
             last_modified: outcome.validators.last_modified.clone().filter(|_| !pinned),
+            archive_digest: outcome.archive_digest.map(Into::into),
             references_blobs: vec![],
             references_directories: vec![],
         };

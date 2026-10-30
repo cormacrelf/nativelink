@@ -180,6 +180,7 @@ impl PushServer {
                 tree_digest: None,
                 etag: None,
                 last_modified: None,
+                archive_digest: None,
                 references_blobs,
                 references_directories,
             };
@@ -206,6 +207,7 @@ impl PushServer {
                 tree_digest: None,
                 etag: None,
                 last_modified: None,
+                archive_digest: None,
                 references_blobs: references_blobs.clone(),
                 references_directories: references_directories.clone(),
             };
@@ -282,6 +284,7 @@ impl PushServer {
                 tree_digest: None,
                 etag: None,
                 last_modified: None,
+                archive_digest: None,
                 references_blobs: references_blobs.clone(),
                 references_directories: references_directories.clone(),
             };

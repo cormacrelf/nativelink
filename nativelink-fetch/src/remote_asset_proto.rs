@@ -40,8 +40,12 @@
 //!   at. A lookup hits only when every algorithm the request names has an
 //!   entry under one of the digests it accepts and all of them point at the
 //!   same content, so how the request spells its checksums, and which
-//!   algorithm is looked up first, cannot change the answer. This is the
-//!   scheme `nativelink-fetch/tla/PinnedAssetCache.tla` models and checks.
+//!   algorithm is looked up first, cannot change the answer. The content is
+//!   the bytes the checksums are of: the blob, or for a directory the
+//!   archive it was expanded from, whose digest the entry records as
+//!   `archive_digest` (different archives expand to the same `Directory`,
+//!   so the `Directory` digest would not do). This is the scheme
+//!   `nativelink-fetch/tla/PinnedAssetCache.tla` models and checks.
 //! * **Value**: an `ActionResult` with the content as output `out`: an
 //!   `OutputFile` for a blob, or an `OutputDirectory` whose `tree_digest` is a
 //!   `Tree` uploaded to the CAS for a directory. `execution_metadata` carries
@@ -209,6 +213,15 @@ pub struct RemoteAssetMetadata {
     /// had none. Sent back as `If-Modified-Since` to revalidate the entry.
     #[prost(string, tag = "7")]
     pub last_modified: String,
+
+    /// For a directory fetched from an archive, the digest of the archive
+    /// bytes under `digest_function`: the content the byte checksums in the
+    /// entry's hash keys are of. Two directory entries are for the same
+    /// content when these agree, not when their `Directory`s do, which
+    /// different archives can share. Entries written before this field
+    /// existed, and pushed directories, decode with it unset.
+    #[prost(message, optional, tag = "8")]
+    pub archive_digest: Option<Digest>,
 }
 
 /// The identity of an asset: its kind, URI and qualifiers. HTTP header
@@ -353,6 +366,9 @@ pub struct RemoteAssetEntry {
     pub etag: Option<String>,
     /// The `Last-Modified` the origin gave the content, if any.
     pub last_modified: Option<String>,
+    /// For a directory expanded from an archive, the digest of the archive
+    /// bytes; see [`RemoteAssetMetadata::archive_digest`]. `None` for a blob.
+    pub archive_digest: Option<Digest>,
     /// A Push's `references_blobs`: blobs that must outlive the entry. Stored
     /// as given, so they should be in their parsed (lowercase) form.
     pub references_blobs: Vec<Digest>,
@@ -527,6 +543,7 @@ pub async fn write_remote_asset_entry_under(
         root_directory_digest,
         etag: entry.etag.clone().unwrap_or_default(),
         last_modified: entry.last_modified.clone().unwrap_or_default(),
+        archive_digest: entry.archive_digest.clone(),
     };
     let action_result = ActionResult {
         output_files,
@@ -688,6 +705,7 @@ fn entry_from_action_result(
         tree_digest,
         etag: Some(metadata.etag).filter(|etag| !etag.is_empty()),
         last_modified: Some(metadata.last_modified).filter(|value| !value.is_empty()),
+        archive_digest: metadata.archive_digest,
         references_blobs,
         references_directories,
     })
