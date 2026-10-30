@@ -25,8 +25,8 @@ use nativelink_error::Error;
 use nativelink_fetch::fetcher::Fetcher;
 use nativelink_fetch::fetcher_factory::fetcher_factory;
 use nativelink_fetch::remote_asset_proto::{
-    AssetKind, RemoteAssetEntry, RemoteAssetMetadata, RemoteAssetQuery, now_timestamp,
-    write_remote_asset_entry,
+    AssetKind, RemoteAssetEntry, RemoteAssetMetadata, RemoteAssetQuery, byte_checksums,
+    now_timestamp, write_remote_asset_entry,
 };
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::asset::v1::fetch_server::Fetch;
@@ -43,6 +43,7 @@ use nativelink_store::store_manager::StoreManager;
 use nativelink_util::background_spawn;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
+use nativelink_util::sri::ContentPin;
 use nativelink_util::store_trait::StoreLike;
 use parking_lot::Mutex;
 use prost::Message;
@@ -382,6 +383,7 @@ fn make_fetch_server_with_clamps(
         &FetcherSpec::Cache(CacheSpec {
             fetcher: String::from("URL"),
             fetch_store: String::from("test_fetch_store"),
+            cas_store: String::from("test_cas_store"),
             max_concurrent_fetches: None,
             min_timeout_s,
             max_timeout_s,
@@ -805,11 +807,23 @@ async fn test_fetch_blob_headers_do_not_affect_cache_key_or_get_persisted() -> R
     assert_eq!(requests.lock().len(), 1);
 
     // The stored metadata holds no header qualifiers (often credentials).
-    assert!(
-        second
-            .qualifiers
-            .iter()
-            .all(|qualifier| !qualifier.name.starts_with("http_header")),
+    let checksum = vec![header_qualifier("checksum.sri", HELLO_WORLD_SRI)];
+    let action_result =
+        stored_action_result(&store_manager, AssetKind::Blob, &uri, checksum.clone()).await;
+    let metadata = RemoteAssetMetadata::decode(
+        action_result.execution_metadata.unwrap().auxiliary_metadata[0]
+            .value
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(metadata.qualifiers, checksum);
+    // Nor does the hit echo a header's value: only its name.
+    assert_eq!(
+        second.qualifiers,
+        vec![
+            header_qualifier("checksum.sri", HELLO_WORLD_SRI),
+            header_qualifier("http_header:Authorization", "<REDACTED>"),
+        ]
     );
     Ok(())
 }
@@ -1250,16 +1264,27 @@ async fn test_fetch_blob_missing_from_cas_is_refetched() -> Result<(), Status> {
     Ok(())
 }
 
-/// Decodes the `ActionResult` stored in `test_ac_store` for an asset.
+/// Decodes the `ActionResult` stored in `test_ac_store` for an asset: under
+/// its URI, or for one pinned by byte checksums, under the hash key of its
+/// strongest algorithm.
 async fn stored_action_result(
     store_manager: &StoreManager,
     kind: AssetKind,
     uri: &str,
     qualifiers: Vec<Qualifier>,
 ) -> ActionResult {
-    let key = RemoteAssetQuery::new(kind, uri.to_owned(), qualifiers)
-        .key(DigestHasherFunc::Sha256)
-        .unwrap();
+    let pin = ContentPin::new(&byte_checksums(&qualifiers).unwrap());
+    let query = RemoteAssetQuery::new(kind, uri.to_owned(), qualifiers);
+    let key = match pin.algorithms().next() {
+        Some((algorithm, digests)) => query
+            .hash_key(
+                algorithm,
+                digests.first().unwrap(),
+                DigestHasherFunc::Sha256,
+            )
+            .unwrap(),
+        None => query.key(DigestHasherFunc::Sha256).unwrap(),
+    };
     let raw = store_manager
         .get_store("test_ac_store")
         .unwrap()

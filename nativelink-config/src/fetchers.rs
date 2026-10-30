@@ -270,6 +270,12 @@ pub struct CacheSpec {
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub fetch_store: StoreRefName,
 
+    /// The CAS store (from the `stores` map) the fetched content lives in; the
+    /// `cas_store` of the fetchers below this one. It is read to hash a fetched
+    /// blob under each algorithm its checksums name.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub cas_store: StoreRefName,
+
     /// Maximum number of fetches running at once. A request that would start
     /// another waits for a slot, and stops waiting if its client goes away;
     /// only a fetch that has a slot carries on in the background. Set it to 0

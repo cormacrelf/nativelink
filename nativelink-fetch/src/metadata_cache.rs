@@ -30,6 +30,13 @@
 //! takes whatever the origin serves now, so its answer is never reused: it is
 //! returned to the caller and not written down.
 //!
+//! A request pinned by byte checksums has its entry written once per
+//! algorithm, under its [`crate::remote_asset_proto::RemoteAssetQuery::hash_key`]
+//! for that algorithm's digest of the content. The inner fetcher has verified
+//! the content against every checksum, so an algorithm for which the request
+//! accepts one digest has that one. One for which it accepts several is hashed
+//! from the CAS.
+//!
 //! Only the *write* lives here. The metadata *read* (cache lookup) stays in the
 //! `FetchServer`, where a hit is served verbatim from the stored entry and
 //! never has to spawn a background task.
@@ -37,11 +44,12 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use nativelink_error::{Error, ResultExt};
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_proto::build::bazel::remote::asset::v1::Qualifier;
 use nativelink_proto::build::bazel::remote::execution::v2::Digest;
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::redact::redact_uri;
+use nativelink_util::sri::ContentPin;
 use nativelink_util::store_trait::Store;
 use prost_types::Timestamp;
 use tonic::async_trait;
@@ -49,7 +57,8 @@ use tracing::debug;
 
 use crate::fetcher::{FetchBlobTask, FetchOutcome, Fetcher};
 use crate::remote_asset_proto::{
-    AssetKind, RemoteAssetEntry, RemoteAssetQuery, write_remote_asset_entry,
+    AssetKind, RemoteAssetEntry, RemoteAssetQuery, hash_blob, hash_keys, pinned_hashes,
+    write_remote_asset_entry_under,
 };
 
 /// A [`Fetcher`] decorator that records the metadata of pinned fetches on
@@ -60,12 +69,19 @@ pub struct MetadataCache {
     /// The Action Cache store the metadata is written to, as an `ActionResult`
     /// (see [`crate::remote_asset_proto`]).
     ac_store: Store,
+    /// The CAS the fetched content lives in, read to hash a fetched blob under
+    /// the algorithms its checksums name.
+    cas_store: Store,
 }
 
 impl MetadataCache {
     /// Wraps `inner`, writing the metadata of pinned fetches into `ac_store`.
-    pub fn new(inner: Arc<dyn Fetcher>, ac_store: Store) -> Arc<Self> {
-        Arc::new(Self { inner, ac_store })
+    pub fn new(inner: Arc<dyn Fetcher>, ac_store: Store, cas_store: Store) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            ac_store,
+            cas_store,
+        })
     }
 
     /// Writes the metadata for a successful pinned fetch. The hash-function
@@ -77,6 +93,7 @@ impl MetadataCache {
         kind: AssetKind,
         outcome: &FetchOutcome,
         qualifiers: &[(String, String)],
+        pin: &ContentPin,
         hasher_func: DigestHasherFunc,
         started: SystemTime,
     ) -> Result<(), Error> {
@@ -98,7 +115,28 @@ impl MetadataCache {
             digest_function: hasher_func.proto_digest_func().into(),
             references_blobs: vec![],
         };
-        write_remote_asset_entry(&self.ac_store, &entry)
+        let keys = if pin.is_empty() {
+            vec![entry.query.key(hasher_func)?]
+        } else {
+            let (mut hashes, unknown) = pinned_hashes(pin);
+            if !unknown.is_empty() {
+                let computed = hash_blob(&self.cas_store, outcome.digest, unknown)
+                    .await
+                    .err_tip(|| "Hashing the fetched blob for its metadata keys")?;
+                for (algorithm, digest) in computed {
+                    if !pin.accepts(algorithm, &digest) {
+                        return Err(make_err!(
+                            Code::Internal,
+                            "The fetched blob's {} digest is not one the request accepts",
+                            algorithm.name()
+                        ));
+                    }
+                    hashes.insert(algorithm, digest);
+                }
+            }
+            hash_keys(&entry, &hashes)?
+        };
+        write_remote_asset_entry_under(&self.ac_store, &entry, &keys)
             .await
             .err_tip(|| "Caching fetched asset metadata")?;
         debug!(
@@ -121,6 +159,7 @@ impl Fetcher for MetadataCache {
                 AssetKind::Blob,
                 &outcome,
                 &job.qualifiers,
+                &ContentPin::new(&job.checksums),
                 job.hasher_func,
                 started,
             )

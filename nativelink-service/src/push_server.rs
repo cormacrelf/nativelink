@@ -18,8 +18,9 @@ use std::collections::HashMap;
 use nativelink_config::cas_server::{PushConfig, WithInstanceName};
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_fetch::remote_asset_proto::{
-    AssetKind, RemoteAssetEntry, RemoteAssetQuery, now_timestamp, qualifier_names, redacted_uris,
-    write_remote_asset_entry,
+    AssetKind, RemoteAssetEntry, RemoteAssetQuery, byte_checksums, hash_blob, hash_keys,
+    now_timestamp, qualifier_names, redacted_uris, write_remote_asset_entry,
+    write_remote_asset_entry_under,
 };
 use nativelink_proto::build::bazel::remote::asset::v1::push_server::{Push, PushServer as Server};
 use nativelink_proto::build::bazel::remote::asset::v1::{
@@ -30,6 +31,7 @@ use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::make_ctx_for_hash_func;
 use nativelink_util::redact::redact_uri;
+use nativelink_util::sri::ContentPin;
 use nativelink_util::store_trait::Store;
 use opentelemetry::context::FutureExt;
 use tonic::{Request, Response, Status};
@@ -52,6 +54,9 @@ fn parse_references(references: &[Digest], field: &str) -> Result<Vec<Digest>, E
 pub struct PushStoreInfo {
     /// The Action Cache store the metadata is written to.
     store: Store,
+    /// The CAS the pushed content lives in, used to verify a blob against its
+    /// checksums. `PushBlob` with a byte checksum is unavailable without it.
+    cas_store: Option<Store>,
     read_only: bool,
 }
 
@@ -70,10 +75,20 @@ impl PushServer {
             let store = store_manager.get_store(&config.push_store).ok_or_else(|| {
                 make_input_err!("'push_store': '{}' does not exist", config.push_store)
             })?;
+            let cas_store = config
+                .cas_store
+                .as_ref()
+                .map(|name| {
+                    store_manager
+                        .get_store(name)
+                        .ok_or_else(|| make_input_err!("'cas_store': '{name}' does not exist"))
+                })
+                .transpose()?;
             stores.insert(
                 config.instance_name.clone(),
                 PushStoreInfo {
                     store,
+                    cas_store,
                     read_only: config.read_only,
                 },
             );
@@ -121,6 +136,53 @@ impl PushServer {
         // entry once any of them has left the CAS.
         let references_blobs = parse_references(&request.references_blobs, "references_blobs")?;
         let stored_at = now_timestamp();
+        let pin = ContentPin::new(&byte_checksums(&request.qualifiers)?);
+        if !pin.is_empty() {
+            // Pinned by byte checksums: verified against the blob, then stored
+            // once per algorithm, under keys that every URI shares.
+            let cas_store = store_info.cas_store.as_ref().ok_or_else(|| {
+                make_err!(
+                    Code::FailedPrecondition,
+                    "PushBlob with a checksum qualifier needs 'cas_store' configured for '{instance_name}'",
+                )
+            })?;
+            let digest =
+                DigestInfo::try_from(&blob_digest).err_tip(|| "Invalid blob digest in push")?;
+            let hashes = hash_blob(cas_store, digest, pin.algorithms().map(|(a, _)| a))
+                .await
+                .map_err(|err| {
+                    let code = if err.code == Code::NotFound {
+                        Code::FailedPrecondition
+                    } else {
+                        err.code
+                    };
+                    Error { code, ..err }
+                        .append("The pushed blob must be in the CAS to verify its checksums")
+                })?;
+            for (algorithm, digest) in &hashes {
+                if !pin.accepts(*algorithm, digest) {
+                    return Err(make_input_err!(
+                        "The pushed blob does not match its checksum qualifiers: its {} digest is not one they accept",
+                        algorithm.name(),
+                    ));
+                }
+            }
+            let uri = request.uris.first().cloned().unwrap_or_default();
+            let entry = RemoteAssetEntry {
+                query: RemoteAssetQuery::new(AssetKind::Blob, uri.clone(), request.qualifiers),
+                digest: digest.into(),
+                expire_at: request.expire_at,
+                stored_at: Some(stored_at),
+                digest_function: request.digest_function,
+                references_blobs,
+            };
+            let keys = hash_keys(&entry, &hashes)?;
+            write_remote_asset_entry_under(&store_info.store, &entry, &keys)
+                .await
+                .err_tip(|| "Failed to update in push server")?;
+            info!(uri = %redact_uri(&uri), "Pushed pinned asset metadata");
+            return Ok(Response::new(PushBlobResponse {}));
+        }
         for uri in request.uris {
             // Header qualifiers are dropped here: they are often credentials
             // and are not part of an asset's identity.

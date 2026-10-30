@@ -344,6 +344,14 @@ pub struct PushConfig {
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub push_store: StoreRefName,
 
+    /// The CAS store the pushed content lives in. `PushBlob` reads it to
+    /// verify a blob against the byte checksums (`checksum.sri`,
+    /// `checksum.sha*`) among its qualifiers, and rejects such a push without
+    /// it.
+    /// Default: {`PushBlob` with a byte checksum is not available}
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub cas_store: Option<StoreRefName>,
+
     /// Whether the Action Cache store may be written to, this if set to false
     /// it is only possible to read from the Action Cache.
     #[serde(default)]

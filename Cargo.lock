@@ -3071,8 +3071,10 @@ dependencies = [
 name = "nativelink-fetch"
 version = "1.8.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "futures",
+ "hex",
  "nativelink-config",
  "nativelink-error",
  "nativelink-macro",

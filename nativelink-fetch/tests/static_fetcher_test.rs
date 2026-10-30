@@ -120,7 +120,7 @@ async fn a_checksum_mismatch_moves_on_to_the_next_uri() -> Result<(), Error> {
         .await
         .fetch_blob(&job(
             &["https://a.example/one", "https://b.example/two"],
-            vec![checksum],
+            checksum,
         ))
         .await?;
 
@@ -134,7 +134,7 @@ async fn a_checksum_nothing_matches_is_aborted() -> Result<(), Error> {
     let checksum = ByteChecksum::from_qualifier("checksum.sha256", &sha256_hex("other"))?;
     let err = fetcher(&store)
         .await
-        .fetch_blob(&job(&["https://a.example/one"], vec![checksum]))
+        .fetch_blob(&job(&["https://a.example/one"], checksum))
         .await
         .unwrap_err();
 
