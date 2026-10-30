@@ -312,9 +312,11 @@ const fn default_unpinned_max_ttl_s() -> u64 {
 /// background and records what that fetcher fetches, so that the next `Fetch`
 /// for the same asset is answered without downloading it again.
 ///
-/// Background: identical pinned requests (ones that carry a checksum) share
-/// one fetch; an unpinned request always runs its own, since it accepts only
-/// what the origin serves now. A fetch keeps running after its client gives up,
+/// Background: a pinned request (one that carries a checksum) is fetched one
+/// URI at a time, and concurrent pinned requests share the download of each
+/// URI they have in common, however their lists of mirrors differ; an
+/// unpinned request always runs its own fetch, since it accepts only what the
+/// origin serves now. A fetch keeps running after its client gives up,
 /// so a retry of a pinned request joins it, or finds it recorded. A shared
 /// fetch runs until the latest of its requests' timeouts (after
 /// `min_timeout_s` and `max_timeout_s`), each counted from when its request

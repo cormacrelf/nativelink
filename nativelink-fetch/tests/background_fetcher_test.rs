@@ -617,3 +617,216 @@ async fn revalidation_input_is_not_part_of_the_dedup_identity() {
     };
     assert_eq!(hash(&plain), hash(&revalidating));
 }
+
+/// A `Fetcher` that answers each URI as scripted: the jobs it is given are
+/// recorded, URIs in `fail` fail with their code, the URI `gated` (if any)
+/// blocks until the gate opens, and any other URI succeeds. Only the first URI
+/// of a job is looked at.
+#[derive(Debug)]
+struct ScriptedFetcher {
+    fail: Vec<(&'static str, Code)>,
+    gated: Option<&'static str>,
+    gate: Arc<Semaphore>,
+    jobs: Arc<Mutex<Vec<FetchBlobTask>>>,
+    start_tx: mpsc::UnboundedSender<String>,
+}
+
+/// A [`ScriptedFetcher`] and what a test steers and observes it with.
+struct Script {
+    fetcher: Arc<ScriptedFetcher>,
+    /// Opens the gated URI, a permit per fetch.
+    gate: Arc<Semaphore>,
+    /// Every job the fetcher was given, in order.
+    jobs: Arc<Mutex<Vec<FetchBlobTask>>>,
+    /// The URI of each job, as it starts.
+    started: mpsc::UnboundedReceiver<String>,
+}
+
+fn scripted(fail: Vec<(&'static str, Code)>, gated: Option<&'static str>) -> Script {
+    let gate = Arc::new(Semaphore::new(0));
+    let jobs = Arc::new(Mutex::new(Vec::new()));
+    let (start_tx, start_rx) = mpsc::unbounded_channel();
+    let fetcher = Arc::new(ScriptedFetcher {
+        fail,
+        gated,
+        gate: gate.clone(),
+        jobs: jobs.clone(),
+        start_tx,
+    });
+    Script {
+        fetcher,
+        gate,
+        jobs,
+        started: start_rx,
+    }
+}
+
+#[async_trait]
+impl Fetcher for ScriptedFetcher {
+    async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
+        self.jobs.lock().push(job.clone());
+        let uri = job.uris.first().cloned().unwrap_or_default();
+        drop(self.start_tx.send(uri.clone()));
+        if let Some(&(_, code)) = self.fail.iter().find(|(failing, _)| *failing == uri) {
+            return Err(make_err!(code, "scripted failure"));
+        }
+        if self.gated == Some(uri.as_str()) {
+            self.gate.acquire().await.expect("gate not closed").forget();
+        }
+        Ok(FetchOutcome::new(
+            uri,
+            DigestInfo::try_new(&"0".repeat(64), 1).unwrap(),
+        ))
+    }
+
+    async fn fetch_directory(&self, _job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+        Err(make_err!(Code::Unimplemented, "not exercised"))
+    }
+}
+
+/// A [`pinned_blob_job`] for several URIs.
+fn pinned_blob_job_for(uris: &[&str], timeout: Option<Duration>) -> FetchBlobTask {
+    let mut job = pinned_blob_job(uris[0], timeout);
+    job.uris = uris.iter().map(|&uri| uri.to_owned()).collect();
+    job
+}
+
+/// Each URI of a pinned request is a fetch of its own, so a request that
+/// lists a mirror another request is already downloading joins that download
+/// when it gets to it, however the two lists differ.
+#[nativelink_test]
+async fn requests_listing_different_mirrors_share_the_mirror_they_have_in_common() {
+    let Script {
+        fetcher,
+        gate,
+        jobs,
+        mut started,
+    } = scripted(vec![("http://b/x", Code::NotFound)], Some("http://a/x"));
+    let bg = BackgroundFetcher::new(fetcher, BackgroundFetcherOpts::default());
+
+    let first = {
+        let bg = bg.clone();
+        let job = pinned_blob_job_for(&["http://a/x"], None);
+        tokio::spawn(async move { bg.fetch_blob(&job).await })
+    };
+    assert_eq!(started.recv().await.as_deref(), Some("http://a/x"));
+    let second = {
+        let bg = bg.clone();
+        let job = pinned_blob_job_for(&["http://b/x", "http://a/x"], None);
+        tokio::spawn(async move { bg.fetch_blob(&job).await })
+    };
+    assert_eq!(started.recv().await.as_deref(), Some("http://b/x"));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    gate.add_permits(1);
+    assert_eq!(first.await.unwrap().unwrap().uri, "http://a/x");
+    assert_eq!(second.await.unwrap().unwrap().uri, "http://a/x");
+    let uris: Vec<Vec<String>> = jobs.lock().iter().map(|job| job.uris.clone()).collect();
+    assert_eq!(
+        uris,
+        vec![vec!["http://a/x".to_owned()], vec!["http://b/x".to_owned()]],
+        "'a' should be downloaded once, by the first request"
+    );
+}
+
+/// A failure the other URIs would share, such as a bad request, ends the job
+/// rather than moving on to the next URI. A failure of the URI alone does not.
+#[nativelink_test]
+async fn a_pinned_job_moves_on_only_past_failures_of_one_uri() {
+    let Script { fetcher, jobs, .. } = scripted(
+        vec![
+            ("http://b/x", Code::NotFound),
+            ("http://c/x", Code::InvalidArgument),
+        ],
+        None,
+    );
+    let bg = BackgroundFetcher::new(fetcher, BackgroundFetcherOpts::default());
+
+    let err = bg
+        .fetch_blob(&pinned_blob_job_for(
+            &["http://b/x", "http://c/x", "http://a/x"],
+            None,
+        ))
+        .await
+        .expect_err("'c' should end the job");
+    assert_eq!(err.code, Code::InvalidArgument);
+    assert_eq!(jobs.lock().len(), 2, "'a' should not be tried");
+
+    let err = bg
+        .fetch_blob(&pinned_blob_job_for(&["http://b/x", "http://b/x"], None))
+        .await
+        .expect_err("every URI fails");
+    assert_eq!(err.code, Code::NotFound);
+}
+
+/// A URI's own headers go with it into its fetch, re-indexed as its first.
+#[nativelink_test]
+async fn a_uris_own_headers_go_with_it() {
+    let Script { fetcher, jobs, .. } = scripted(vec![("http://b/x", Code::NotFound)], None);
+    let bg = BackgroundFetcher::new(fetcher, BackgroundFetcherOpts::default());
+
+    let mut job = pinned_blob_job_for(&["http://b/x", "http://a/x"], None);
+    job.headers = headers(&[("http_header_url:1:Authorization", "Bearer a")]);
+    bg.fetch_blob(&job).await.unwrap();
+
+    let jobs = jobs.lock();
+    assert!(jobs[0].headers.for_uri(0).get("authorization").is_none());
+    assert_eq!(
+        jobs[1].headers.for_uri(0).get("authorization").unwrap(),
+        "Bearer a"
+    );
+}
+
+/// The request's timeout covers all of its URIs: a later URI gets what the
+/// earlier ones left.
+#[nativelink_test]
+async fn the_timeout_covers_every_uri() {
+    #[derive(Debug)]
+    struct Slow(Arc<Mutex<Vec<Option<Duration>>>>);
+
+    #[async_trait]
+    impl Fetcher for Slow {
+        async fn fetch_blob(&self, job: &FetchBlobTask) -> Result<FetchOutcome, Error> {
+            self.0.lock().push(job.timeout);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Err(make_err!(Code::NotFound, "slow and missing"))
+        }
+
+        async fn fetch_directory(&self, _job: &FetchDirectoryJob) -> Result<FetchOutcome, Error> {
+            Err(make_err!(Code::Unimplemented, "not exercised"))
+        }
+    }
+
+    let timeouts = Arc::new(Mutex::new(Vec::new()));
+    let bg = BackgroundFetcher::new(
+        Arc::new(Slow(timeouts.clone())),
+        BackgroundFetcherOpts::default(),
+    );
+    let timeout = Duration::from_secs(10);
+    bg.fetch_blob(&pinned_blob_job_for(
+        &["http://a/x", "http://b/x"],
+        Some(timeout),
+    ))
+    .await
+    .expect_err("both URIs fail");
+
+    let timeouts = timeouts.lock();
+    assert_eq!(timeouts[0], Some(timeout));
+    let second = timeouts[1].expect("the second URI has a timeout");
+    assert!(
+        second <= timeout.saturating_sub(Duration::from_millis(200)),
+        "the second URI got {second:?}"
+    );
+}
+
+/// An unpinned job joins nothing, so it is passed on whole.
+#[nativelink_test]
+async fn an_unpinned_job_is_passed_on_whole() {
+    let Script { fetcher, jobs, .. } = scripted(vec![], None);
+    let bg = BackgroundFetcher::new(fetcher, BackgroundFetcherOpts::default());
+
+    let mut job = blob_job("http://a/x", None);
+    job.uris.push("http://b/x".to_owned());
+    bg.fetch_blob(&job).await.unwrap();
+    assert_eq!(jobs.lock()[0].uris.len(), 2);
+}
