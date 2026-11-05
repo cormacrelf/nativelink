@@ -71,14 +71,10 @@ pub fn fetcher_factory<S: BuildHasher>(
             };
             Ok(Arc::new(UrlFetcher::new(cas_store, options)?))
         }
-        FetcherSpec::MetadataCache(spec) => {
+        FetcherSpec::Cache(spec) => {
             let store = store_manager.get_store(&spec.fetch_store).ok_or_else(|| {
                 make_input_err!("'fetch_store': '{}' does not exist", spec.fetch_store)
             })?;
-            let inner = resolve(&spec.fetcher, built)?;
-            Ok(MetadataCache::new(inner, store))
-        }
-        FetcherSpec::Background(spec) => {
             let inner = resolve(&spec.fetcher, built)?;
             let opts = BackgroundFetcherOpts {
                 max_concurrent_fetches: limit(
@@ -88,7 +84,10 @@ pub fn fetcher_factory<S: BuildHasher>(
                 min_timeout: spec.min_timeout_s.map(Duration::from_secs),
                 max_timeout: spec.max_timeout_s.map(Duration::from_secs),
             };
-            Ok(BackgroundFetcher::new(inner, opts))
+            // The metadata write goes inside the background unit of work, so
+            // that it still happens when the client stops waiting.
+            let cached = MetadataCache::new(inner, store);
+            Ok(BackgroundFetcher::new(cached, opts))
         }
         FetcherSpec::Route(spec) => {
             if spec.routes.is_empty() && spec.otherwise.is_none() {
