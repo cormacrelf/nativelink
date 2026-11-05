@@ -4,14 +4,20 @@
 (*                                                                         *)
 (* An entry's key is one (algorithm, digest) pair, plus the request's      *)
 (* other qualifiers (left out here: they only partition the key space).    *)
-(* Its value is the CAS digest of the content, which stands in for the     *)
-(* content itself: CAS digests are assumed not to collide. The named       *)
+(* Its value is a digest naming the content, Expand[content]. The named    *)
+(* hashes are over the content as downloaded, and the reader compares the  *)
+(* values, so the scheme needs Expand injective (Injective = TRUE: digests *)
+(* are assumed not to collide). For a blob the value is its CAS digest.    *)
+(* For a directory the content is an archive, and the value the server     *)
+(* compares is the archive's own digest, recorded with the entry; the      *)
+(* Directory it unpacked to would not do, as several archives share one.   *)
+(* Injective = FALSE is that mistake: comparing the Directory. The named   *)
 (* hashes are allowed to collide freely: Digests is smaller than Contents, *)
 (* and TLC tries every hash function.                                      *)
 (*                                                                         *)
 (* A writer (a fetch, or a push of a blob already in the CAS) verifies the *)
 (* content against every algorithm the request names, then writes one     *)
-(* entry per named algorithm, one key at a time. It may crash between     *)
+(* entry per named algorithm, one key at a time. It may crash between      *)
 (* writes. It hashes only what the request names: entries carry no other   *)
 (* hashes.                                                                 *)
 (*                                                                         *)
@@ -24,7 +30,8 @@
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS Algs, Contents, Digests, Writers, Readers, None, CheckAll
+CONSTANTS Algs, Contents, Stored, Digests, Writers, Readers, None,
+          CheckAll, Injective
 
 Keys == Algs \X Digests
 
@@ -39,26 +46,33 @@ Phases == {"idle", "probe", "check", "final", "hit", "miss"}
 
 VARIABLES
     H,      \* the hash functions, chosen once
+    Expand, \* content -> CAS digest of what it stores as, chosen once
     cache,  \* key -> CAS digest, or None
     cas,    \* the blobs in the CAS
     ws,     \* writers: the content being recorded and the keys left to write
     rs      \* readers: the query, the candidate and the algorithms left
 
-vars == <<H, cache, cas, ws, rs>>
+vars == <<H, Expand, cache, cas, ws, rs>>
+
+Expansions ==
+    {e \in [Contents -> Stored] :
+        Injective => \A c1, c2 \in Contents : e[c1] = e[c2] => c1 = c2}
 
 WriterState == [c : Contents \cup {None}, todo : SUBSET Keys]
-ReaderState == [phase : Phases, q : Queries, cand : Contents \cup {None},
+ReaderState == [phase : Phases, q : Queries, cand : Stored \cup {None},
                 todo : SUBSET Algs]
 
 TypeOK ==
     /\ H \in [Algs -> [Contents -> Digests]]
-    /\ cache \in [Keys -> Contents \cup {None}]
-    /\ cas \subseteq Contents
+    /\ Expand \in Expansions
+    /\ cache \in [Keys -> Stored \cup {None}]
+    /\ cas \subseteq Stored
     /\ ws \in [Writers -> WriterState]
     /\ rs \in [Readers -> ReaderState]
 
 Init ==
     /\ H \in [Algs -> [Contents -> Digests]]
+    /\ Expand \in Expansions
     /\ cache = [k \in Keys |-> None]
     /\ cas = {}
     /\ ws = [w \in Writers |-> [c |-> None, todo |-> {}]]
@@ -75,41 +89,45 @@ Fetch(w) ==
     /\ ws[w].todo = {}
     /\ \E q \in Queries, c \in Contents :
         /\ Sat(H, c, q)
-        /\ cas' = cas \cup {c}
+        /\ cas' = cas \cup {Expand[c]}
         /\ ws' = [ws EXCEPT ![w] =
                     [c |-> c, todo |-> {<<a, H[a][c]>> : a \in Named(q)}]]
-    /\ UNCHANGED <<H, cache, rs>>
+    /\ UNCHANGED <<H, Expand, cache, rs>>
 
-\* PushBlob: the blob must already be in the CAS, and is verified the same way.
+\* PushBlob: the blob must already be in the CAS, and is verified the same
+\* way. Only for blobs: a directory's archive is not there to verify, so
+\* PushDirectory with a byte checksum is rejected.
 Push(w) ==
+    /\ Injective
     /\ ws[w].todo = {}
-    /\ \E q \in Queries, c \in cas :
+    /\ \E q \in Queries, c \in Contents :
+        /\ Expand[c] \in cas
         /\ Sat(H, c, q)
         /\ ws' = [ws EXCEPT ![w] =
                     [c |-> c, todo |-> {<<a, H[a][c]>> : a \in Named(q)}]]
-    /\ UNCHANGED <<H, cache, cas, rs>>
+    /\ UNCHANGED <<H, Expand, cache, cas, rs>>
 
 WriteKey(w) ==
     /\ \E k \in ws[w].todo :
-        /\ cache' = [cache EXCEPT ![k] = ws[w].c]
+        /\ cache' = [cache EXCEPT ![k] = Expand[ws[w].c]]
         /\ ws' = [ws EXCEPT ![w].todo = @ \ {k}]
-    /\ UNCHANGED <<H, cas, rs>>
+    /\ UNCHANGED <<H, Expand, cas, rs>>
 
 Crash(w) ==
     /\ ws[w].todo # {}
     /\ ws' = [ws EXCEPT ![w].todo = {}]
-    /\ UNCHANGED <<H, cache, cas, rs>>
+    /\ UNCHANGED <<H, Expand, cache, cas, rs>>
 
 ---------------------------------------------------------------------------
 (* Eviction, of entries and blobs independently *)
 
 EvictKey ==
     /\ \E k \in Keys : cache[k] # None /\ cache' = [cache EXCEPT ![k] = None]
-    /\ UNCHANGED <<H, cas, ws, rs>>
+    /\ UNCHANGED <<H, Expand, cas, ws, rs>>
 
 EvictBlob ==
-    /\ \E c \in cas : cas' = cas \ {c}
-    /\ UNCHANGED <<H, cache, ws, rs>>
+    /\ \E s \in cas : cas' = cas \ {s}
+    /\ UNCHANGED <<H, Expand, cache, ws, rs>>
 
 ---------------------------------------------------------------------------
 (* Readers *)
@@ -119,7 +137,7 @@ Start(r) ==
     /\ \E q \in Queries :
         rs' = [rs EXCEPT ![r] =
                 [phase |-> "probe", q |-> q, cand |-> None, todo |-> Named(q)]]
-    /\ UNCHANGED <<H, cache, cas, ws>>
+    /\ UNCHANGED <<H, Expand, cache, cas, ws>>
 
 \* Read any key of any named algorithm: strongest first is one such order.
 \* Reading a missing key changes nothing, so it is not a step either.
@@ -133,7 +151,7 @@ Probe(r) ==
                               !.todo = IF CheckAll THEN s.todo \ {a} ELSE {},
                               !.phase = IF CheckAll /\ s.todo \ {a} # {}
                                         THEN "check" ELSE "final"]]
-    /\ UNCHANGED <<H, cache, cas, ws>>
+    /\ UNCHANGED <<H, Expand, cache, cas, ws>>
 
 \* Find an entry for another named algorithm that agrees on the CAS digest.
 Check(r) ==
@@ -145,17 +163,17 @@ Check(r) ==
                     [s EXCEPT !.todo = s.todo \ {a},
                               !.phase = IF s.todo \ {a} = {}
                                         THEN "final" ELSE "check"]]
-    /\ UNCHANGED <<H, cache, cas, ws>>
+    /\ UNCHANGED <<H, Expand, cache, cas, ws>>
 
 Final(r) ==
     /\ rs[r].phase = "final"
     /\ rs' = [rs EXCEPT ![r].phase = IF rs[r].cand \in cas THEN "hit" ELSE "miss"]
-    /\ UNCHANGED <<H, cache, cas, ws>>
+    /\ UNCHANGED <<H, Expand, cache, cas, ws>>
 
 GiveUp(r) ==
     /\ rs[r].phase \in {"probe", "check", "final"}
     /\ rs' = [rs EXCEPT ![r].phase = "miss"]
-    /\ UNCHANGED <<H, cache, cas, ws>>
+    /\ UNCHANGED <<H, Expand, cache, cas, ws>>
 
 ---------------------------------------------------------------------------
 
@@ -169,13 +187,23 @@ Spec == Init /\ [][Next]_vars
 ---------------------------------------------------------------------------
 (* Properties *)
 
-\* The theorem: every hit satisfies every hash its query names.
+\* The theorem: a hit is the expansion of one content that satisfies every
+\* hash its query names. What a fetch of the same request would have had
+\* to download.
 HitsSatisfy ==
-    \A r \in Readers : rs[r].phase = "hit" => Sat(H, rs[r].cand, rs[r].q)
+    \A r \in Readers : rs[r].phase = "hit" =>
+        \E c \in Contents : Expand[c] = rs[r].cand /\ Sat(H, c, rs[r].q)
+
+\* The weaker claim that survives a lossy Expand: for every named algorithm,
+\* *some* content with an accepted digest expands to the hit.
+HitsSatisfyEach ==
+    \A r \in Readers : rs[r].phase = "hit" =>
+        \A a \in Named(rs[r].q) :
+            \E c \in Contents : Expand[c] = rs[r].cand /\ H[a][c] \in rs[r].q[a]
 
 \* The contents a query could hit in this state, whatever order it reads in.
 HitSet(q) ==
-    {c \in cas : \A a \in Named(q) : \E d \in q[a] : cache[<<a, d>>] = c}
+    {s \in cas : \A a \in Named(q) : \E d \in q[a] : cache[<<a, d>>] = s}
 
 \* With one digest per named algorithm, there is at most one answer: the
 \* order a reader goes through the algorithms cannot change what it gets.
@@ -185,9 +213,11 @@ OneAnswer ==
 
 (* The inductive invariant. *)
 
-\* Every entry is true of its content.
+\* Every entry is true of some content it stores: that content has the
+\* digest in the key. With Expand injective that content is unique.
 EntriesTrue ==
-    \A k \in Keys : cache[k] # None => H[k[1]][cache[k]] = k[2]
+    \A k \in Keys : cache[k] # None =>
+        \E c \in Contents : Expand[c] = cache[k] /\ H[k[1]][c] = k[2]
 
 \* A writer only holds keys that are true of its content.
 WritersTrue ==
@@ -197,16 +227,20 @@ WritersTrue ==
             /\ \A k \in ws[w].todo : H[k[1]][ws[w].c] = k[2]
 
 \* A probing reader has ticked nothing off yet, and a reader with a candidate
-\* has a candidate that satisfies every algorithm it has ticked off.
+\* has, for every algorithm it has ticked off, some content expanding to the
+\* candidate with an accepted digest. One witness per algorithm: this is all
+\* the entries can say, and with a lossy Expand it is not one witness for
+\* all of them.
 ReadersTrue ==
     \A r \in Readers :
         LET s == rs[r] IN
         /\ s.phase = "probe" => s.todo = Named(s.q)
         /\ s.phase \in {"check", "final", "hit"} =>
-            /\ s.cand \in Contents
+            /\ s.cand \in Stored
             /\ s.todo \subseteq Named(s.q)
             /\ s.phase # "check" => s.todo = {}
-            /\ \A a \in Named(s.q) \ s.todo : H[a][s.cand] \in s.q[a]
+            /\ \A a \in Named(s.q) \ s.todo :
+                \E c \in Contents : Expand[c] = s.cand /\ H[a][c] \in s.q[a]
 
 Inv == TypeOK /\ EntriesTrue /\ WritersTrue /\ ReadersTrue
 
@@ -214,9 +248,10 @@ Inv == TypeOK /\ EntriesTrue /\ WritersTrue /\ ReadersTrue
 \* as it goes. Checking Inv from here checks that Inv is inductive.
 IndInit ==
     /\ H \in [Algs -> [Contents -> Digests]]
-    /\ cache \in [Keys -> Contents \cup {None}]
+    /\ Expand \in Expansions
+    /\ cache \in [Keys -> Stored \cup {None}]
     /\ EntriesTrue
-    /\ cas \in SUBSET Contents
+    /\ cas \in SUBSET Stored
     /\ ws \in [Writers -> WriterState]
     /\ WritersTrue
     /\ rs \in [Readers -> ReaderState]
